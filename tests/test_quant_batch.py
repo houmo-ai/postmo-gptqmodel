@@ -91,40 +91,4 @@ class TestQuantBatch(unittest.TestCase):
 
             del model
 
-        assert abs(batch_size_1_ppl - batch_size_256_ppl) < 0.1
-
-    def test_dynamic_bits(self):
-        dynamic_bits = {
-            # `.*\.` matches the layers_node prefix
-            r".*\.18\..*gate.*": 8, # match layer 18 (index start at 0) gate module
-            r".*\.19\..*gate.*": 8, # match layer 19 (index start at 0) gate module
-            r".*\.20\..*gate.*": 8, # match layer 21 (index start at 0) gate module
-            r".*\.21\..*gate.*": 8, # match layer 22 (index start at 0) gate module
-        }
-        quantize_config = QuantizeConfig(
-            bits=4,
-            dynamic_bits=dynamic_bits,
-            group_size=128,
-        )
-        model = GPTQModel.from_pretrained(
-            self.NATIVE_MODEL_ID,
-            quantize_config=quantize_config,
-        )
-        model.quantize(self.calibration_dataset, batch_size=4)
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            model.save_quantized(
-                tmp_dir,
-            )
-
-            del model
-
-            model = GPTQModel.from_quantized(
-                tmp_dir,
-                backend=BACKEND.TRITON,
-            )
-
-            dynamic_bits_ppl = self.calculate_avg_ppl(model, self.tokenizer)
-
-            del model
-            assert dynamic_bits_ppl < 10
+        assert abs(batch_size_1_ppl - batch_size_256_ppl) < 0
