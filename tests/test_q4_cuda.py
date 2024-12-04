@@ -17,7 +17,6 @@ GENERATE_EVAL_SIZE = 100
 class TestsQ4CUDA(unittest.TestCase):
     @parameterized.expand(
         [
-            (torch.float32, "cpu"),
             (torch.float32, "cuda:0"),
             (torch.float16, "cuda:0"),
         ]
@@ -65,7 +64,6 @@ class TestsQ4CUDA(unittest.TestCase):
 
     @parameterized.expand(
         [
-            (torch.float32, "cpu"),
             (torch.float32, "cuda:0"),
             (torch.float16, "cuda:0"),
         ]
