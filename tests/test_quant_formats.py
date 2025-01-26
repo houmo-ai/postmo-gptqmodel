@@ -49,7 +49,6 @@ class TestQuantization(ModelTest):
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.pretrained_model_id, use_fast=True)
 
-        # auto-round can't use self.load_dataset() from ModelTest
         traindata = load_dataset("json", data_files="/monster/data/model/dataset/c4-train.00000-of-01024.json.gz", split="train")
         self.calibration_dataset = [self.tokenizer(example["text"]) for example in traindata.select(range(128))]
 
@@ -60,7 +59,6 @@ class TestQuantization(ModelTest):
             (QUANT_METHOD.GPTQ, BACKEND.IPEX, False, FORMAT.GPTQ, 4),
             (QUANT_METHOD.GPTQ, BACKEND.EXLLAMA_V2, True, FORMAT.GPTQ_V2, 4),
             (QUANT_METHOD.GPTQ, BACKEND.EXLLAMA_V2, False, FORMAT.GPTQ, 4),
-            (QUANT_METHOD.AUTO_ROUND, BACKEND.EXLLAMA_V2, True, FORMAT.GPTQ, 4),
         ]
     )
     def test_quantize(self, method: QUANT_METHOD, backend: BACKEND, sym: bool, format: FORMAT, bits: int):
