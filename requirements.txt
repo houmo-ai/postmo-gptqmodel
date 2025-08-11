@@ -16,3 +16,4 @@ tokenicer==0.0.4
 logbar==0.0.4
 # for Qwen-Omni model
 soundfile==0.13.1
+device_smi

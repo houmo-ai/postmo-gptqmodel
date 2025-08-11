@@ -119,11 +119,14 @@ def main(args):
         bits=bits,  # quantize model to 4-bit
         group_size=group_size,  # it is recommended to set the value to 128
         sym=True,
+        # mse=True,
         rotation="hadamard",
+        device="cuda:0",
+        desc_act=False,
     )
 
     # load un-quantized model, the model will always be force loaded into cpu
-    model = GPTQModel.load(pretrained_model_id, quantize_config, device_map="cuda:0")
+    model = GPTQModel.load(pretrained_model_id, quantize_config, torch_dtype=torch.float32)
 
     # quantize model, the calibration_dataset should be list of dict whose keys can only be "input_ids" and "attention_mask"
     # with value under torch.LongTensor type.
