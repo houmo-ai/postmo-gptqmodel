@@ -127,6 +127,7 @@ from .definitions.xverse import XverseGPTQ  # noqa: E402
 from .definitions.yi import YiGPTQ  # noqa: E402
 from .definitions.falcon_h1 import FalconH1GPTQ  # noqa: E402
 from .definitions.pangu_alpha import PanguAlphaGPTQ  # noqa: E402
+from .definitions.gpt_oss import GptOssGPTQ  # noqa: E402
 
 # make quants and inference more determinisitc
 torch.manual_seed(787)
@@ -203,6 +204,7 @@ MODEL_MAP = {
     "gpt_pangu": PanguAlphaGPTQ,
     "ernie4_5": ERNIE4_5GPTQ,
     "ernie4_5_moe": ERNIE4_5_MOEGPTQ,
+    "gpt_oss": GptOssGPTQ,
 }
 
 SUPPORTED_MODELS = list(MODEL_MAP.keys())
@@ -246,9 +248,16 @@ class GPTQModel:
             backend = BACKEND(backend)
 
         is_quantized = False
-        if hasattr(AutoConfig.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code),
-                   "quantization_config"):
-            is_quantized = True
+        cfg = AutoConfig.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code)
+        if hasattr(cfg, "quantization_config"):
+            # auto-bypass unsupported HF quantization configs (e.g., mxfp4)
+            qc = getattr(cfg, "quantization_config", {}) or {}
+            qmethod = str(qc.get("quant_method", qc.get("quantization_method", ""))).lower()
+            if qmethod == "mxfp4":
+                log.info("Loader: Detected unsupported quantization_config quant_method=mxfp4. Treating as unquantized and loading weights in BF16/FP16 for re-quantization.")
+                is_quantized = False
+            else:
+                is_quantized = True
         else:
             for name in [QUANT_CONFIG_FILENAME, "quant_config.json"]:
                 if isdir(model_id_or_path):  # Local
@@ -291,12 +300,16 @@ class GPTQModel:
             trust_remote_code: bool = False,
             **model_init_kwargs,
     ) -> BaseGPTQModel:
-        if hasattr(AutoConfig.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code),
-                   "quantization_config"):
-            log.warn("Model is already quantized, will use `from_quantized` to load quantized model.\n"
-                           "If you want to quantize the model, please pass un_quantized model path or id, and use "
-                           "`from_pretrained` with `quantize_config`.")
-            return cls.from_quantized(model_id_or_path, trust_remote_code=trust_remote_code)
+        cfg = AutoConfig.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code)
+        if hasattr(cfg, "quantization_config"):
+            qc = getattr(cfg, "quantization_config", {}) or {}
+            qmethod = str(qc.get("quant_method", qc.get("quantization_method", ""))).lower()
+            if qmethod and qmethod != "mxfp4":
+                log.warn("Model is already quantized, will use `from_quantized` to load quantized model.\n"
+                             "If you want to quantize the model, please pass un_quantized model path or id, and use "
+                             "`from_pretrained` with `quantize_config`.")
+                return cls.from_quantized(model_id_or_path, trust_remote_code=trust_remote_code)
+            # else: mxfp4 -> treat as unquantized and continue
 
         if quantize_config and quantize_config.dynamic:
             log.warn(

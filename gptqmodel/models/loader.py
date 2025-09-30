@@ -163,6 +163,14 @@ def ModelLoader(cls):
 
         config = AutoConfig.from_pretrained(model_local_path, **model_init_kwargs)
 
+        # Strip unsupported HF quantization configs like mxfp4 and force dtype to bf16
+        if hasattr(config, "quantization_config"):
+            qc = getattr(config, "quantization_config", {}) or {}
+            qmethod = str(qc.get("quant_method", qc.get("quantization_method", ""))).lower()
+            if qmethod == "mxfp4":
+                delattr(config, "quantization_config")
+                model_init_kwargs["torch_dtype"] = torch.bfloat16
+
         atten_impl = model_init_kwargs.get("attn_implementation", None)
 
         if atten_impl is not None and atten_impl != "auto":
@@ -185,7 +193,7 @@ def ModelLoader(cls):
         # enforce some values despite user specified
         # non-quantized models are always loaded into cpu
         model_init_kwargs["device_map"] = cpu_device_map
-        model_init_kwargs["torch_dtype"] = torch_dtype
+        model_init_kwargs["torch_dtype"] = model_init_kwargs.get("torch_dtype", torch_dtype)
         model_init_kwargs["_fast_init"] = cls.require_fast_init
         # model_init_kwargs["low_cpu_mem_usage"] = True
 
@@ -318,6 +326,24 @@ def ModelLoader(cls):
             trust_remote_code=trust_remote_code,
             **cached_file_kwargs,
         )
+
+        # Fallback: if HF config has quantization_config.mxfp4, treat as unquantized and delegate to from_pretrained
+        if hasattr(config, "quantization_config"):
+            qc = getattr(config, "quantization_config", {}) or {}
+            qmethod = str(qc.get("quant_method", qc.get("quantization_method", ""))).lower()
+            if qmethod == "mxfp4":
+                log.info("Loader: Detected quantization_config.mxfp4 in from_quantized; falling back to from_pretrained path.")
+                # minimal QuantizeConfig for fallback
+                qcfg = kwargs.get("quantize_config")
+                if qcfg is None:
+                    from ..quantization.config import QuantizeConfig as _Q
+                    qcfg = _Q(bits=4, group_size=128)
+                return cls.from_pretrained(
+                    pretrained_model_id_or_path=model_local_path,
+                    quantize_config=qcfg,
+                    trust_remote_code=trust_remote_code,
+                    **kwargs,
+                )
 
         if cls.require_dtype:
             torch_dtype = cls.require_dtype
