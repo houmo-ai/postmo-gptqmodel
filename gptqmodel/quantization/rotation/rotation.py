@@ -1,3 +1,8 @@
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
+# Contact: qubitium@modelcloud.ai, x.com/qubitium
+
 # Adapted from https://github.com/spcl/QuaRot/blob/main/fake_quant/rotation_utils.py
 import typing
 
@@ -8,6 +13,7 @@ from ...utils.logger import setup_logger
 from ...utils.model import get_module_by_name_prefix
 from ...utils.torch import torch_empty_cache
 from .hadamard_utils import apply_exact_had_to_linear, random_hadamard_matrix
+
 
 log = setup_logger()
 

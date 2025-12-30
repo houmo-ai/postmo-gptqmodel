@@ -1,16 +1,25 @@
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
+# Contact: qubitium@modelcloud.ai, x.com/qubitium
+
 from typing import Union
 
 import torch
 from transformers import PreTrainedModel
 
-from ..models import BaseGPTQModel
+from ..models import BaseQModel
 from ..nn_modules.qlinear.torch import TorchQuantLinear
-from ..quantization import FORMAT, QuantizeConfig
-from .log import setup_logger
+from ..quantization import FORMAT
+from .logger import setup_logger
 from .torch import torch_empty_cache
+
 
 try:
     import mlx.core as mx
+
+    mx.set_default_device(mx.cpu)
+
     from mlx_lm import generate
     from mlx_lm.utils import _get_classes, get_model_path, load_config, quantize_model
     MLX_AVAILABLE = True
@@ -19,7 +28,7 @@ except ImportError:
 
 log = setup_logger()
 
-def convert_gptq_to_mlx_weights(model_id_or_path: str, model: Union[PreTrainedModel, BaseGPTQModel], gptq_config: QuantizeConfig, lm_head_name: str):
+def convert_gptq_to_mlx_weights(model_id_or_path: str, model: Union[PreTrainedModel, BaseQModel], gptq_config: dict, lm_head_name: str):
     if not MLX_AVAILABLE:
         raise ValueError("MLX not installed. Please install via `pip install gptqmodel[mlx] --no-build-isolation`.")
 
@@ -29,7 +38,7 @@ def convert_gptq_to_mlx_weights(model_id_or_path: str, model: Union[PreTrainedMo
     if gptq_config["checkpoint_format"] not in [FORMAT.GPTQ, FORMAT.GPTQ_V2]:
         raise ValueError("Model checkpoint format is not gptq or gptq_v2")
 
-    if gptq_config["dynamic"]:
+    if gptq_config.get("dynamic") is not None:
         print(gptq_config["dynamic"])
         for _, config in gptq_config["dynamic"].items():
             if config != {}:
@@ -40,15 +49,16 @@ def convert_gptq_to_mlx_weights(model_id_or_path: str, model: Union[PreTrainedMo
     if gptq_config["group_size"] in [-1, 16]:
         gptq_config["group_size"] = 64
 
-    config = load_config(get_model_path(model_id_or_path))
+    model_path, _ = get_model_path(model_id_or_path)
+    config = load_config(model_path)
 
-    if isinstance(model, BaseGPTQModel):
+    if isinstance(model, BaseQModel):
         model = model.model
 
     # Convert weights
     weights = {}
     n = 1
-    pb = log.pb(model.named_modules()).title("Format: Converting to mlx ->").manual()
+    pb = log.pb(list(model.named_modules())).title("Format: Converting to mlx ->").manual()
     for name, module in pb:
         pb.subtitle(f"{name}").draw()
         if isinstance(module, TorchQuantLinear):
@@ -63,8 +73,8 @@ def convert_gptq_to_mlx_weights(model_id_or_path: str, model: Union[PreTrainedMo
                 torch_empty_cache()
 
             n += 1
-
-        elif hasattr(module, "weight") and (config.tie_word_embeddings or name != lm_head_name):
+        # Handle normal layers with weight (exclude lm_head if embeddings tied)
+        elif hasattr(module, "weight") and not (config["tie_word_embeddings"] and name == lm_head_name):
             weights[f"{name}.weight"] = mx.array(
                 module.weight.detach().to("cpu", torch.float16).numpy()
             )
@@ -87,8 +97,8 @@ def convert_gptq_to_mlx_weights(model_id_or_path: str, model: Union[PreTrainedMo
     # Load and quantize weights
     log.info("Starting MLX quantization...")
     mlx_model.load_weights(list(weights.items()))
-    weights, mlx_config = quantize_model(mlx_model, config, q_group_size=gptq_config["group_size"],
-                                     q_bits=gptq_config["bits"])
+    weights, mlx_config = quantize_model(mlx_model, config, group_size=gptq_config["group_size"],
+                                     bits=gptq_config["bits"])
     log.info("MLX quantization completed")
 
     return weights, mlx_config
@@ -103,7 +113,7 @@ def mlx_generate(model, tokenizer, **kwargs,):
         raise ValueError("MLX requires prompts to be provided")
 
     verbose = kwargs.pop("verbose", False)
-    formatter = kwargs.pop("formatter", None)
+    kwargs.pop("formatter", None)
 
     sampling_params = {}
     sampling_params["max_tokens"] = kwargs.pop("max_tokens", 256)
@@ -150,4 +160,4 @@ def mlx_generate(model, tokenizer, **kwargs,):
     if "min_tokens_to_keep" in kwargs:
         sampling_params["min_tokens_to_keep"] = kwargs.pop("min_tokens_to_keep", None)
 
-    return generate(model=model, tokenizer=tokenizer, prompt=prompt, formatter=formatter ,verbose=verbose, **sampling_params)
+    return generate(model=model, tokenizer=tokenizer, prompt=prompt, verbose=verbose, **sampling_params)

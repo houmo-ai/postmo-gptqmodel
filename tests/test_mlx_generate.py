@@ -1,13 +1,21 @@
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
+# Contact: qubitium@modelcloud.ai, x.com/qubitium
+
 import os
+
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 import sys  # noqa: E402
 
+
 if sys.platform == "darwin":
     os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
-from gptqmodel import BACKEND, GPTQModel  # noqa: E402
 from models.model_test import ModelTest  # noqa: E402
+
+from gptqmodel import BACKEND, GPTQModel  # noqa: E402
 
 
 class TestMlxGenerate(ModelTest):

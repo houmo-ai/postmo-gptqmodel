@@ -1,18 +1,7 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 # adapted from https://github.com/Intelligent-Computing-Lab-Yale/GPTQv2
 # adapted from @qwopqwop200 's [GPTQ-for-LLaMa](https://github.com/qwopqwop200/GPTQ-for-LLaMa/tree/cuda), which itself is based on [gptq](https://github.com/IST-DASLab/gptq)
@@ -29,19 +18,25 @@ import transformers
 
 from ..looper.named_module import NamedModule
 from ..quantization import QuantizeConfig
-from ..utils.torch import torch_compile, torch_sync
+from ..utils.torch import TORCH_GTE_28, torch_compile, torch_sync
 from .gptq import GPTQ
 
 
 class GPTQv2(GPTQ):
-    def __init__(self, module: NamedModule, qcfg: Optional[QuantizeConfig]=None):
+    def __init__(self, module: NamedModule, qcfg: Optional[QuantizeConfig] = None):
         from ..looper.native_processor import NATIVE_INPUTS_STATE_KEY  # avoid import loop
 
         super().__init__(module, qcfg)
 
+        self.H = None
         self.dXXT = None
 
         self.native_inps = module.state.pop(NATIVE_INPUTS_STATE_KEY)
+
+    def add_batch(self, inp: torch.Tensor, out: torch.Tensor, batch_index: Optional[int] = None):
+        with self.lock:
+            self.fwd_counter += 1
+            self.process_batch(inp)
 
     # TODO FIXME: using v1 new process_batch kills v2 quantization quality, use original process_batch
     # sample counter based on batch request # instead of batched token #.
@@ -73,7 +68,7 @@ class GPTQv2(GPTQ):
     #     del native_inp, reshaped_inp
 
     def process_batch(self, inp):
-        inp = inp.to(device=self.module.target_device, dtype=torch.float32)
+        inp = inp.to(dtype=torch.float32)
         native_inp = self.native_inps.pop(0).to(device=inp.device, dtype=torch.float32)
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
@@ -115,37 +110,32 @@ class GPTQv2(GPTQ):
 
         self.H += inp.matmul(inp.t())
         native_inp = math.sqrt(2 / self.nsamples) * native_inp
-        self.dXXT += (native_inp-inp).matmul(inp.t())
+        self.dXXT += (native_inp - inp).matmul(inp.t())
 
     @torch.inference_mode()
     def quantize(
-        self,
-        blocksize=128,
+            self,
+            blocksize=128,
     ):
-        #self.H = self.H.to(device=CUDA_0)
+        # self.H = self.H.to(device=CUDA_0)
         # log.info(f"Quantization `{self.name}` using samples: `{self.nsamples}`")
         start = time.time()
 
-        self.hessian_inverse = torch_compile(self.hessian_inverse)
-
-        # process buffered inputs
-        for inp in self.fwd_inputs_buffered_data:
-            torch_sync(device=self.module.target_device)
-            self.process_batch(inp)
-
-        # release buffer
-        del self.fwd_inputs_buffered_data
+        # TODO compilation failure for Torch >= 2.8
+        if not TORCH_GTE_28:
+            self.hessian_inverse = torch_compile(self.hessian_inverse)
 
         # if self.device.type not in ["mps", "cpu"]:
         #     self.module.weight.data = self.module.weight.data.cpu()
 
         # TODO: waiting for pytorch implementation of ops for MPS
         if sys.platform == "darwin" and os.getenv("PYTORCH_ENABLE_MPS_FALLBACK") != "1":
-            raise RuntimeError("For MacOS you must set env `PYTORCH_ENABLE_MPS_FALLBACK=1` before running quantization.")
+            raise RuntimeError(
+                "For MacOS you must set env `PYTORCH_ENABLE_MPS_FALLBACK=1` before running quantization.")
 
         if self.module_copy is None:
             # log.info("copy W to cuda_1")
-            W = self._clone_module(device=self.H.device)
+            W = self.clone_module(device=self.H.device)
         else:
             W = self.module_copy
             self.module_copy = None
@@ -170,7 +160,7 @@ class GPTQv2(GPTQ):
             groups = []
             for i in range(0, self.columns, self.qcfg.group_size):
                 quantizer = copy.deepcopy(self.quantizer)
-                quantizer.find_params(W[:, i : (i + self.qcfg.group_size)], weight=True)
+                quantizer.find_params(W[:, i: (i + self.qcfg.group_size)], weight=True)
 
                 scale.append(quantizer.scale)
                 zero.append(quantizer.zero)
@@ -183,12 +173,11 @@ class GPTQv2(GPTQ):
             self.dXXT = self.dXXT[perm][:, perm]
             invperm = torch.argsort(perm)
 
-
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
 
         Hinv, damp = self.hessian_inverse(H)
-        P = self.qcfg.v2_alpha * ((self.dXXT @ Hinv.T).triu(diagonal=1)) @ Hinv
+        P = self.qcfg.gptaq_alpha * ((self.dXXT @ Hinv.T).triu(diagonal=1)) @ Hinv
         del self.dXXT
 
         for i1 in range(0, self.columns, blocksize):
@@ -209,7 +198,7 @@ class GPTQv2(GPTQ):
                 if self.qcfg.group_size != -1:
                     if not self.qcfg.static_groups:
                         if (i1 + i) % self.qcfg.group_size == 0:
-                            self.quantizer.find_params(W[:, (i1 + i) : (i1 + i + self.qcfg.group_size)], weight=True)
+                            self.quantizer.find_params(W[:, (i1 + i): (i1 + i + self.qcfg.group_size)], weight=True)
 
                         if ((i1 + i) // self.qcfg.group_size) - now_idx == -1:
                             scale.append(self.quantizer.scale)
@@ -224,10 +213,11 @@ class GPTQv2(GPTQ):
 
                 q = self.quantizer.quantize(w.unsqueeze(1)).flatten()
                 Q1[:, i] = q
-                Losses1[:, i] = (w - q) ** 2 / d**2
+                Losses1[:, i] = (w - q) ** 2 / d ** 2
 
                 err1 = (w - q) / d
-                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) - w.unsqueeze(1).matmul(P1[i, i:].unsqueeze(0))
+                W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0)) - w.unsqueeze(1).matmul(
+                    P1[i, i:].unsqueeze(0))
                 Err1[:, i] = err1
 
             Q[:, i1:i2] = Q1
@@ -269,7 +259,7 @@ class GPTQv2(GPTQ):
         else:
             Q = Q.type_as(self.module.weight.data)
 
-        #Q = Q.to(device=DEVICE_1)
+        # Q = Q.to(device=DEVICE_1)
 
         if scale == []:
             scale.append(self.quantizer.scale)
@@ -287,5 +277,6 @@ class GPTQv2(GPTQ):
 
         if hasattr(self, 'dXXT'):
             del self.dXXT
+
 
 __all__ = ["GPTQv2"]

@@ -1,16 +1,22 @@
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
+# Contact: qubitium@modelcloud.ai, x.com/qubitium
+
 import csv
 import json
 import os
 import random
-import re
 import time
 
+import pcre as re
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from ..utils.logger import setup_logger
+
 
 choices = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P"]
 max_model_length = 4096
@@ -121,7 +127,7 @@ def batch_inference(model, tokenizer, inference_batchs, batch_size):
 
     for batch in pb:
         input_tensor = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=max_model_length, padding_side='left').to(model.device)
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model.generate(
                 input_ids=input_tensor["input_ids"],
                 tokenizer=tokenizer,
@@ -166,7 +172,7 @@ def save_res(res, output_path):
     return accu, corr, wrong
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def eval_cot(subject, model, tokenizer, val_df, test_df, output_path, ntrain, batch_size):
     global choices
     log.info("evaluating " + subject)

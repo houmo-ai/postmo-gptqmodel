@@ -17,6 +17,7 @@ import os
 
 from logbar import LogBar
 
+
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
 import tempfile  # noqa: E402
@@ -26,11 +27,19 @@ from typing import List  # noqa: E402
 import torch  # noqa: E402
 import transformers  # noqa: E402
 from datasets import load_dataset  # noqa: E402
-from gptqmodel import BACKEND  # noqa: E402
 from peft import AdaLoraConfig, get_peft_model  # noqa: E402
 from tokenicer import Tokenicer  # noqa: E402
-from transformers import (AutoModelForCausalLM, GPTQConfig, TrainerCallback,  # noqa: E402
-                          TrainerControl, TrainerState, TrainingArguments)
+from transformers import (  # noqa: E402
+    AutoModelForCausalLM,
+    GPTQConfig,
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
+    TrainingArguments,
+)
+
+from gptqmodel import BACKEND  # noqa: E402
+
 
 DEVICE = torch.device("cuda:0")
 
@@ -59,10 +68,10 @@ def train(
         lora_alpha: int = 16,
         lora_dropout: float = 0.05,
         lora_target_modules: List[str] = None,
-        torch_dtype: torch.dtype = torch.bfloat16,
+        dtype: torch.dtype = torch.bfloat16,
         init_lora_weights="olora",
 ):
-    model_kwargs = {"torch_dtype": torch_dtype, "device_map": DEVICE}
+    model_kwargs = {"dtype": dtype, "device_map": DEVICE}
     if quantize:
         model_kwargs["quantization_config"] = GPTQConfig(
             bits=4,
@@ -131,7 +140,7 @@ def train(
             learning_rate=learning_rate,
             logging_steps=1,
             optim="adamw_torch",
-            evaluation_strategy="steps",
+            eval_strategy="steps",
             save_strategy="steps",
             eval_steps=eval_step,
             save_steps=save_step,
@@ -179,6 +188,6 @@ class Test(unittest.TestCase):
                 lora_alpha=16,
                 lora_dropout=0.05,
                 lora_target_modules=None,
-                torch_dtype=torch.bfloat16,
+                dtype=torch.bfloat16,
                 init_lora_weights="olora",
             )

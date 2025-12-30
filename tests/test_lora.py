@@ -16,22 +16,28 @@
 # -- do not touch
 import os
 
+
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 # -- end do not touch
 
-from gptqmodel import BACKEND, GPTQModel  # noqa: E402
-from gptqmodel.adapter.adapter import Lora  # noqa: E402
 from models.model_test import ModelTest  # noqa: E402
 from parameterized import parameterized  # noqa: E402
+
+from gptqmodel import BACKEND, GPTQModel  # noqa: E402
+from gptqmodel.adapter.adapter import Lora  # noqa: E402
+from gptqmodel.utils.eval import EVAL  # noqa: E402
 
 
 class Test(ModelTest):
     NATIVE_MODEL_ID = "/monster/data/model/sliuau-llama3.2-1b-4bit-group128"
     lora_path = "/monster/data/model/sliuau-llama3.2-1b-4bit-group128/llama3.2-1b-4bit-group128-eora-rank128-arc" #"sliuau/llama3.2-1b-4bit-group128-eora_test-rank128-arc/blob/main/adapter_model.safetensors" #"sliuau/llama3.2-1b-4bit-group128-eora_test-rank128-arc"
 
-    NATIVE_ARC_CHALLENGE_ACC = 0.3567
-    NATIVE_ARC_CHALLENGE_ACC_NORM = 0.3805
-    QUANT_ARC_MAX_DELTA_FLOOR_PERCENT = 0.36
+    EVAL_TASKS = {
+        EVAL.LM_EVAL.ARC_CHALLENGE: {
+            "acc": {"value": 0.3567, "floor_pct": 0.36},
+            "acc_norm": {"value": 0.3805, "floor_pct": 0.36},
+        },
+    }
 
     @classmethod
     def setUpClass(cls):
@@ -57,7 +63,7 @@ class Test(ModelTest):
         )
 
         # print(model)
-        tokens = model.generate("Capital of France is")[0]
+        tokens = model.generate("The capital city of France is named")[0]
         result = model.tokenizer.decode(tokens)
         print(f"Result: {result}")
         self.assertIn("paris", result.lower())
@@ -75,10 +81,12 @@ class Test(ModelTest):
             device_map="auto",
         )
 
-        tokens = model.generate("Capital of France is")[0]
+        tokens = model.generate("The capital city of France is named", min_new_tokens=128, max_new_tokens=128)[0]
         result = model.tokenizer.decode(tokens)
         print(f"Result: {result}")
         self.assertIn("paris", result.lower())
+        if "paris" not in result.lower() and "built" not in result.lower():
+            raise AssertionError(" `paris` not found in `result`")
 
     def test_lm_eval_from_path(self):
         adapter = Lora(path=self.lora_path, rank=128)

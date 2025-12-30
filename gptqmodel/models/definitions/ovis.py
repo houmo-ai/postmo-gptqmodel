@@ -1,18 +1,7 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import copy
 import logging
@@ -23,48 +12,28 @@ import torch
 from ...utils.calibration import batched
 from ...utils.image import fetch_image
 from ...utils.model import MODALITY, move_to
+from ...utils.offload import offload_to_disk
 from .._const import CPU
-from ..base import BaseGPTQModel
+from ..base import BaseQModel
 
 
-class OvisGPTQ(BaseGPTQModel):
-    base_modules = ["llm.model.embed_tokens", "llm.model.norm", "visual_tokenizer", "vte"]
+class OvisQModel(BaseQModel):
     pre_lm_head_norm_module = "llm.model.norm"
 
-    layers_node = ["llm.model.layers"] #, "visual_tokenizer.backbone.trunk.blocks"]
-    layer_type = ["LlamaDecoderLayer", "Gemma2DecoderLayer", "Qwen2DecoderLayer"]
-
-    layers_modules_tree = {
-        # "visual_tokenizer": [
-        #     "backbone",
-        #     "trunk",
-        #     "blocks",
-        #     "#",
-        #     {
-        #         "attn": ("qkv", "proj"),
-        #         "mlp": ("fc1", "fc2", "fc3"),
-        #     },
-        # ],
-        "llm": [
-            "model",
-            "layers",
-            "#",
-            {
-                "self_attn": ("k_proj", "v_proj", "q_proj", "o_proj"),
-                "mlp": ("up_proj", "gate_proj", "down_proj"),
-            }
-        ],
-    }
+    module_tree = [
+        "llm",
+        "model",
+        "layers",
+        "#",
+        {
+            "input_layernorm": ("input_layernorm:!",),
+            "self_attn": ("q_proj:0", "k_proj:0", "v_proj:0", "o_proj:1"),
+            "post_attention_layernorm": ("post_attention_layernorm:!",),
+            "mlp": ("gate_proj:0", "up_proj:0", "down_proj:1"),
+        }
+    ]
 
     layer_modules_strict = False # the layer modules are in different decode layers
-    layer_modules = [
-        ["qkv", "proj"],
-        ["fc1", "fc2", "fc3"],
-        ["self_attn.k_proj", "self_attn.v_proj", "self_attn.q_proj"],
-        ["self_attn.o_proj"],
-        ["mlp.up_proj", "mlp.gate_proj"],
-        ["mlp.down_proj"],
-    ]
 
     require_monkeypatch = True
 
@@ -80,11 +49,24 @@ class OvisGPTQ(BaseGPTQModel):
         self.model.visual_tokenizer = self.model.visual_tokenizer.to(dtype=self.model.llm.dtype)
         self.model.vte = self.model.vte.to(dtype=self.model.llm.dtype)
 
+        self.model.llm.generation_config.max_length = 8192
+
     def pre_quantize_generate_hook_start(self):
-        self.model.visual_tokenizer = move_to(self.model.visual_tokenizer, device=self.quantize_config.device)
-        self.model.vte = move_to(self.model.vte, device=self.quantize_config.device)
+        self.shell_module_materialize(self.model.visual_tokenizer, self.quantize_config.device)
+        self.shell_module_materialize(self.model.vte, self.quantize_config.device)
 
     def pre_quantize_generate_hook_end(self):
+        if self.quantize_config.offload_to_disk:
+            offload_to_disk(model=self.model,
+                            module=self.model.visual_tokenizer,
+                            disk_path=self.quantize_config.offload_to_disk_path,
+                            )
+            offload_to_disk(model=self.model,
+                            module=self.model.vte,
+                            disk_path=self.quantize_config.offload_to_disk_path,
+                            )
+            return
+
         self.model.visual_tokenizer = move_to(self.model.visual_tokenizer, device=CPU)
         self.model.vte = move_to(self.model.vte, device=CPU)
 
@@ -125,7 +107,8 @@ class OvisGPTQ(BaseGPTQModel):
             calibration_dataset,
             calibration_dataset_concat_size,
             batch_size: int = 1,
-            tokenizer=None, ):
+            tokenizer=None,
+            **kwargs):
         calib_data = []
         for batch in batched(calibration_dataset, batch_size, self.preprocess_dataset):
             pixel_values, input_ids, labels = tuple([instance[key] for instance in batch]

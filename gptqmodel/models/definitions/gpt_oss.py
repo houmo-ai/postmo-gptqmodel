@@ -1,170 +1,199 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# <<<<<<< HEAD
+# # Copyright 2024-2025 ModelCloud.ai
+# # Copyright 2024-2025 qubitium@modelcloud.ai
+# # Contact: qubitium@modelcloud.ai, x.com/qubitium
+# #
+# # Licensed under the Apache License, Version 2.0 (the "License");
+# # you may not use this file except in compliance with the License.
+# # You may obtain a copy of the License at
+# #
+# #     http://www.apache.org/licenses/LICENSE-2.0
+# #
+# # Unless required by applicable law or agreed to in writing, software
+# # distributed under the License is distributed on an "AS IS" BASIS,
+# # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# # See the License for the specific language governing permissions and
+# # limitations under the License.
+
+# from .._const import EXPERT_INDEX_PLACEHOLDER
+# from ..base import BaseGPTQModel
+
+
+# class GptOssGPTQ(BaseGPTQModel):
+#     # allow dynamic expert index for layer_modules so we don't need to write out 64 layers here
+#     # config.num_experts contains the actual expert count used for index
+#     dynamic_expert_index = "num_local_experts"
+
+#     base_modules = ["model.embed_tokens", "model.norm"]
+#     pre_lm_head_norm_module = "model.norm"
+
+#     layers_node = ["model.layers"]
+#     layer_type = "GptOssDecoderLayer"
+#     layer_modules = [
+#         ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
+#         ["self_attn.o_proj"],
+
+#         ["mlp.router.proj"],
+
+#         # uses dynamic_expert_index
+#         [f"mlp.experts.{EXPERT_INDEX_PLACEHOLDER}.gate_up_proj"],
+#         [f"mlp.experts.{EXPERT_INDEX_PLACEHOLDER}.down_proj"],
+#     ]
+
+#     layers_modules_tree = [
+# =======
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+import torch
+import torch.nn.functional as F
+from torch import nn
 
-from .._const import EXPERT_INDEX_PLACEHOLDER
-from ..base import BaseGPTQModel
+from ..base import BaseQModel
 
 
-class GptOssGPTQ(BaseGPTQModel):
-    # allow dynamic expert index for layer_modules so we don't need to write out 64 layers here
-    # config.num_experts contains the actual expert count used for index
+class GptOssExpertsNew(nn.Module):
+    def __init__(self, config, ori_experts=None):
+        super().__init__()
+        self.intermediate_size = config.intermediate_size
+        self.num_experts = config.num_local_experts
+        self.hidden_size = config.hidden_size
+        self.expert_dim = self.intermediate_size
+        self.alpha = 1.702
+        self.limit = 7.0
+        self.quantizing = False
+
+        self.gate_up = nn.ModuleList([
+            nn.Linear(self.hidden_size, 2 * self.expert_dim, dtype=config.dtype)
+            for _ in range(self.num_experts)
+        ])
+
+        self.down = nn.ModuleList([
+            nn.Linear(self.expert_dim, self.hidden_size, dtype=config.dtype)
+            for _ in range(self.num_experts)
+        ])
+
+        if ori_experts is not None:
+            self.quantizing = True
+            for i in range(self.num_experts):
+                tgt_gu_w = self.gate_up[i].weight   # [2E, H]
+                tgt_gu_b = self.gate_up[i].bias     # [2E]
+                tgt_d_w  = self.down[i].weight      # [H, E]
+                tgt_d_b  = self.down[i].bias        # [H]
+
+                gu_w_src = ori_experts.gate_up_proj[i].detach().t().contiguous()
+                gu_b_src = ori_experts.gate_up_proj_bias[i].detach()
+                d_w_src  = ori_experts.down_proj[i].detach().t().contiguous()
+                d_b_src  = ori_experts.down_proj_bias[i].detach()
+
+                with torch.inference_mode():
+                    tgt_gu_w.copy_(gu_w_src)
+                    tgt_gu_b.copy_(gu_b_src)
+                    tgt_d_w.copy_(d_w_src)
+                    tgt_d_b.copy_(d_b_src)
+
+    def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
+        if self.quantizing:
+            # For quantization, we need to trigger computation of all experts
+            batch_size = hidden_states.shape[0]
+            hidden_states = hidden_states.reshape(-1, self.hidden_size)  # (num_tokens, hidden_size)
+            num_experts = routing_weights.shape[1]
+
+            hidden_states = hidden_states.repeat(num_experts, 1)
+            hidden_states = hidden_states.view(num_experts, -1, self.hidden_size)
+            gate_up = torch.stack([proj(hidden_states[i]) for i, proj in enumerate(self.gate_up)])
+            gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+            gate = gate.clamp(min=None, max=self.limit)
+            up = up.clamp(min=-self.limit, max=self.limit)
+            glu = gate * torch.sigmoid(gate * self.alpha)
+            next_states = torch.stack([proj((up[i] + 1) * glu[i]) for i, proj in enumerate(self.down)])
+            next_states = next_states.view(num_experts, batch_size, -1, self.hidden_size)
+            next_states = next_states * routing_weights.transpose(0, 1).view(num_experts, batch_size, -1)[..., None]
+            next_states = next_states.sum(dim=0)
+
+            return next_states
+
+        # For non-quantization forward pass, reduce forward pass time by only computing active experts
+        batch_size, seq_len = hidden_states.shape[0], hidden_states.shape[1] if len(hidden_states.shape) > 2 else 1
+        hidden_states = hidden_states.reshape(-1, self.hidden_size)  # (num_tokens, hidden_size)
+
+        active_experts = torch.unique(router_indices.flatten())
+        final_output = torch.zeros_like(hidden_states)
+        for expert_idx in active_experts:
+            expert_mask = (router_indices == expert_idx).any(dim=-1)  # (num_tokens,)
+            if not expert_mask.any():
+                continue
+
+            expert_tokens = hidden_states[expert_mask]  # (selected_tokens, hidden_size)
+
+            gate_up_output = self.gate_up[expert_idx](expert_tokens)  # (selected_tokens, 2*expert_dim)
+            gate, up = gate_up_output[..., ::2], gate_up_output[..., 1::2]
+
+            gate = gate.clamp(min=None, max=self.limit)
+            up = up.clamp(min=-self.limit, max=self.limit)
+            glu = gate * torch.sigmoid(gate * self.alpha)
+
+            expert_output = self.down[expert_idx]((up + 1) * glu)  # (selected_tokens, hidden_size)
+
+            expert_weights = routing_weights[expert_mask, expert_idx].unsqueeze(-1)  # (selected_tokens, 1)
+
+            final_output[expert_mask] += expert_output * expert_weights
+
+        if seq_len > 1:
+            final_output = final_output.view(batch_size, seq_len, self.hidden_size)
+        else:
+            final_output = final_output.view(batch_size, self.hidden_size)
+
+        return final_output
+
+class GptOssTopKRouterNew(nn.Module):
+    def __init__(self, config, ori_router=None):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_local_experts
+        self.hidden_dim = config.hidden_size
+        self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
+        self.bias = nn.Parameter(torch.empty(self.num_experts))
+
+        if ori_router is not None:
+            with torch.inference_mode():
+                self.weight.copy_(ori_router.weight.detach())
+                self.bias.copy_(ori_router.bias.detach())
+
+    def forward(self, hidden_states):
+        hidden_states = hidden_states.reshape(-1, self.hidden_dim)
+        router_logits = F.linear(hidden_states, self.weight.to(hidden_states.dtype), self.bias.to(hidden_states.dtype))  # (seq_len, num_experts)
+        router_top_value, router_indices = torch.topk(router_logits, self.top_k, dim=-1)  # (seq_len, top_k)
+        router_top_value = torch.nn.functional.softmax(router_top_value, dim=1, dtype=router_top_value.dtype)
+        router_scores = torch.zeros_like(router_logits).scatter_(1, router_indices, router_top_value)
+        return router_scores, router_indices
+
+class GPTOSSGPTQ(BaseQModel):
     dynamic_expert_index = "num_local_experts"
 
-    base_modules = ["model.embed_tokens", "model.norm"]
     pre_lm_head_norm_module = "model.norm"
 
-    layers_node = ["model.layers"]
-    layer_type = "GptOssDecoderLayer"
-    layer_modules = [
-        ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
-        ["self_attn.o_proj"],
-
-        ["mlp.router.proj"],
-
-        # uses dynamic_expert_index
-        [f"mlp.experts.{EXPERT_INDEX_PLACEHOLDER}.gate_up_proj"],
-        [f"mlp.experts.{EXPERT_INDEX_PLACEHOLDER}.down_proj"],
-    ]
-
-    layers_modules_tree = [
+    module_tree = [
         "model",
         "layers",
         "#",
         {
-            "self_attn": ("k_proj", "v_proj", "q_proj", "o_proj"),
+            "input_layernorm": ("input_layernorm:!",),
+            "self_attn": ("q_proj:0", "k_proj:0", "v_proj:0", "o_proj:1"),
+            "post_attention_layernorm": ("post_attention_layernorm:!",),
             "mlp": {
-                "router": ("proj",),
                 "experts": {
-                    "#": ("gate_up_proj", "down_proj"),
-                },
-            },
+                    "gate_up": {"#": ("#")},
+                    "down": {"#": ("#")},
+                }
+            }
         }
     ]
 
-    require_monkeypatch = True
+    def before_model_load(self, load_quantized_model=False):
+        if load_quantized_model:
+            import transformers.models.gpt_oss.modeling_gpt_oss as gpt_oss_modeling
 
-    def monkey_patch(self):
-        import torch
-        import torch.nn as nn
-
-        # Convert router (Parameter -> nn.Linear named `proj`)
-        for layer in getattr(self.model, "layers", []):
-            router = getattr(layer.mlp, "router", None)
-            if router is not None and not hasattr(router, "proj"):
-                # router has weight: (num_experts, hidden), bias: (num_experts)
-                weight = getattr(router, "weight", None)
-                bias = getattr(router, "bias", None)
-                if isinstance(weight, torch.nn.Parameter) and isinstance(bias, torch.nn.Parameter):
-                    num_experts, hidden = weight.shape
-                    proj = nn.Linear(hidden, num_experts, bias=True)
-                    with torch.no_grad():
-                        proj.weight.copy_(weight)
-                        proj.bias.copy_(bias)
-                    router.proj = proj
-
-                    def router_forward(self, hidden_states):
-                        return torch.nn.functional.linear(hidden_states, self.proj.weight, self.proj.bias).softmax(dim=-1), None
-
-                    # keep original behavior: return (scores, indices) for compatibility with upstream
-                    def router_forward_topk(self, hidden_states):
-                        hidden_states = hidden_states.reshape(-1, self.proj.in_features)
-                        logits = torch.nn.functional.linear(hidden_states, self.proj.weight, self.proj.bias)
-                        topk = getattr(self, "top_k", 2)
-                        values, indices = torch.topk(logits, topk, dim=-1)
-                        values = torch.nn.functional.softmax(values, dim=1, dtype=values.dtype)
-                        scores = torch.zeros_like(logits).scatter_(1, indices, values)
-                        return scores, indices
-
-                    # prefer full-compat forward signature
-                    router.forward = router_forward_topk.__get__(router, type(router))
-
-        # Convert experts tensors (batched Parameters -> per-expert nn.Linear)
-        for layer in getattr(self.model, "layers", []):
-            mlp = getattr(layer, "mlp", None)
-            experts = getattr(mlp, "experts", None)
-            if experts is None:
-                continue
-
-            # Expected attributes on original experts:
-            gate_up = getattr(experts, "gate_up_proj", None)
-            gate_up_bias = getattr(experts, "gate_up_proj_bias", None)
-            down = getattr(experts, "down_proj", None)
-            down_bias = getattr(experts, "down_proj_bias", None)
-
-            # If already converted, skip
-            if isinstance(getattr(experts, "experts", None), nn.ModuleList):
-                continue
-
-            # Validate shapes
-            if not (isinstance(gate_up, nn.Parameter) and isinstance(gate_up_bias, nn.Parameter)
-                    and isinstance(down, nn.Parameter) and isinstance(down_bias, nn.Parameter)):
-                continue
-
-            num_experts, hidden, twoE = gate_up.shape
-            expert_dim = twoE // 2
-            assert twoE == 2 * expert_dim, "gate_up_proj last dim must be 2*expert_dim"
-            assert down.shape == (num_experts, expert_dim, hidden)
-            assert gate_up_bias.shape == (num_experts, 2 * expert_dim)
-            assert down_bias.shape == (num_experts, hidden)
-
-            # Build per-expert submodules exposing `gate_up_proj` and `down_proj` as nn.Linear
-            class _GptOssExpertModule(nn.Module):
-                def __init__(self, hidden_size: int, expert_dim: int):
-                    super().__init__()
-                    self.gate_up_proj = nn.Linear(hidden_size, 2 * expert_dim, bias=True)
-                    self.down_proj = nn.Linear(expert_dim, hidden_size, bias=True)
-
-            expert_modules = nn.ModuleList()
-            for i in range(num_experts):
-                mod = _GptOssExpertModule(hidden, expert_dim)
-                with torch.no_grad():
-                    mod.gate_up_proj.weight.copy_(gate_up[i].t())  # (hidden, 2E) -> Linear expects (out, in)
-                    mod.gate_up_proj.bias.copy_(gate_up_bias[i])
-                    mod.down_proj.weight.copy_(down[i].t())        # (E, hidden) -> (hidden, E) before .t()
-                    mod.down_proj.bias.copy_(down_bias[i])
-                expert_modules.append(mod)
-
-            # Attach converted structure
-            experts.experts = expert_modules
-
-            # Override experts.forward to use the per-expert Linear modules
-            def experts_forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None):
-                batch_size = hidden_states.shape[0]
-                seq_len = hidden_states.shape[1]
-                hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
-                topk = router_indices.shape[1]
-                device = hidden_states.device
-                out = torch.zeros((hidden.shape[0], self.experts[0].down_proj.out_features), dtype=hidden_states.dtype, device=device)
-
-                # accumulate per expert
-                for expert_id, expert in enumerate(self.experts):
-                    mask = (router_indices == expert_id).any(dim=-1)
-                    if not mask.any():
-                        continue
-                    token_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-                    current = hidden[token_idx]
-                    gate_up = expert.gate_up_proj(current)
-                    gate, up = gate_up[..., ::2], gate_up[..., 1::2]
-                    gate = torch.clamp(gate, max=7.0)
-                    up = torch.clamp(up, min=-7.0, max=7.0)
-                    glu = gate * torch.sigmoid(gate * 1.702)
-                    mid = (up + 1) * glu
-                    down_out = expert.down_proj(mid)
-                    weight = routing_weights[token_idx, (router_indices[token_idx] == expert_id).nonzero(as_tuple=True)[1]].unsqueeze(-1)
-                    out[token_idx] += down_out * weight
-                return out.view(batch_size, seq_len, -1)
-
-            experts.forward = experts_forward.__get__(experts, type(experts))
+            gpt_oss_modeling.GptOssExperts = GptOssExpertsNew
+            gpt_oss_modeling.GptOssTopKRouter = GptOssTopKRouterNew

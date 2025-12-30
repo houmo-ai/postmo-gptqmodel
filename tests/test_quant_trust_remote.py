@@ -1,33 +1,22 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 # -- do not touch
 import os
+
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 # -- end do not touch
 
 import tempfile  # noqa: E402
 
-import transformers  # noqa: E402
+from models.model_test import ModelTest  # noqa: E402
+from transformers import AutoTokenizer  # noqa: E402
+
 from gptqmodel import GPTQModel  # noqa: E402
 from gptqmodel.quantization import FORMAT, QuantizeConfig  # noqa: E402
-from models.model_test import ModelTest  # noqa: E402
-from packaging.version import Version  # noqa: E402
-from transformers import AutoTokenizer  # noqa: E402
 
 
 class TestQuantWithTrustRemoteTrue(ModelTest):
@@ -39,7 +28,7 @@ class TestQuantWithTrustRemoteTrue(ModelTest):
         if not self.tokenizer.pad_token_id:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
-        self.calibration_dataset = self.load_dataset(self.tokenizer)
+        self.calibration_dataset = self.load_dataset(self.tokenizer, self.DATASET_SIZE)
 
     def test_diff_batch(self):
         quantize_config = QuantizeConfig(
@@ -48,10 +37,7 @@ class TestQuantWithTrustRemoteTrue(ModelTest):
             format=FORMAT.GPTQ,
         )
         args = {}
-        # if flash_attn was installed and _attn_implementation_autoset was None, flash attention would be loaded
-        # but device map is cpu, it will trow non-supported device error
-        if Version(transformers.__version__) >= Version("4.46.0"):
-            args["_attn_implementation_autoset"] = True
+
         model = GPTQModel.load(
             self.MODEL_ID,
             quantize_config=quantize_config,

@@ -1,15 +1,22 @@
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
+# Contact: qubitium@modelcloud.ai, x.com/qubitium
+
+import os
 import os.path
 import tempfile
 
 import torch.cuda
-from gptqmodel import GPTQModel, QuantizeConfig
-from gptqmodel.utils.tensor import tensor_parameters
 from models.model_test import ModelTest
 from safetensors.torch import load_file
 
+from gptqmodel import GPTQModel, QuantizeConfig
+from gptqmodel.utils.tensor import tensor_parameters
+
 
 class TestsParameterCount(ModelTest):
-    LLAMA_3_2_1B_PARAMETER_COUNT = 1235814400
+    LLAMA_3_2_1B_PARAMETER_COUNT = 1235814432
 
     # ModelCloud/Llama-3.2-1B-Instruct-gptqmodel-4bit-vortex-v1 incorrectly saves lm_head.weight,
     # and the number of calculated parameters will be larger.
@@ -19,10 +26,11 @@ class TestsParameterCount(ModelTest):
     def test_parameter_count(self):
         import os.path
 
-        from gptqmodel import QuantizeConfig
-        from gptqmodel.utils.tensor import tensor_parameters
         from huggingface_hub import hf_hub_download
         from safetensors.torch import load_file
+
+        from gptqmodel import QuantizeConfig
+        from gptqmodel.utils.tensor import tensor_parameters
 
         model_id = "/monster/data/model/Llama-3.2-1B-Instruct-gptqmodel-4bit-vortex-v1"
         if os.path.isdir(model_id):
@@ -47,7 +55,7 @@ class TestsParameterCount(ModelTest):
     def test_parameter_count_with_quant(self):
         model_id = "/monster/data/model/Llama-3.2-1B-Instruct"  # meta-llama/Llama-3.2-1B-Instruct
 
-        calibration_dataset = self.load_dataset(self.load_tokenizer(model_id))
+        calibration_dataset = self.load_dataset(self.load_tokenizer(model_id), self.DATASET_SIZE)
 
         quant_config = QuantizeConfig(bits=4, group_size=128)
 

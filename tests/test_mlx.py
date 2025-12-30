@@ -1,5 +1,11 @@
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
+# Contact: qubitium@modelcloud.ai, x.com/qubitium
+
 import os
 import sys
+
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
@@ -8,10 +14,11 @@ if sys.platform == "darwin":
 
 import tempfile  # noqa: E402
 
-from gptqmodel import GPTQModel  # noqa: E402
 from mlx_lm import generate, load  # noqa: E402
 from models.model_test import ModelTest  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
+
+from gptqmodel import GPTQModel  # noqa: E402
 
 
 class TestExport(ModelTest):
@@ -20,7 +27,7 @@ class TestExport(ModelTest):
     @classmethod
     def setUpClass(self):
         self.tokenizer = AutoTokenizer.from_pretrained(self.NATIVE_MODEL_ID, use_fast=True)
-        self.calibration_dataset = self.load_dataset(self.tokenizer)
+        self.calibration_dataset = self.load_dataset(self.tokenizer, self.DATASET_SIZE)
 
     def test_export_mlx(self):
         with tempfile.TemporaryDirectory() as export_dir:

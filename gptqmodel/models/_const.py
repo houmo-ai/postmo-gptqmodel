@@ -1,18 +1,8 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+from __future__ import annotations
 
 from enum import Enum
 
@@ -25,7 +15,9 @@ from ..utils import BACKEND
 from ..utils.rocm import IS_ROCM
 from ..utils.torch import HAS_CUDA, HAS_MPS, HAS_XPU
 
+
 CPU = device("cpu")
+META = device("meta")
 CUDA = device("cuda")
 CUDA_0 = device("cuda:0")
 XPU = device("xpu")
@@ -42,7 +34,7 @@ class DEVICE(str, Enum):
     CPU = "cpu"  # All CPU: Optimized for IPEX is CPU has AVX, AVX512, AMX, or XMX instructions
     CUDA = "cuda"  # Nvidia GPU: Optimized for Ampere+
     XPU = "xpu"  # Intel GPU: Datacenter Max + Arc
-    MPS = "mps"  # MacOS GPU: Apple Silion/Metal)
+    MPS = "mps"  # MacOS GPU: Apple Silicon/Metal)
     ROCM = "rocm"  # AMD GPU: ROCm maps to fake cuda
 
     @classmethod
@@ -51,6 +43,25 @@ class DEVICE(str, Enum):
         if IS_ROCM and f"{value}".lower() == "rocm":
             return cls.ROCM
         return super()._missing_(value)
+
+    @property
+    def type(self) -> str:
+        """Return the backend type compatible with torch.device semantics."""
+        if self == DEVICE.ROCM:
+            return "cuda"
+        return self.value
+
+    @property
+    def index(self) -> int | None:
+        """Default index used when materialising a torch.device from this enum."""
+        if self in (DEVICE.CUDA, DEVICE.ROCM, DEVICE.XPU):
+            return 0
+        return None
+
+    def to_torch_device(self) -> torch.device:
+        """Convert the enum to a concrete torch.device, defaulting to index 0."""
+        idx = self.index
+        return torch.device(self.type if idx is None else f"{self.type}:{idx}")
 
     def to_device_map(self):
         return {"": DEVICE.CUDA if self == DEVICE.ROCM else self}
@@ -108,9 +119,7 @@ def normalize_device(type_value: str | DEVICE | int | torch.device) -> DEVICE:
 
 
 def get_best_device(backend: BACKEND = BACKEND.AUTO) -> torch.device:
-    if backend == BACKEND.IPEX:
-        return XPU_0 if HAS_XPU else CPU
-    elif HAS_CUDA:
+    if HAS_CUDA:
         return CUDA_0
     elif HAS_XPU:
         return XPU_0
@@ -122,5 +131,3 @@ def get_best_device(backend: BACKEND = BACKEND.AUTO) -> torch.device:
 EXLLAMA_DEFAULT_MAX_INPUT_LENGTH = 2048
 
 EXPERT_INDEX_PLACEHOLDER = "{expert_index}"
-
-CALIBRATION_DATASET_CONCAT_CHAR = " "

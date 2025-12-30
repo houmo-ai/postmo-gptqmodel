@@ -1,18 +1,7 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from typing import Optional, Tuple
 
@@ -23,22 +12,27 @@ from ...adapter.adapter import Adapter, Lora
 from ...models._const import DEVICE, PLATFORM
 from ...utils.backend import BACKEND
 from ...utils.logger import setup_logger
-from ...utils.python import has_gil
+from ...utils.python import has_gil_disabled
 from .torch import TorchQuantLinear
 
-try:
-    # TODO: triton is not compatible with free threading
-    if not has_gil():
-        raise Exception("GIL is disabled so Triton is not (yet) compatible.")
 
+try:
     import triton
     import triton.language as tl
     from triton import __version__ as triton_version
 
     from ..triton_utils.dequant import QuantLinearFunction
     from ..triton_utils.mixin import TritonModuleMixin
-    if version.parse(triton_version) < version.parse("2.0.0"):
+
+    triton_v = version.parse(triton_version)
+
+    if triton_v < version.parse("2.0.0"):
         raise ImportError(f"triton version must be >= 2.0.0: actual = {triton_version}")
+
+    # GIL=0 is tested with Triton 3.4.0 and it works
+    if has_gil_disabled() and triton_v < version.parse("3.4.0"):
+        raise Exception("GIL is disabled and not compatible with current Triton. Please upgrade to Triton >= 3.4.0")
+
     TRITON_AVAILABLE = True
 except BaseException:
     TRITON_AVAILABLE = False
@@ -53,7 +47,7 @@ log = setup_logger()
 
 class TritonV2QuantLinear(TorchQuantLinear, TritonModuleMixin):
     SUPPORTS_BITS = [2, 4, 8]
-    SUPPORTS_GROUP_SIZE = [-1, 16, 32, 64, 128]
+    SUPPORTS_GROUP_SIZE = [-1, 16, 32, 64, 128, 256, 512, 1024]
     SUPPORTS_DESC_ACT = [True, False]
     SUPPORTS_SYM = [True, False]
     SUPPORTS_SHARDS = True
@@ -68,6 +62,8 @@ class TritonV2QuantLinear(TorchQuantLinear, TritonModuleMixin):
     SUPPORTS_ADAPTERS = [Lora]
 
     SUPPORTS_DTYPES = [torch.float16, torch.bfloat16]
+
+    REQUIRES_FORMAT_V2 = True
 
     # for transformers/optimum tests compat
     QUANT_TYPE = "tritonv2"
@@ -91,10 +87,13 @@ class TritonV2QuantLinear(TorchQuantLinear, TritonModuleMixin):
         bias: bool = False,
         pack_dtype: torch.dtype = torch.int32,
         adapter: Adapter = None,
+        register_buffers: bool = True,
         **kwargs,
     ):
         if not TRITON_AVAILABLE:
             raise ValueError(TRITON_INSTALL_HINT)
+
+        # log.debug(f"triton register_buffers: {register_buffers}")
         super().__init__(
             bits=bits,
             group_size=group_size,
@@ -106,7 +105,7 @@ class TritonV2QuantLinear(TorchQuantLinear, TritonModuleMixin):
             pack_dtype=pack_dtype,
             backend=kwargs.pop("backend", BACKEND.TRITON),
             adapter=adapter,
-            register_buffers=True,
+            register_buffers=register_buffers,
             **kwargs)
 
         # if self.group_size != self.in_features:
@@ -207,5 +206,4 @@ def triton_xpu_available():
         return True
     except Exception:
         return False
-
 

@@ -1,10 +1,17 @@
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
+# Contact: qubitium@modelcloud.ai, x.com/qubitium
+
 import tempfile
 
 from datasets import load_dataset
+from logbar import LogBar
+
 from gptqmodel import GPTQModel, QuantizeConfig
 from gptqmodel.quantization import FORMAT
 from gptqmodel.utils.eval import EVAL
-from logbar import LogBar
+
 
 log = LogBar.shared()
 
@@ -13,7 +20,7 @@ CFG_BITS = 4
 CFG_GROUPSIZE = 128
 CFG_V2 = True
 INPUTS_MAX_LENGTH = 2048 # in tokens
-QUANT_SAVE_PATH = f"/monster/data/xl/gptq_v2_{CFG_V2}_bit_{CFG_BITS}_gpsize_{CFG_GROUPSIZE}_llama_3.1_8B_Instruct"
+QUANT_SAVE_PATH = f"/monster/data/model/gptq_v2_{CFG_V2}_bit_{CFG_BITS}_gpsize_{CFG_GROUPSIZE}_llama_3.1_8B_Instruct"
 
 RAND_SEED = 898
 
@@ -70,10 +77,11 @@ if not EVAL_ONLY:
 # eval
 from lm_eval.utils import make_table
 
+
 with tempfile.TemporaryDirectory() as tmp_dir:
     results = GPTQModel.eval(
         QUANT_SAVE_PATH,
-        tasks=[EVAL.LM_EVAL.GSM8K_PLATINUM_COT], #, EVAL.LM_EVAL.GSM8K_PLATINUM_COT],
+        tasks=[EVAL.LM_EVAL.GSM8K_COT], #, EVAL.LM_EVAL.GSM8K_PLATINUM_COT],
         apply_chat_template=True,
         random_seed=898,
         output_path= tmp_dir,

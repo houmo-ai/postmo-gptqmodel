@@ -1,24 +1,14 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import os
 import time
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
 
 try:
     from optimum.intel.utils.modeling_utils import bind_cores_for_best_perf
@@ -28,6 +18,7 @@ except ImportError as e:
     pass
 
 import argparse
+
 
 parser = argparse.ArgumentParser(description="Benchmark IPEX vs HF on a pre-trained model.")
 parser.add_argument("--model", type=str, required=True, help="Path or name of the pre-trained model.")
@@ -70,7 +61,7 @@ if is_quantized_model:
     print("load quantized model, will use BACKEND.IPEX")
     model = GPTQModel.load(ars.model, backend=BACKEND.IPEX)
 else:
-    model = AutoModelForCausalLM.from_pretrained(ars.model, device_map="cpu", torch_dtype=torch.bfloat16)
+    model = AutoModelForCausalLM.from_pretrained(ars.model, device_map="cpu", dtype=torch.bfloat16)
 print(f"load model use: {time.time() - start_load}")
 
 # set model to eval mode

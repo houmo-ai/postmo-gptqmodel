@@ -1,28 +1,19 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import os
+
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import tempfile
 
-from gptqmodel import BACKEND, GPTQModel, QuantizeConfig
-from gptqmodel.models._const import DEVICE
 from models.model_test import ModelTest
 from parameterized import parameterized
+
+from gptqmodel import BACKEND, GPTQModel, QuantizeConfig
+from gptqmodel.models._const import DEVICE
 
 
 class TestInferenceResultXPU(ModelTest):
@@ -34,16 +25,15 @@ class TestInferenceResultXPU(ModelTest):
             (BACKEND.TORCH, DEVICE.XPU, False),
         ]
     )
-    def testTritonXPU(self, backend, device, template):
+    def testTorchXPU(self, backend, device, template):
         origin_model = GPTQModel.load(
             self.NATIVE_MODEL_ID,
-            quantize_config=QuantizeConfig(),
+            quantize_config=QuantizeConfig(device=device),
             backend=backend,
-            device=device,
         )
         tokenizer = self.load_tokenizer(self.NATIVE_MODEL_ID)
         calibration_dataset = self.load_dataset(tokenizer, rows=128)
-        origin_model.quantize(calibration_dataset, backend=BACKEND.TRITON)
+        origin_model.quantize(calibration_dataset, backend=BACKEND.TORCH)
 
         with tempfile.TemporaryDirectory() as tmpdir:
           origin_model.save(tmpdir)

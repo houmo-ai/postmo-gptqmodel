@@ -1,18 +1,7 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 # Adapted from turboderp exllama: https://github.com/turboderp/exllamav2
 
@@ -24,13 +13,15 @@ from ...adapter.adapter import Adapter, Lora
 from ...models._const import DEVICE, PLATFORM
 from ...nn_modules.qlinear import BaseQuantLinear
 from ...utils.backend import BACKEND
+from ...utils.exllamav2 import ScratchSpace
 from ...utils.logger import setup_logger
+
 
 exllama_v2_import_exception = None
 try:
     from gptqmodel_exllamav2_kernels import gemm_half_q_half, make_q_matrix
 except ImportError as e:
-    exllama_v2_import_exception = e
+    exllama_v2_import_exception = str(e)
 
 log = setup_logger()
 
@@ -139,6 +130,8 @@ class ExllamaV2QuantLinear(BaseQuantLinear):
 
     SUPPORTS_DTYPES = [torch.float16, torch.bfloat16]
 
+    REQUIRES_FORMAT_V2 = True
+
     # for transformers/optimum tests compat
     QUANT_TYPE = "exllamav2"
 
@@ -155,6 +148,7 @@ class ExllamaV2QuantLinear(BaseQuantLinear):
         bias: bool = False,
         pack_dtype: torch.dtype = torch.int32,
         adapter: Adapter = None,
+        register_buffers: bool = True,
         **kwargs, ):
 
         if exllama_v2_import_exception is not None:
@@ -184,7 +178,7 @@ class ExllamaV2QuantLinear(BaseQuantLinear):
             pack_dtype=pack_dtype,
             backend=kwargs.pop("backend", BACKEND.EXLLAMA_V2),
             adapter=adapter,
-            register_buffers=True,
+            register_buffers=register_buffers,
             register_buffers_in_features=in_features,
             register_buffers_out_feature=out_features,
             **kwargs)
@@ -195,10 +189,10 @@ class ExllamaV2QuantLinear(BaseQuantLinear):
     @classmethod
     def validate(cls, **args) -> Tuple[bool, Optional[Exception]]:
         if exllama_v2_import_exception is not None:
-            return False, exllama_v2_import_exception
+            return False, ImportError(exllama_v2_import_exception)
         return cls._validate(**args)
 
-    def post_init(self, temp_dq):
+    def post_init(self, scratch_space: ScratchSpace):
         # resize due to padding after model weights have been loaded
         # if self.out_features != self.original_out_features or self.in_features != self.original_in_features:
         #     self.qweight.resize_(self.in_features // self.pack_dtype_bits * self.bits, self.out_features)
@@ -220,7 +214,7 @@ class ExllamaV2QuantLinear(BaseQuantLinear):
             "scales": self.scales,
             "g_idx": self.g_idx,
         }
-        temp_dq = temp_dq.get_scratch_slice(self.temp_dq_size())
+        temp_dq = scratch_space.get_slice(self.temp_dq_size())
         self.q_handle = ext_make_q_matrix(self.q_tensors, temp_dq)
 
         super().post_init()
@@ -269,30 +263,3 @@ class ExllamaV2QuantLinear(BaseQuantLinear):
 
     def scratch_space_fixed(self, max_input_len=2048, max_batch_size=8):
         return self.temp_dq_size() + self.temp_fwd_size(max_input_len, max_batch_size)
-
-
-class ExLlamaV2DeviceTensors:
-    device_idx: int
-    scratch_bytes: int
-    scratch_idx: int
-    scratch: torch.tensor = None
-
-    def __init__(self, device_idx, scratch_bytes):
-        self.device_idx = device_idx
-        self.scratch_bytes = scratch_bytes
-
-    def prepare(self):
-        self.scratch = torch.empty(
-            (self.scratch_bytes // 2,),
-            dtype=torch.half,
-            device=_torch_device(self.device_idx),
-        )
-
-    def get_scratch_slice(self, size_bytes):
-        if self.scratch is None:
-            self.prepare()
-
-        size_bytes = ((size_bytes + 127) // 128) * 128
-        size_half = size_bytes // 2
-        scratch_slice = self.scratch.narrow(0, 0, size_half)
-        return scratch_slice

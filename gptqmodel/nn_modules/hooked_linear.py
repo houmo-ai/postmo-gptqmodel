@@ -1,18 +1,7 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import copy
 from typing import Dict, List, Tuple, Union
 
@@ -22,7 +11,15 @@ from torch import nn
 
 from ..utils.logger import setup_logger
 
+
 log = setup_logger()
+
+
+class StopForward(Exception):
+    """Signal an intentional early stop of the forward pass."""
+    pass
+
+STOP_FORWARD_EXCEPTION = StopForward("Forwarding stopped")
 
 # Models using conv1d: gpt2
 class HookedConv1D(transformers.Conv1D):
@@ -31,6 +28,7 @@ class HookedConv1D(transformers.Conv1D):
         self.nf = nf
         self.nx = nx
         self.forward_hook = None
+        self.forward_hook_last = False
 
     @staticmethod
     def from_conv1d(m: transformers.Conv1D):
@@ -40,11 +38,21 @@ class HookedConv1D(transformers.Conv1D):
         custom.bias = m.bias
         return custom
 
+    @torch.inference_mode()
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        input = input.to(device=self.weight.data.device)
+        original_device = input.device
+        target_device = self.weight.data.device
+        if original_device != target_device:
+            input = input.to(device=target_device)
         output = super().forward(input)
+
         if self.forward_hook:
             self.forward_hook(self, (input,), output)
+            if self.forward_hook_last:
+                raise STOP_FORWARD_EXCEPTION.with_traceback(None)
+
+        if output.device != original_device:
+            output = output.to(device=original_device)
         return output
 
 class HookedConv1d(torch.nn.Conv1d):
@@ -72,6 +80,7 @@ class HookedConv1d(torch.nn.Conv1d):
         #     padding_mode,
         # )
         self.forward_hook = None
+        self.forward_hook_last = False
 
     @staticmethod
     def from_conv1d(m: torch.nn.Conv1d):
@@ -93,11 +102,19 @@ class HookedConv1d(torch.nn.Conv1d):
         custom.bias = m.bias
         return custom
 
+    @torch.inference_mode()
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        input = input.to(device=self.weight.data.device)
+        original_device = input.device
+        target_device = self.weight.data.device
+        if original_device != target_device:
+            input = input.to(device=target_device)
         output = super().forward(input)
         if self.forward_hook:
             self.forward_hook(self, (input,), output)
+            if self.forward_hook_last:
+                raise STOP_FORWARD_EXCEPTION.with_traceback(None)
+        if output.device != original_device:
+            output = output.to(device=original_device)
         return output
 
 # Models using conv2d: ovis
@@ -126,6 +143,7 @@ class HookedConv2d(torch.nn.Conv2d):
         #     padding_mode,
         # )
         self.forward_hook = None
+        self.forward_hook_last = False
 
     @staticmethod
     def from_conv2d(m: torch.nn.Conv2d):
@@ -147,11 +165,19 @@ class HookedConv2d(torch.nn.Conv2d):
         custom.bias = m.bias
         return custom
 
+    @torch.inference_mode()
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        input = input.to(device=self.weight.data.device)
+        original_device = input.device
+        target_device = self.weight.data.device
+        if original_device != target_device:
+            input = input.to(device=target_device)
         output = super().forward(input)
         if self.forward_hook:
             self.forward_hook(self, (input,), output)
+            if self.forward_hook_last:
+                raise STOP_FORWARD_EXCEPTION.with_traceback(None)
+        if output.device != original_device:
+            output = output.to(device=original_device)
         return output
 
 # Models using transformers.conv1d: gpt2
@@ -161,6 +187,7 @@ class HookedTransformerConv1D(transformers.Conv1D):
         self.nf = nf
         self.nx = nx
         self.forward_hook = None
+        self.forward_hook_last = False
 
     @staticmethod
     def from_conv1d(conv1d: transformers.Conv1D):
@@ -169,11 +196,19 @@ class HookedTransformerConv1D(transformers.Conv1D):
         custom.bias = conv1d.bias
         return custom
 
+    @torch.inference_mode()
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        input = input.to(device=self.weight.data.device)
+        original_device = input.device
+        target_device = self.weight.data.device
+        if original_device != target_device:
+            input = input.to(device=target_device)
         output = super().forward(input)
         if self.forward_hook:
             self.forward_hook(self, (input,), output)
+            if self.forward_hook_last:
+                raise STOP_FORWARD_EXCEPTION.with_traceback(None)
+        if output.device != original_device:
+            output = output.to(device=original_device)
         return output
 
 class HookedLinear(torch.nn.Linear):
@@ -184,6 +219,7 @@ class HookedLinear(torch.nn.Linear):
         self.out_features = out_features
 
         self.forward_hook = None
+        self.forward_hook_last = False
 
     @staticmethod
     def from_linear(linear: torch.nn.Linear):
@@ -192,11 +228,19 @@ class HookedLinear(torch.nn.Linear):
         custom_linear.bias = linear.bias
         return custom_linear
 
+    @torch.inference_mode()
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        input = input.to(device=self.weight.data.device)
+        original_device = input.device
+        target_device = self.weight.data.device
+        if original_device != target_device:
+            input = input.to(device=target_device)
         output = super().forward(input)
         if self.forward_hook:
             self.forward_hook(self, (input,), output)
+            if self.forward_hook_last:
+                raise STOP_FORWARD_EXCEPTION.with_traceback(None)
+        if output.device != original_device:
+            output = output.to(device=original_device)
         return output
 
 
@@ -222,15 +266,18 @@ def _replace_module(module, child, name, level: int = 0, debug: bool = False) ->
     return True
 
 
-def replace_module_with_hooked_legacy(module, level: int = 0):
-    if level == 0:
-        log.info("Hooked Modules: Using legacy based config for targeting of modules")
+def replace_module_with_hooked_legacy(module, level: int = 0, quant_lm_head: bool = False):
+    # if level == 0:
+    #     log.info("Hooked Modules: Using legacy based config for targeting of modules")
 
     for name, child in module.named_children():
-        if not _replace_module(module, child, name, level):
-            replace_module_with_hooked_legacy(child, level=level+1)
+        if not quant_lm_head and hasattr(module, "get_output_embeddings") and child == module.get_output_embeddings():
+            continue
 
+        if not _replace_module(module, child, name, level, quant_lm_head):
+            replace_module_with_hooked_legacy(child, level=level+1, quant_lm_head=quant_lm_head)
 
+# deprecated features
 def replace_module_with_hooked_tree(module, tree: Union[List,Dict] = [], level: int = 0, debug: bool = False):
     if level == 0:
         log.info("Hooked Modules: Using tree based config for accurate targeting of modules")

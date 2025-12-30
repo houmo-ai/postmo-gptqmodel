@@ -1,30 +1,31 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from model_test import ModelTest
 
+from gptqmodel.utils.eval import EVAL
 
+
+# | Metric                         |   MARLIN |
+# |--------------------------------|----------|
+# | arc_challenge :: acc,none      |   0.5154 |
+# | arc_challenge :: acc_norm,none |   0.535  |
+# | mmlu_stem :: acc,none          |   0.6325 |
 class TestGlm(ModelTest):
+    GROUP_SIZE = 32
     # real: THUDM/glm-4-9b-chat-hf
     NATIVE_MODEL_ID = "/monster/data/model/glm-4-9b-chat-hf"
-    NATIVE_ARC_CHALLENGE_ACC = 0.5154
-    NATIVE_ARC_CHALLENGE_ACC_NORM = 0.5316
-    QUANT_ARC_MAX_DELTA_FLOOR_PERCENT = 0.2
-    USE_VLLM = False
+    EVAL_TASKS = {
+        EVAL.LM_EVAL.ARC_CHALLENGE: {
+            "acc": {"value": 0.5154, "floor_pct": 0.04},
+            "acc_norm": {"value": 0.5350, "floor_pct": 0.04},
+        },
+        EVAL.LM_EVAL.MMLU_STEM: {
+            "acc": {"value": 0.6325, "floor_pct": 0.04},
+        },
+    }
 
     def test_glm(self):
         self.quant_lm_eval()
-

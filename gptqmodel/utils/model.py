@@ -1,67 +1,145 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
 import collections
 import functools
-import hashlib
 import json
+import math
 import operator
 import os
-import re
 import shutil
+import struct
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import accelerate
-import threadpoolctl as tctl
+import pcre as re
 import torch
 import torch.nn as nn
 import transformers
-from gptqmodel.nn_modules.qlinear.exllama_eora import ExllamaEoraQuantLinear
-from gptqmodel.nn_modules.qlinear.marlin import MarlinQuantLinear
-from gptqmodel.nn_modules.qlinear.qqq import QQQQuantLinear
 from huggingface_hub import HfApi, hf_hub_download
 from packaging import version
+from safetensors import safe_open
 from torch.nn.modules.conv import _ConvNd
 from transformers import PretrainedConfig
 from transformers.pytorch_utils import id_tensor_storage
 from transformers.utils.hub import cached_file
 
+from gptqmodel.nn_modules.qlinear.exllama_eora import ExllamaEoraQuantLinear
+from gptqmodel.nn_modules.qlinear.marlin import MarlinQuantLinear
+
 from ..adapter.adapter import Adapter
 from ..looper.named_module import NamedModule
-from ..models._const import (CPU, DEVICE, EXLLAMA_DEFAULT_MAX_INPUT_LENGTH,
-                             EXPERT_INDEX_PLACEHOLDER, SUPPORTS_MODULE_TYPES)
+from ..models._const import (
+    CPU,
+    DEVICE,
+    EXLLAMA_DEFAULT_MAX_INPUT_LENGTH,
+    EXPERT_INDEX_PLACEHOLDER,
+    SUPPORTS_MODULE_TYPES,
+)
 from ..nn_modules.qlinear import BaseQuantLinear
 from ..nn_modules.qlinear.exllama import ExllamaQuantLinear
 from ..nn_modules.qlinear.exllamav2 import ExllamaV2QuantLinear
-from ..nn_modules.qlinear.ipex import HAS_IPEX, IPEXQuantLinear
+from ..nn_modules.qlinear.exllamav2_awq import AwqExllamaV2QuantLinear
 from ..quantization import FORMAT, QuantizeConfig
-from ..quantization.config import FORMAT_FIELD_JSON, QUANT_METHOD, dynamic_get
-from . import has_gil
+from ..quantization.config import FORMAT_FIELD_CHECKPOINT, METHOD, dynamic_get
+from . import has_gil_disabled
 from .backend import BACKEND
+from .ctx import ctx
+from .device import get_device
 from .importer import select_quant_linear
-from .logger import setup_logger
-from .torch import torch_empty_cache, torch_new_stream_ctx
+from .logger import log_time_block, setup_logger
+from .torch import HAS_CUDA, torch_empty_cache
+
 
 log = setup_logger()
+
+
+_DTYPE_SAFE_MAP = {
+    torch.float32: ("F32", 4),
+    torch.float16: ("F16", 2),
+    torch.float64: ("F64", 8),
+    torch.bfloat16: ("BF16", 2),
+    torch.int64: ("I64", 8),
+    torch.int32: ("I32", 4),
+    torch.int16: ("I16", 2),
+    torch.int8: ("I8", 1),
+    torch.uint8: ("U8", 1),
+    torch.bool: ("BOOL", 1),
+}
+
+
+_DTYPE_STR_MAP = {
+    "float32": torch.float32,
+    "float": torch.float32,
+    "float16": torch.float16,
+    "half": torch.float16,
+    "float64": torch.float64,
+    "double": torch.float64,
+    "bfloat16": torch.bfloat16,
+    "int64": torch.int64,
+    "long": torch.int64,
+    "int32": torch.int32,
+    "int": torch.int32,
+    "int16": torch.int16,
+    "short": torch.int16,
+    "int8": torch.int8,
+    "uint8": torch.uint8,
+    "bool": torch.bool,
+}
+
+
+def _torch_dtype_num_bytes(dtype: torch.dtype) -> int:
+    if dtype not in _DTYPE_SAFE_MAP:
+        raise NotImplementedError(f"Unsupported dtype for safetensors export: {dtype}")
+    return _DTYPE_SAFE_MAP[dtype][1]
+
+
+def _torch_dtype_to_safetensors(dtype: torch.dtype) -> str:
+    if dtype not in _DTYPE_SAFE_MAP:
+        raise NotImplementedError(f"Unsupported dtype for safetensors export: {dtype}")
+    return _DTYPE_SAFE_MAP[dtype][0]
+
+
+def _dtype_string_to_torch(dtype_str: Optional[str], fallback: torch.dtype) -> torch.dtype:
+    if dtype_str is None:
+        return fallback
+    key = dtype_str.lower()
+    return _DTYPE_STR_MAP.get(key, fallback)
+
+
+@dataclass(frozen=True)
+class OffloadTensorRef:
+    path: str
+    torch_dtype: torch.dtype
+    shape: Tuple[int, ...]
+    format: str  # 'dat' or 'safetensors'
+    weight_name: Optional[str] = None
+    data_offsets: Optional[Tuple[int, int]] = None
+
+    @property
+    def num_bytes(self) -> int:
+        return _torch_dtype_num_bytes(self.torch_dtype) * math.prod(self.shape or (1,))
+
+
+@dataclass
+class TensorSource:
+    name: str
+    torch_dtype: torch.dtype
+    shape: Tuple[int, ...]
+    source: Union[torch.Tensor, OffloadTensorRef]
+
+    @property
+    def num_bytes(self) -> int:
+        return _torch_dtype_num_bytes(self.torch_dtype) * math.prod(self.shape or (1,))
 
 def recurse_getattr(obj, attr: str):
     """
@@ -89,52 +167,18 @@ def recurse_setattr(module, name, value):
         recurse_setattr(getattr(module, name), rest, value)
 
 
-def get_device(obj: torch.Tensor | nn.Module):
-    if isinstance(obj, torch.Tensor):
-        return obj.device
-
-    params = list(obj.parameters())  # Convert generator to list
-    if len(params) > 0:
-        return params[0].device
-    else:
-        log.warn(f"Quantize: Unable to determine device of `{obj}`. default to `cpu`")
-        return torch.device('cpu')  # or raise an exception
-
-def move_to(obj: torch.Tensor | nn.Module, device: torch.device, dtype: torch.dtype = None, stream: bool = False):
-    if get_device(obj) != device:
-        if stream:
-            # we cannot support changing dtype and stream at the same time
-            assert dtype is None, f"streaming does not support changing dtype: actual = `{dtype}"
-            if not isinstance(obj, torch.Tensor):
-                raise NotImplementedError(
-                    f"Streaming `move_to` is not supported for non-Tensors: actual = `{obj.__class__.__name__}`")
-
-            if device == CPU:
-                # print(f" streaming from non-CPU to CPU...nonblocking")
-                obj_copy = torch.zeros_like(obj, device=CPU, pin_memory=True)
-                streamCtx = torch_new_stream_ctx()
-                if streamCtx:
-                    # use streaming context with pinned cpu memory
-                    with streamCtx:
-                        obj_copy.copy_(obj, non_blocking=True)
-                    return obj_copy
-                else:
-                    # does not support streaming context
-                    obj = obj.to(device=device, non_blocking=True)
-            else:
-                # cpu to non-cpu or non-cpu to non-cpu  uses normal .to() api
-                obj = obj.to(device=device, non_blocking=True)
-        else:
-            obj = obj.to(device=device, dtype=dtype, non_blocking=False)
+def move_to(obj: torch.Tensor | nn.Module, device: torch.device, dtype: torch.dtype = None):
+    if get_device(obj) != device or dtype is not None:
+        obj = obj.to(device=device, dtype=dtype, non_blocking=False)
 
     return obj
 
 
-def nested_move_to(v, device, dtype: torch.dtype = None, stream: bool = False):
+def nested_move_to(v, device, dtype: torch.dtype = None):
     if isinstance(v, torch.Tensor):
-        return move_to(v, device=device, dtype=dtype, stream=stream)
+        return move_to(v, device=device, dtype=dtype)
     elif isinstance(v, (list, tuple)):
-        return type(v)([nested_move_to(e, device=device, dtype=dtype, stream=stream) for e in v])
+        return type(v)([nested_move_to(e, device=device, dtype=dtype) for e in v])
     else:
         return v
 
@@ -181,8 +225,8 @@ def get_module(module, key):
 
 def make_quant(
     module,
-    quant_result: Dict[str, Dict[str, Any]],
     qcfg: QuantizeConfig,
+    quant_result: Dict[str, Dict[str, Any]],
     backend: BACKEND,
     lm_head_name: str,
     pack: bool = False,
@@ -199,6 +243,10 @@ def make_quant(
     dynamic = qcfg.dynamic
     pack_dtype = qcfg.pack_dtype
 
+    # Bitblas needs to be loaded as gptq's quant linear first, and then converted to bitblas format.
+    if not pack and format == FORMAT.GPTQ and backend == BACKEND.BITBLAS:
+        backend = BACKEND.TORCH
+
     # returns multiple validated kernels
     quant_linear_candidates = select_quant_linear(
         bits=bits,
@@ -207,6 +255,7 @@ def make_quant(
         sym=sym,
         backend=backend,
         format=format,
+        quant_method=qcfg.quant_method,
         pack=pack,
         dynamic=dynamic,
         device=device,
@@ -232,9 +281,9 @@ def make_quant(
                 dynamic=dynamic,
                 group_size=group_size,
                 module=module,
-                quant_result=quant_result,
                 sym=sym,
                 device=device,
+                quant_result=quant_result,
                 lm_head_name=lm_head_name,
                 pack_dtype=pack_dtype,
                 backend=backend,
@@ -251,6 +300,120 @@ def make_quant(
 
     raise ValueError(f"No compatible quant linear was found for this module: {module.__class__.__name__}")
 
+def create_quant_module(
+    name: str,
+    linear_cls: Type[BaseQuantLinear],
+    bits: int,
+    desc_act: bool,
+    dynamic,
+    group_size: int,
+    module: nn.Module,
+    submodule: nn.Module,
+    sym: bool,
+    device: DEVICE,
+    lm_head_name: str,
+    pack_dtype: torch.dtype,
+    backend: BACKEND = BACKEND.AUTO,
+    register_buffers: bool = True,
+    adapter: Optional[Adapter] = None,
+):
+    # unwrap named module
+    if isinstance(submodule, NamedModule):
+        # print(f"offloading named module: {module.full_name}")
+        submodule = submodule.module
+
+    # submodule may be BaseQuantLinear, and the next QuantLinear is selected because of in_features/out_features
+    # mismatch and other reasons.
+    # In this case, need to call list_buffer() to get the device.
+    if not isinstance(submodule, BaseQuantLinear):
+        ori_layer_device = next(submodule.parameters()).device
+    else:
+        ori_layer_device = submodule.list_buffers()[0].device
+
+    if ori_layer_device.type != CPU.type:
+        raise AssertionError(
+            f"Expected `{name}` to reside on CPU during quant module creation, "
+            f"but found tensors on `{ori_layer_device}`."
+        )
+
+    if isinstance(submodule, NamedModule):
+        in_features = submodule.state.get("in_features")
+        out_features = submodule.state.get("out_features")
+    elif isinstance(submodule, nn.Linear):
+        in_features = submodule.in_features
+        out_features = submodule.out_features
+    elif isinstance(submodule, _ConvNd):
+        in_features = submodule.in_channels
+        out_features = submodule.out_channels
+    elif isinstance(submodule, transformers.Conv1D):
+        in_features = submodule.weight.shape[0]
+        out_features = submodule.weight.shape[1]
+    elif isinstance(submodule, BaseQuantLinear):
+        # if submodule is already a quant layer, we need to get in_features and out_features from the submodule
+        in_features = submodule.in_features
+        out_features = submodule.out_features
+    else:
+        raise NotImplementedError(f"Unsupported module {submodule}")
+
+    bias = submodule.bias is not None
+
+    # need copies as dynamic config may override these in for loop
+    tmp_bits = bits
+    tmp_group_size = group_size
+    tmp_desc_act = desc_act
+    tmp_sym = sym
+    tmp_pack_dtype = pack_dtype
+
+    # dynamic bits, group_size, sym, pack_dtype for each layer/module
+    if dynamic is not None:
+        overrides = dynamic_get(dynamic=dynamic, module_name=name)
+        # negative module match, skip this module
+        if overrides == False:  # noqa: E712
+            return
+
+        # positive module match
+        if overrides:
+            # override base QuantizeConfig for every quant config key/value
+            tmp_bits = overrides.get("bits", bits)
+            tmp_group_size = overrides.get("group_size", group_size)
+            tmp_desc_act = overrides.get("desc_act", desc_act)
+            tmp_sym = overrides.get("sym", sym)
+            tmp_pack_dtype = overrides.get("pack_dtype", pack_dtype)
+
+    # when loading a quantized model, device is target device passed in GPTQModel.load()
+    # check in_features and out_features validate
+    _, err = linear_cls.validate(
+        bits=tmp_bits,
+        group_size=tmp_group_size,
+        desc_act=tmp_desc_act,
+        sym=tmp_sym,
+        pack_dtype=tmp_pack_dtype,
+        in_features=in_features,
+        out_features=out_features,
+        device=device,
+        adapter=adapter, # TODO FIX ME..need to pass Eora if loaded
+    )
+    if err is not None:
+        raise err
+
+    new_layer = linear_cls(
+        bits=tmp_bits,
+        group_size=tmp_group_size,
+        desc_act=tmp_desc_act,
+        sym=tmp_sym,
+        in_features=in_features,
+        out_features=out_features,
+        pack_dtype=tmp_pack_dtype,
+        bias=bias,
+        #weight_dtype=submodule.qweight.dtype if isinstance(submodule, BaseQuantLinear) else submodule.weight.dtype,
+        name=name,
+        lm_head_name=lm_head_name,
+        backend=backend,
+        register_buffers=register_buffers,
+        adapter=adapter,
+    )
+    new_layer.device = ori_layer_device
+    recurse_setattr(module, name, new_layer.to(ori_layer_device))
 
 def create_quant_layer(
         linear_cls: Type[BaseQuantLinear],
@@ -258,8 +421,8 @@ def create_quant_layer(
         desc_act: bool,
         dynamic,
         group_size: int,
-        module,
         quant_result: Dict[str, Dict[str, Any]],
+        module,
         sym: bool,
         device: DEVICE,
         lm_head_name: str,
@@ -274,91 +437,23 @@ def create_quant_layer(
         if name not in quant_result:
             continue
 
-        # submodule may be BaseQuantLinear, and the next QuantLinear is selected because of in_features/out_features
-        # mismatch and other reasons.
-        # In this case, need to call list_buffer() to get the device.
-        if not isinstance(submodule, BaseQuantLinear):
-            ori_layer_device = next(submodule.parameters()).device
-        else:
-            ori_layer_device = submodule.list_buffers()[0].device
-
-        if isinstance(submodule, NamedModule):
-            in_features = submodule.state.get("in_features")
-            out_features = submodule.state.get("out_features")
-        elif isinstance(submodule, nn.Linear):
-            in_features = submodule.in_features
-            out_features = submodule.out_features
-        elif isinstance(submodule, _ConvNd):
-            in_features = submodule.in_channels
-            out_features = submodule.out_channels
-        elif isinstance(submodule, transformers.Conv1D):
-            in_features = submodule.weight.shape[0]
-            out_features = submodule.weight.shape[1]
-        elif isinstance(submodule, BaseQuantLinear):
-            # if submodule is already a quant layer, we need to get in_features and out_features from the submodule
-            in_features = submodule.in_features
-            out_features = submodule.out_features
-        else:
-            raise NotImplementedError(f"Unsupported module {submodule}")
-
-        bias = submodule.bias is not None
-
-        # need copies as dynamic config may override these in for loop
-        tmp_bits = bits
-        tmp_group_size = group_size
-        tmp_desc_act = desc_act
-        tmp_sym = sym
-        tmp_pack_dtype = pack_dtype
-
-        # dynamic bits, group_size, sym, pack_dtype for each layer/module
-        if dynamic is not None:
-            overrides = dynamic_get(dynamic=dynamic, module_name=name)
-            # negative module match, skip this module
-            if overrides == False:  # noqa: E712
-                continue
-
-            # positive module match
-            if overrides:
-                # override base QuantizeConfig for every quant config key/value
-                tmp_bits = overrides.get("bits", bits)
-                tmp_group_size = overrides.get("group_size", group_size)
-                tmp_desc_act = overrides.get("desc_act", desc_act)
-                tmp_sym = overrides.get("sym", sym)
-                tmp_pack_dtype = overrides.get("pack_dtype", pack_dtype)
-
-        # when loading a quantized model, device is target device passed in GPTQModel.load()
-        # check in_features and out_features validate
-        _, err = linear_cls.validate(
-            bits=tmp_bits,
-            group_size=tmp_group_size,
-            desc_act=tmp_desc_act,
-            sym=tmp_sym,
-            pack_dtype=tmp_pack_dtype,
-            in_features=in_features,
-            out_features=out_features,
-            device=device,
-            adapter=adapter, # TODO FIX ME..need to pass Eora if loaded
-        )
-        if err is not None:
-            raise err
-
-        new_layer = linear_cls(
-            bits=tmp_bits,
-            group_size=tmp_group_size,
-            desc_act=tmp_desc_act,
-            sym=tmp_sym,
-            in_features=in_features,
-            out_features=out_features,
-            pack_dtype=tmp_pack_dtype,
-            bias=bias,
-            #weight_dtype=submodule.qweight.dtype if isinstance(submodule, BaseQuantLinear) else submodule.weight.dtype,
+        create_quant_module(
             name=name,
+            linear_cls=linear_cls,
+            bits=bits,
+            desc_act=desc_act,
+            dynamic=dynamic,
+            group_size=group_size,
+            module=module,
+            submodule=submodule,
+            sym=sym,
+            device=device,
             lm_head_name=lm_head_name,
+            pack_dtype=pack_dtype,
             backend=backend,
             adapter=adapter,
         )
-        new_layer.device = ori_layer_device
-        recurse_setattr(module, name, new_layer.to(ori_layer_device))
+
     return linear_cls
 
 # public/stable api exposed to transformer/optimum
@@ -371,7 +466,7 @@ def hf_convert_gptq_v1_to_v2_format(
 ) -> Tuple[nn.Module, bool]:
     if checkpoint_format == "gptq":
         # skip v1 to v2 conversion for kernels that can only operate on sym=True (gptq_v1)
-        if qlinear_kernel in [IPEXQuantLinear, MarlinQuantLinear, ExllamaEoraQuantLinear]:
+        if qlinear_kernel in [MarlinQuantLinear, ExllamaEoraQuantLinear]:
             return model, False
 
         cfg = QuantizeConfig(bits=bits)
@@ -464,35 +559,35 @@ def convert_gptq_v1_to_v2_format_module(module: BaseQuantLinear, bits: int, pack
     module.qzero_format(format=2)
 
 # Optionally convert weight from gptq_v1 to v2 format if Kernel is compatible with v2
+@torch.inference_mode()
 def convert_gptq_v1_to_v2_format(
     model,
     cfg: QuantizeConfig,
     qlinear_kernel: Type[BaseQuantLinear],
 ):
     # skip v2 to v1 conversion for gptq_v1 kernels
-    if qlinear_kernel in [IPEXQuantLinear, MarlinQuantLinear, ExllamaEoraQuantLinear, QQQQuantLinear]:
+    if cfg.quant_method in [METHOD.GPTQ] and not qlinear_kernel.REQUIRES_FORMAT_V2:
         log.info(
             f"Format: Skipped v1 to v2 conversion due to Kernel  `{qlinear_kernel}`.")
         return model
 
     # Limit thread usage to avoid auto-parallizataion regression
-    with tctl.threadpool_limits(limits=1):
-        t = time.time()
-        log.info(
-            f"Format: Converting `{FORMAT_FIELD_JSON}` from `{FORMAT.GPTQ}` to internal `{FORMAT.GPTQ_V2}`.")
+    # with tctl.threadpool_limits(limits=1):
+    time.time()
+    log.info(
+        f"Format: Converting `{FORMAT_FIELD_CHECKPOINT}` from `{FORMAT.GPTQ}` to internal `{FORMAT.GPTQ_V2}`.")
 
-        for _, submodule in model.named_modules():
-            # v1 checkpoint format used to do `qzeros = qzeros -= 1` before serialization, thus the
-            # additions here do not overflow.
-            # v1 checkpoint format with sym=False saved via convert_gptq_v2_to_v1_format() will
-            # overflow ~<=13% based on testing
-            if isinstance(submodule, qlinear_kernel):
-                convert_gptq_v1_to_v2_format_module(module=submodule, bits=cfg.bits, pack_dtype=cfg.pack_dtype)
+    for _, submodule in model.named_modules():
+        # v1 checkpoint format used to do `qzeros = qzeros -= 1` before serialization, thus the
+        # additions here do not overflow.
+        # v1 checkpoint format with sym=False saved via convert_gptq_v2_to_v1_format() will
+        # overflow ~<=13% based on testing
+        if isinstance(submodule, qlinear_kernel):
+            convert_gptq_v1_to_v2_format_module(module=submodule, bits=cfg.bits, pack_dtype=cfg.pack_dtype)
 
-        log.info(f"Format: Conversion complete: {time.time() - t}s")
+        #log.info(f"Format: Conversion complete: {time.time() - t}s")
 
     return model
-
 
 # public/stable api exposed to transformer/optimum
 def hf_convert_gptq_v2_to_v1_format(
@@ -540,6 +635,7 @@ def convert_gptq_v2_to_v1_format_module(
     module.qzero_format(format=1)
 
 # Optionally convert weight from gptq_v2 to v1 export format if Kernel is compatible with v2
+@torch.inference_mode()
 def convert_gptq_v2_to_v1_format(
     model,
     quantize_config: QuantizeConfig,
@@ -547,51 +643,180 @@ def convert_gptq_v2_to_v1_format(
 ):
 
     # skip v2 to v1 conversion for gptq_v1 kernels
-    if qlinear_kernel in [IPEXQuantLinear, MarlinQuantLinear, ExllamaEoraQuantLinear, QQQQuantLinear]:
+    if quantize_config.quant_method in [METHOD.GPTQ] and not qlinear_kernel.REQUIRES_FORMAT_V2:
         return model
 
     # Limit thread usage to avoid auto-parallizataion regression
-    with tctl.threadpool_limits(limits=1):
-        for _, submodule in model.named_modules():
-            # sym=False has underflow probability of ~<=13% during testing. No underflow possible for sym=True.
-            if isinstance(submodule, qlinear_kernel):
-                convert_gptq_v2_to_v1_format_module(module=submodule, quantize_config=quantize_config)
+    # with tctl.threadpool_limits(limits=1):
+    for _, submodule in model.named_modules():
+        # sym=False has underflow probability of ~<=13% during testing. No underflow possible for sym=True.
+        if isinstance(submodule, qlinear_kernel):
+            convert_gptq_v2_to_v1_format_module(module=submodule, quantize_config=quantize_config)
 
     return model
 
-
-def pack_module(name, qModules, quant_result: Dict[str, Dict[str, Any]], layers, quant_linear_cls, lock: threading.Lock):
+@torch.inference_mode()
+def pack_module(
+    name,
+    qModules,
+    q_scales,
+    q_zeros,
+    q_g_idx,
+    layers,
+    quant_linear_cls,
+    lock: threading.Lock,
+    q_scales_extra=None,
+    quantize_config: Optional[QuantizeConfig] = None,
+    quant_result: Optional[Dict[str, Any]] = None,
+):
     # Limit pack() thread usage to avoid auto-parallizataion regression
-    with tctl.threadpool_limits(limits=1):
+    # with ctx(tctl.threadpool_limits(limits=1), lock):
+    layer = layers[name]
+    module = qModules[name]
+
+    assert get_device(module) == CPU
+    assert get_device(layer) == CPU
+    assert get_device(q_scales) == CPU
+    assert get_device(q_zeros) == CPU
+
+    # module = module.to(CPU)
+    # layer = layer.to(CPU)
+    # q_scales = q_scales.to(CPU)
+    # q_zeros = q_zeros.to(CPU)
+
+    if q_g_idx is not None:
+        assert get_device(q_g_idx) == CPU
+        #q_g_idx = q_g_idx.to(CPU)
+
+    pack_impl = "original"
+    target_device = None
+    if quantize_config is not None:
+        pack_impl = getattr(quantize_config, "pack_impl", "original") or "original"
+        cfg_device = getattr(quantize_config, "device", None)
+        if isinstance(cfg_device, DEVICE):
+            target_device = cfg_device.to_torch_device()
+        elif isinstance(cfg_device, torch.device):
+            target_device = cfg_device
+        elif isinstance(cfg_device, str):
+            try:
+                target_device = torch.device(cfg_device)
+            except (RuntimeError, ValueError):
+                log.warning(f"pack_module: unable to parse target device `{cfg_device}`; defaulting to CUDA auto-select.")
+
+    packer_label = None
+
+    if lock is not None:
         with lock:
-            r = quant_result[name]
-            scale, zero, g_idx = r["scale"], r["zero"], r["g_idx"] # TODO FIX ME: use const, not string for field names
-            module = qModules[name]
-            layer = layers[name]
-
-        module = module.to(CPU)
-
-        layer = layer.to(CPU)
-        scale = scale.to(CPU)
-        zero = zero.to(CPU)
-        g_idx = g_idx.to(CPU) if g_idx is not None else None
-
-        with lock:
-            qModules[name] = module
             layers[name] = layer
+            qModules[name] = module
+    else:
+        layers[name] = layer
+        qModules[name] = module
 
-        if quant_linear_cls.QUANT_TYPE == "qqq":
-            with lock:
-                scale_extra = r["scale_extra"]
-            scale_extra = scale_extra.to(CPU)
-            module.pack(linear=layer, scales=scale, s_extra=scale_extra)
-        else:
-            module.pack(linear=layer, scales=scale, zeros=zero, g_idx=g_idx)
+    # TODO FIX ME..remove hard coded qqq pack
+    if quant_linear_cls.QUANT_TYPE == "qqq":
+        if q_scales_extra is not None:
+            q_scales_extra = q_scales_extra.to(CPU)
+        packer_label = "module.pack"
+        with log_time_block(
+            packer_label,
+            logger=log,
+            module_name=name,
+        ):
+            module.pack(linear=layer, scales=q_scales, s_extra=q_scales_extra)
+    if quant_linear_cls.QUANT_TYPE.startswith("awq_"):
+        packer_label = "module.pack"
+        with log_time_block(
+            packer_label,
+            logger=log,
+            module_name=name,
+        ):
+            module.pack(
+                linear=layer,
+                scales=q_scales,
+                zeros=q_zeros,
+                g_idx=q_g_idx,
+            )
+    else:
+        effective_impl = (pack_impl or "original").lower()
+
+        if effective_impl in {"cpu", "block", "pack_block"}:
+            effective_impl = "block"
+        elif effective_impl in {"original", "pack_original"}:
+            effective_impl = "original"
+        elif effective_impl == "gpu":
+            if not HAS_CUDA:
+                log.warning("pack_module: GPU packing requested but CUDA is unavailable; falling back to original pack.")
+                effective_impl = "original"
+            elif not hasattr(module, "pack_gpu"):
+                log.warning("pack_module: GPU packing requested but module lacks pack_gpu; falling back to original pack.")
+                effective_impl = "original"
+        elif effective_impl != "original":
+            log.warning(
+                "pack_module: Unknown pack_impl `%s`; defaulting to original pack.",
+                pack_impl,
+            )
+            effective_impl = "original"
+
+        label_map = {
+            "gpu": "module.pack_gpu",
+            "block": "module.pack_block",
+            "original": "module.pack_original",
+        }
+
+        packer_label = label_map[effective_impl]
+
+        with log_time_block(
+            packer_label,
+            logger=log,
+            module_name=name,
+        ):
+            if effective_impl == "gpu":
+                try:
+                    module.pack_gpu(
+                        linear=layer,
+                        scales=q_scales,
+                        zeros=q_zeros,
+                        g_idx=q_g_idx,
+                        device=target_device,
+                    )
+                except ValueError:
+                    module.pack_original(linear=layer, scales=q_scales, zeros=q_zeros, g_idx=q_g_idx)
+            elif effective_impl == "block":
+                try:
+                    module.pack_block(
+                        linear=layer,
+                        scales=q_scales,
+                        zeros=q_zeros,
+                        g_idx=q_g_idx,
+                    )
+                except ValueError:
+                    module.pack_original(linear=layer, scales=q_scales, zeros=q_zeros, g_idx=q_g_idx)
+            else:
+                module.pack_original(linear=layer, scales=q_scales, zeros=q_zeros, g_idx=q_g_idx)
+
+        if (
+            quantize_config is not None
+            and quantize_config.quant_method == METHOD.GPTQ
+            and quantize_config.format == FORMAT.GPTQ
+            and getattr(quant_linear_cls, "REQUIRES_FORMAT_V2", False)
+        ):
+            with log_time_block(
+                "convert_v2_to_v1",
+                logger=log,
+                module_name=name,
+            ):
+                convert_gptq_v2_to_v1_format_module(
+                    module=module,
+                    quantize_config=quantize_config,
+                )
 
         # TODO: why move it back to gpu?
         # start = time.time()
         # qModules[name].to(layer_device)
         # log.info(f"Pack: moving module back to `{layer_device}` cost = {time.time()-start} seconds")
+
+    return packer_label
 
 def pack_model(
     model,
@@ -600,12 +825,11 @@ def pack_model(
     group_size,
     backend: BACKEND,
     format: str | FORMAT,
-    quant_method: str | QUANT_METHOD,
+    quant_method: str | METHOD,
     lm_head_name: str,
     desc_act=False,
     sym: bool = True,
     dynamic=None,
-    parallel_packing: bool = True,
     pack_dtype: torch.dtype = None,
 ):
     qcfg = QuantizeConfig(
@@ -628,7 +852,6 @@ def pack_model(
     modules = {n: modules[n] for n in quant_result}
     quant_linear_cls = make_quant(
         model,
-        quant_result=quant_result,
         qcfg=qcfg,
         backend=backend,
         lm_head_name=lm_head_name,
@@ -642,69 +865,80 @@ def pack_model(
     names = list(qModules.keys())
     lock = threading.Lock()
 
-    if not has_gil():
+    if has_gil_disabled():
         from device_smi import Device
         cpu = Device("cpu")
         max_packers = cpu.count * cpu.cores
     else:
         max_packers = 1 # due to gil, there is no point packing with more than 1 thread
 
-    with ThreadPoolExecutor(max_workers=max_packers) as executor:
-        with log.pb(names).manual() as pb:
-            def wrapper(name):
-                # TODO FIX, thread pool executor does not advance iterator
-                pb.next()
-                pb.title(f"Packing {name}").draw()
-                pack_module(name=name, qModules=qModules, quant_result=quant_result, layers=modules,
-                            quant_linear_cls=quant_linear_cls, lock=lock)
+    with ctx(ThreadPoolExecutor(max_workers=max_packers), log.pb(names).manual()) as (executor, pb):
+        def wrapper(name):
+            # TODO FIX, thread pool executor does not advance iterator
+            pb.next()
+            pb.title(f"Packing {name}").draw()
+            pack_module(
+                name=name,
+                qModules=qModules,
+                quant_result=quant_result,
+                layers=modules,
+                quant_linear_cls=quant_linear_cls,
+                lock=lock,
+                quantize_config=qcfg,
+            )
 
-            for _ in executor.map(wrapper, names):
-                pass
+        for _ in executor.map(wrapper, names):
+            pass
 
     log.info("Model packed.")
     return quant_linear_cls
 
-
-def verify_model_hash(file_path: str, verify_hash: str):
-    if not isinstance(verify_hash, str):
-        raise ValueError("model verify_hash must be a string")
-    if ':' not in verify_hash:
-        raise ValueError("verify_hash must be in the format 'hash_type:hash_value'")
-    hash_type, hash_value = verify_hash.split(':', 1)
-    hash_func = getattr(hashlib, hash_type, None)
-    if not hash_func:
-        raise ValueError(f"No hash function found for type: {hash_type}")
-    with open(file_path, "rb") as f:
-        file_hash = hash_func(f.read()).hexdigest()
-    return file_hash == hash_value
-
-
-def verify_sharded_model_hashes(jsonPath: str, verify_hash: List[str]):
-    if not isinstance(verify_hash, list):
-        raise ValueError("sharded model verify_hash must be a list")
-
-    with open(jsonPath, 'r') as f:
-        index_data = json.load(f)
-    weight_map = index_data['weight_map']
-    shard_files = set(weight_map.values())
-    if len(shard_files) != len(verify_hash):
-        raise ValueError("Number of shards and number of hash values do not match.")
-
-    for shard_file, expected_hash in zip(shard_files, verify_hash):
-        if not verify_model_hash(shard_file, expected_hash):
-            log.info(f"Hash verification failed for {shard_file}")
-            return False
-    return True
-
 def simple_dispatch_model(model, device_map):
+    from accelerate.hooks import AlignDevicesHook, add_hook_to_module
 
-    if "" in device_map:
-        d = device_map[""]
+    device_map = dict(device_map)
+    single_root = "" in device_map and len(device_map) == 1
+    all_single_cpu_or_mps = all(
+        d in ("cpu", "mps") for d in device_map.values()
+    )
+    # CPU offload is unnecessary for all-CPU/MPS device maps and must be skipped.
+    if single_root or all_single_cpu_or_mps:
+        d = next(iter(device_map.values()))
         model = model.to(torch.device(d))
         model.hf_device_map = device_map
         return model
+
+    # Avoid eagerly materialising the full model on a single device when the map
+    # provides finer-grained placements; rely on accelerate hooks instead.
+    tied_params = accelerate.utils.modeling.find_tied_parameters(model)
+    if set(device_map.values()) == {"cpu"} or set(device_map.values()) == {
+        "cpu",
+        "disk",
+    }:
+        main_device = "cpu"
     else:
-        raise ValueError("internal device_map must contain an empty string")
+        main_device = [d for d in device_map.values() if d not in ["cpu", "disk"]][0]
+
+    cpu_offload_group = [(n, d) for n, d in device_map.items() if d == "cpu"]
+    prev_hook = None
+    for idx, (n, d) in enumerate(cpu_offload_group):
+        m = get_module_by_name_suffix(model, n)
+        _, prev_hook = accelerate.cpu_offload_with_hook(m, execution_device=main_device, prev_module_hook=prev_hook)
+    # set first cpu offload module's prev_module_hook to the last cpu offload module's hook
+    if len(cpu_offload_group) > 1:
+        get_module_by_name_suffix(model, cpu_offload_group[0][0])._hf_hook.prev_module_hook = prev_hook
+
+    for n, d in device_map.items():
+        if n == "":
+            continue
+        m = get_module_by_name_suffix(model, n)
+        if d != "cpu":
+            d = torch.device(d)
+            hook = AlignDevicesHook(d, io_same_device=True, place_submodules=True)
+            add_hook_to_module(m, hook)
+    accelerate.utils.modeling.retie_parameters(model, tied_params)
+
+    model.hf_device_map = device_map
 
     return model
 
@@ -734,6 +968,14 @@ def gptqmodel_post_init(model, use_act_order: bool, quantize_config: QuantizeCon
             model_uses_exllamav2 = True
             device = submodule.qweight.device
             scratch_fixed = submodule.scratch_space_fixed()
+            fixed_bytes[device] = max(scratch_fixed, fixed_bytes.get(device, 0))
+        elif isinstance(submodule, AwqExllamaV2QuantLinear):
+            model_uses_exllamav2 = True
+            device = submodule.qweight.device
+            scratch_fixed = submodule.scratch_space_fixed(
+                max_input_len=max_input_length or 2048,
+                max_batch_size=int(os.getenv("AWQ_BATCH_SIZE", 1))
+            )
             fixed_bytes[device] = max(scratch_fixed, fixed_bytes.get(device, 0))
         elif isinstance(submodule, ExllamaQuantLinear):
             model_uses_exllama = True
@@ -817,20 +1059,21 @@ def gptqmodel_post_init(model, use_act_order: bool, quantize_config: QuantizeCon
         set_tuning_params(matmul_recons_thd, matmul_fused_remap, matmul_no_half2)
 
     if model_uses_exllamav2:
-        from ..nn_modules.qlinear.exllamav2 import ExLlamaV2DeviceTensors
+        from ..utils.exllamav2 import ScratchSpace
 
+        # we allocate a model-persistent scratch space for each device
         device_tensors = {}
         for device, scratch_bytes in fixed_bytes.items():
-            device_tensors[device] = ExLlamaV2DeviceTensors(device.index, scratch_bytes)
+            device_tensors[device] = ScratchSpace(scratch_bytes=scratch_bytes, dev=device)
 
         # have persistent buffers, otherwise we will get OOM
         model.device_tensors = device_tensors
 
     # The buffers need to have been initialized first before calling make_q4.
     for _, submodule in model.named_modules():
-        if isinstance(submodule, ExllamaV2QuantLinear):
+        if isinstance(submodule, (ExllamaV2QuantLinear, AwqExllamaV2QuantLinear)):
             device = submodule.qweight.device
-            submodule.post_init(temp_dq=model.device_tensors[device])
+            submodule.post_init(scratch_space=model.device_tensors[device])
         elif isinstance(submodule, BaseQuantLinear):
             submodule.post_init()
 
@@ -925,9 +1168,10 @@ def auto_dtype(config: PretrainedConfig,
         log.info("Loader: Auto dtype (MPS or XPU): `torch.float16`")
         return torch.float16
 
-    # IPEX for CPU is optimized for bfloat16
-    if device in [DEVICE.CPU] and HAS_IPEX:
-        log.info("Loader: Auto dtype (CPU + IPEX): `torch.bfloat16`")
+    # TODO: need to verify this
+    # Torch 2.8 fused kernel for CPU is optimized for bfloat16
+    if device in [DEVICE.CPU]:
+        log.info("Loader: Auto dtype (CPU + Torch Fused): `torch.bfloat16`")
         return torch.bfloat16
 
     # Update: latest kernel accuracies have shown, with multiple ranges of shapes
@@ -936,13 +1180,13 @@ def auto_dtype(config: PretrainedConfig,
     # # for inference, always use FP16 for max accuracy
     # # check test_kernel_outputs for validation between fp16 and b16 in terms of kernel accuracy
     # if quant_inference:
-    #     log.info("Loader: Auto dtype: `torch.float16` due to inference mode. If you wish to use `bfloat16`, please pass in `torch_dtype` arg to `loader()`.")
+    #     log.info("Loader: Auto dtype: `torch.float16` due to inference mode. If you wish to use `bfloat16`, please pass in `dtype` arg to `loader()`.")
     #     return torch.float16
 
     # get dtype from config
-    dtype = getattr(config, "torch_dtype")
+    dtype = getattr(config, "dtype") if hasattr(config, "dtype") else getattr(config, "torch_dtype")
     if dtype and not isinstance(dtype, torch.dtype):
-        raise ValueError(f"torch_dtype in config must be a torch.dtype, but got {dtype}")
+        raise ValueError(f"dtype in config must be a torch.dtype, but got {dtype}")
 
     if dtype in [torch.float32, torch.float64]:
         log.info("Loader: Auto dtype (float32 down-cast): `torch.bfloat16`")
@@ -1046,29 +1290,240 @@ class MODALITY(str, Enum):
     # TEXT_TO_IMAGE = "text_to_image"
 
 
-def get_state_dict_for_save(model: nn.Module) -> Dict:
+def _split_parameter_path(full_name: str) -> Tuple[str, str]:
+    if "." in full_name:
+        module_path, leaf = full_name.rsplit(".", 1)
+    else:
+        module_path, leaf = "", full_name
+    return module_path, leaf
+
+
+def _generate_offload_search_paths(offload_root, module_path):
+    """
+    Generate fallback paths:
+    'a.b.c' -> ['gptqmodel_offload/a.b.c', 'gptqmodel_offload/a.b', 'gptqmodel_offload/a', 'gptqmodel_offload/']
+    """
+    if not module_path:
+        return [offload_root]
+
+    parts = module_path.split(".")
+    paths = []
+
+    for i in range(len(parts), 0, -1):
+        sub = ".".join(parts[:i])
+        paths.append(os.path.join(offload_root, sub))
+
+    paths.append(os.path.join(offload_root, ""))
+
+    return paths
+
+
+def _generate_entry_keys(module_path, leaf):
+    """
+        Generate fallback entry keys for lookup inside `index`.
+
+        Given:
+            module_path = "code2wav.upsample.0.1"
+            leaf = "gamma"
+
+        This function produces a list of possible lookup keys, ordered from
+        least specific to most specific, so that the caller can try them in order.
+
+        Example output:
+            [
+                "gamma",
+                "1.gamma",
+                "0.1.gamma",
+                "upsample.0.1.gamma",
+                "code2wav.upsample.0.1.gamma",
+            ]
+    """
+    keys = [leaf]
+    if module_path:
+        parts = module_path.split(".")
+        for i in range(len(parts)-1, -1, -1):
+            suffix = ".".join(parts[i:])
+            keys.append(f"{suffix}.{leaf}")
+    return keys
+
+
+def _resolve_offload_entry(
+    offload_root: str,
+    module_path: str,
+    leaf: str,
+    dtype: torch.dtype,
+    shape_hint: Tuple[int, ...],
+    index_cache: Dict[str, Optional[Dict]],
+) -> Optional[OffloadTensorRef]:
+    if not offload_root:
+        return None
+
+    search_paths = _generate_offload_search_paths(offload_root, module_path)
+    index = None
+    for module_dir in search_paths:
+        index = index_cache.get(module_dir)
+        if index is not None:
+            break
+
+        index_path = os.path.join(module_dir, "index.json")
+        if not os.path.isfile(index_path):
+            index_cache[module_dir] = None
+            continue
+
+        # load index.json
+        with open(index_path, "r", encoding="utf-8") as fh:
+            index = json.load(fh)
+
+        index_cache[module_dir] = index
+        break
+
+    if not index:
+        return None
+
+    keys = _generate_entry_keys(module_path, leaf)
+    entry = None
+    for key in keys:
+        entry = index.get(key)
+        if entry is not None:
+            break
+    if entry is None:
+        return None
+
+    resolved_dtype = _dtype_string_to_torch(entry.get("dtype"), dtype)
+    if "shape" in entry:
+        shape = tuple(entry["shape"])
+    else:
+        shape = shape_hint
+
+    safetensors_file = entry.get("safetensors_file")
+    if safetensors_file:
+        path = safetensors_file
+        if not os.path.isabs(path):
+            path = os.path.join(module_dir, path)
+        offsets = entry.get("data_offsets")
+        if offsets is not None:
+            offsets = tuple(int(x) for x in offsets)
+        return OffloadTensorRef(
+            path=os.path.abspath(path),
+            torch_dtype=resolved_dtype,
+            shape=shape,
+            format="safetensors",
+            weight_name=entry.get("weight_name", leaf),
+            data_offsets=offsets,
+        )
+
+    filename = entry.get("filename")
+    if filename:
+        path = filename if os.path.isabs(filename) else os.path.join(module_dir, filename)
+        start = int(entry.get("offset", 0))
+        end = start + (_torch_dtype_num_bytes(resolved_dtype) * math.prod(shape or (1,)))
+        return OffloadTensorRef(
+            path=os.path.abspath(path),
+            dtype=resolved_dtype,
+            shape=shape,
+            format="dat",
+            weight_name=None,
+            data_offsets=(start, end),
+        )
+
+    data_path = os.path.join(module_dir, f"{leaf}.dat")
+    if not os.path.isfile(data_path):
+        return None
+
+    return OffloadTensorRef(
+        path=os.path.abspath(data_path),
+        torch_dtype=resolved_dtype,
+        shape=shape,
+        format="dat",
+        weight_name=None,
+        data_offsets=None,
+    )
+
+
+def _collect_state_dict_with_offload(model: nn.Module, offload_root: str) -> Dict[str, TensorSource]:
+    state_dict: Dict[str, TensorSource] = collections.OrderedDict()
+    index_cache: Dict[str, Optional[Dict]] = {}
+
+    for name, param in model.named_parameters():
+        module_path, leaf = _split_parameter_path(name)
+        source = None
+        if getattr(param, "is_meta", False) or param.device.type == "meta":
+            source = _resolve_offload_entry(
+                offload_root,
+                module_path,
+                leaf,
+                param.dtype,
+                tuple(param.shape),
+                index_cache,
+            )
+            if source is None:
+                raise FileNotFoundError(
+                    f"Offloaded tensor '{name}' not found in offload directory '{offload_root}'."
+                )
+        else:
+            source = param
+        state_dict[name] = TensorSource(name=name, torch_dtype=param.dtype, shape=tuple(param.shape), source=source)
+
+    for name, buf in model.named_buffers():
+        if name in state_dict:
+            continue
+        module_path, leaf = _split_parameter_path(name)
+        if getattr(buf, "is_meta", False) or buf.device.type == "meta":
+            source = _resolve_offload_entry(
+                offload_root,
+                module_path,
+                leaf,
+                buf.dtype,
+                tuple(buf.shape),
+                index_cache,
+            )
+            if source is None:
+                raise FileNotFoundError(
+                    f"Offloaded buffer '{name}' not found in offload directory '{offload_root}'."
+                )
+        else:
+            source = buf
+        state_dict[name] = TensorSource(name=name, torch_dtype=buf.dtype, shape=tuple(buf.shape), source=source)
+
+    return state_dict
+
+
+def get_state_dict_for_save(model: nn.Module, offload_root: Optional[str] = None) -> Dict[str, TensorSource]:
     """
     Filter weight-sharing tensors.
     Referenced from transformers.modeling_utils.PreTrainedModel.save_pretrained.
 
     See https://github.com/huggingface/transformers/blob/v4.38.2/src/transformers/modeling_utils.py#L2369
     """
+    if offload_root:
+        state_dict = _collect_state_dict_with_offload(model, offload_root)
+    else:
+        state_dict = collections.OrderedDict()
+        for name, param in model.named_parameters():
+            state_dict[name] = TensorSource(name=name, torch_dtype=param.dtype, shape=tuple(param.shape), source=param)
+        for name, buf in model.named_buffers():
+            if name in state_dict:
+                continue
+            state_dict[name] = TensorSource(name=name, torch_dtype=buf.dtype, shape=tuple(buf.shape), source=buf)
 
-    state_dict = model.state_dict()
-
-    # Safetensors does not allow tensor aliasing.
-    # We're going to remove aliases before saving
     ptrs = collections.defaultdict(list)
-    for name, tensor in state_dict.items():
-        # Sometimes in the state_dict we have non-tensor objects.
-        # e.g. in bitsandbytes we have some `str` objects in the state_dict
-        if isinstance(tensor, torch.Tensor):
-            ptrs[id_tensor_storage(tensor)].append(name)
+    for name, entry in state_dict.items():
+        source = entry.source
+        if isinstance(source, OffloadTensorRef):
+            key = ("offload", source.path, source.weight_name or name, source.data_offsets)
+        elif isinstance(source, torch.Tensor):
+            tensor = source
+            if getattr(tensor, "is_meta", False) or tensor.device.type == "meta":
+                key = ("meta", id(tensor))
+            else:
+                try:
+                    key = ("storage", id_tensor_storage(tensor))
+                except Exception:
+                    key = ("tensor", id(tensor))
         else:
-            # In the non-tensor case, fall back to the pointer of the object itself
-            ptrs[id(tensor)].append(name)
+            key = ("other", id(source))
+        ptrs[key].append(name)
 
-    # These are all the pointers of shared tensors.
     shared_ptrs = {ptr: names for ptr, names in ptrs.items() if len(names) > 1}
     warn_names = set()
     for names in shared_ptrs.values():
@@ -1105,6 +1560,144 @@ def get_state_dict_for_save(model: nn.Module) -> Dict:
 def load_checkpoint_in_model_then_tie_weights(model, *args, **kwargs):
     accelerate.load_checkpoint_in_model(model, *args, **kwargs)
     model.tie_weights()
+
+
+# 32MB read/write i/o buffer
+_STREAM_BUFFER_SIZE = 32 * 1024 * 1024
+_STREAM_BUFFER = memoryview(bytearray(_STREAM_BUFFER_SIZE))
+_STREAM_BUFFER_LOCK = threading.Lock()
+
+def _copy_file_stream(src_path: str, dst_fh, length: int, *, offset: int = 0) -> None:
+    with ctx(open(src_path, "rb", buffering=0), _STREAM_BUFFER_LOCK) as (src, _):
+        if offset:
+            src.seek(offset)
+        remaining = length
+        while remaining > 0:
+            chunk_size = min(_STREAM_BUFFER_SIZE, remaining)
+            read = src.readinto(_STREAM_BUFFER[:chunk_size])
+            if not read:
+                raise IOError(f"Unexpected EOF while copying from {src_path}")
+            dst_fh.write(_STREAM_BUFFER[:read])
+            remaining -= read
+
+
+def _write_tensor_bytes(out, tensor: torch.Tensor, dtype: torch.dtype) -> None:
+    tensor = tensor.detach().to("cpu").contiguous()
+    if dtype is torch.bfloat16:
+        view = tensor.view(torch.int16)
+        out.write(view.numpy().tobytes())
+    else:
+        out.write(tensor.numpy().tobytes())
+
+
+def _write_shard_file(path: str, entries: List[TensorSource], metadata: Dict[str, str]) -> int:
+    header: Dict[str, Any] = {}
+    if metadata:
+        header["__metadata__"] = metadata
+
+    offset = 0
+    for entry in entries:
+        header[entry.name] = {
+            "dtype": _torch_dtype_to_safetensors(entry.torch_dtype),
+            "shape": list(entry.shape),
+            "data_offsets": [offset, offset + entry.num_bytes],
+        }
+        offset += entry.num_bytes
+
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+
+    with open(path, "wb") as out:
+        out.write(struct.pack("<Q", len(header_bytes)))
+        out.write(header_bytes)
+
+        for entry in entries:
+            source = entry.source
+            if isinstance(source, OffloadTensorRef):
+                if source.format == "dat":
+                    # print("offload tensor io buffered transfer DAT")
+                    start = 0
+                    if source.data_offsets is not None:
+                        start = source.data_offsets[0]
+                    _copy_file_stream(source.path, out, entry.num_bytes, offset=start)
+                elif source.format == "safetensors" and source.data_offsets is not None:
+                    # print("offload tensor io buffered transfer SAFETENSOR stream")
+                    start, end = source.data_offsets
+                    _copy_file_stream(source.path, out, end - start, offset=start)
+                else:
+                    # print("offload tensor slow tensor read")
+                    with safe_open(source.path, framework="pt", device="cpu") as handler:
+                        tensor = handler.get_tensor(source.weight_name or entry.name)
+                    tensor = tensor.to(source.torch_dtype)
+                    _write_tensor_bytes(out, tensor, source.torch_dtype)
+            else:
+                tensor = source.detach()
+                _write_tensor_bytes(out, tensor, entry.torch_dtype)
+                del tensor
+
+        file_size = out.tell()
+
+    return file_size
+
+
+def _plan_shards(entries: List[TensorSource], max_shard_size: Optional[int]) -> List[List[TensorSource]]:
+    if not max_shard_size or max_shard_size <= 0:
+        return [entries]
+
+    shards: List[List[TensorSource]] = []
+    current: List[TensorSource] = []
+    current_size = 0
+
+    for entry in entries:
+        size = entry.num_bytes
+        if size > max_shard_size:
+            if current:
+                shards.append(current)
+                current = []
+                current_size = 0
+            shards.append([entry])
+            continue
+        if current_size + size > max_shard_size and current:
+            shards.append(current)
+            current = []
+            current_size = 0
+        current.append(entry)
+        current_size += size
+
+    if current:
+        shards.append(current)
+
+    return shards
+
+
+def streaming_state_dict_to_shards(
+    state_dict: Dict[str, TensorSource],
+    save_dir: str,
+    model_base_name: str,
+    single_file_name: str,
+    metadata: Dict[str, str],
+    max_shard_size: Optional[int],
+) -> Tuple[List[str], Dict[str, str], int]:
+    entries = list(state_dict.values())
+    shards = _plan_shards(entries, max_shard_size)
+    num_shards = len(shards)
+    filenames: List[str] = []
+    tensor_to_filename: Dict[str, str] = {}
+    total_size = 0
+
+    for idx, shard_entries in enumerate(shards, start=1):
+        if num_shards == 1:
+            filename = single_file_name
+        else:
+            filename = f"{model_base_name}-{idx:05d}-of-{num_shards:05d}.safetensors"
+
+        path = os.path.join(save_dir, filename)
+        size = _write_shard_file(path, shard_entries, metadata)
+        total_size += size
+        filenames.append(filename)
+        for entry in shard_entries:
+            tensor_to_filename[entry.name] = filename
+
+    return filenames, tensor_to_filename, total_size
 
 
 def find_config_seq_len(config_dict, target_keys):

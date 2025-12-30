@@ -1,3 +1,8 @@
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
+# Contact: qubitium@modelcloud.ai, x.com/qubitium
+
 import os
 from urllib.parse import urlparse
 
@@ -57,7 +62,7 @@ def resolve_path(path: str, filename: str) -> str: # return a valid file path to
             path = f"{path_split[0]}/{path_split[1]}"
             subfolder = "/".join(path_split[2:])
 
-        from huggingface_hub import HfApi, hf_hub_download
+        from huggingface_hub import hf_hub_download
 
         # _ = HfApi().list_repo_files(path)
 

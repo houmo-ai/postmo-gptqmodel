@@ -1,34 +1,25 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
-import importlib.util
 import os
+import time
 from importlib.metadata import PackageNotFoundError, version
+from itertools import chain
 from typing import Dict, List, Optional, Union
 
 import torch
 import transformers
 
-if os.getenv('GPTQMODEL_USE_MODELSCOPE', 'False').lower() in ['true', '1']:
-    try:
-        from modelscope import snapshot_download
-    except Exception:
-        raise ModuleNotFoundError("env `GPTQMODEL_USE_MODELSCOPE` used but modelscope pkg is not found: please install with `pip install modelscope`.")
+from ..utils.modelscope import ensure_modelscope_available
+from ..utils.structure import print_module_tree
+
+
+if ensure_modelscope_available():
+    from modelscope import snapshot_download
 else:
     from huggingface_hub import snapshot_download
 
@@ -40,23 +31,34 @@ from transformers.utils.generic import ContextManagers
 
 from ..adapter.adapter import Adapter
 from ..nn_modules.qlinear.exllamav2 import ExllamaV2QuantLinear
-from ..nn_modules.qlinear.ipex import IPEXQuantLinear
 from ..quantization import QuantizeConfig
-from ..quantization.config import FORMAT, MIN_VERSION_WITH_V2
+from ..quantization.config import FORMAT, METHOD, MIN_VERSION_WITH_V2
 from ..utils.backend import BACKEND
 from ..utils.importer import auto_select_device, normalize_device_device_map, select_quant_linear
+from ..utils.inspect import safe_kwargs_call
 from ..utils.logger import setup_logger
-from ..utils.marlin import _validate_marlin_compatibility, _validate_marlin_device_support
-from ..utils.model import (auto_dtype, convert_gptq_v1_to_v2_format, find_modules, get_checkpoints,
-                           get_moe_layer_modules, gptqmodel_post_init, load_checkpoint_in_model_then_tie_weights,
-                           make_quant, simple_dispatch_model, verify_model_hash, verify_sharded_model_hashes,
-                           find_config_seq_len)
+from ..utils.machete import _validate_machete_device_support
+from ..utils.marlin import _validate_marlin_device_support
+from ..utils.model import (
+    auto_dtype,
+    convert_gptq_v1_to_v2_format,
+    find_config_seq_len,
+    find_modules,
+    get_checkpoints,
+    get_module_by_name_prefix,
+    gptqmodel_post_init,
+    load_checkpoint_in_model_then_tie_weights,
+    make_quant,
+    simple_dispatch_model,
+)
 from ._const import DEVICE, normalize_device
+
 
 log = setup_logger()
 
 ATTN_IMPLEMENTATION = "attn_implementation"
-USE_FLASH_ATTENTION_2 = "use_flash_attention_2"
+
+
 def parse_version_string(version_str: str):
     try:
         return Version(version_str)
@@ -105,14 +107,16 @@ def check_versions(model_class, requirements: List[str]):
 def get_model_local_path(pretrained_model_id_or_path, **kwargs):
     is_local = os.path.isdir(pretrained_model_id_or_path)
     if is_local:
-        return pretrained_model_id_or_path
-    else:
-        # Clone kwargs before modifying
-        download_kwargs = kwargs.copy()
-        download_kwargs.pop("max_memory", None)
-        download_kwargs.pop("attn_implementation", None)
-        download_kwargs.pop("use_flash_attention_2", None)
-        return snapshot_download(pretrained_model_id_or_path, **download_kwargs)
+        return os.path.normpath(pretrained_model_id_or_path)
+    def _log_removed(removed: list[str]):
+        log.debug("Loader: dropping unsupported snapshot_download kwargs: %s", ", ".join(removed))
+
+    return safe_kwargs_call(
+        snapshot_download,
+        pretrained_model_id_or_path,
+        kwargs=kwargs,
+        on_removed=_log_removed,
+    )
 
 
 def ModelLoader(cls):
@@ -122,11 +126,17 @@ def ModelLoader(cls):
             pretrained_model_id_or_path: str,
             quantize_config: QuantizeConfig,
             trust_remote_code: bool = False,
-            torch_dtype: [str | torch.dtype] = "auto",
+            dtype: [str | torch.dtype] = "auto",
             device_map: Optional[Union[str, Dict[str, Union[int, str]]]] = None,
             device: Optional[Union[str, int]] = None,
             **model_init_kwargs,
     ):
+        # quantization is unsafe with GIL=0 and torch.compile/graphs
+        import torch._dynamo
+        torch._dynamo.disable()
+
+        load_start = time.perf_counter()
+
         # non-quantized models are always loaded into cpu
         cpu_device_map = {"": "cpu"}
 
@@ -184,51 +194,65 @@ def ModelLoader(cls):
             quantize_config.device = normalize_device(quantize_config.device)
 
         if cls.require_dtype:
-            torch_dtype = cls.require_dtype
+            dtype = cls.require_dtype
 
-        if torch_dtype is None or torch_dtype == "auto" or not isinstance(torch_dtype, torch.dtype):
+        if dtype is None or dtype == "auto" or not isinstance(dtype, torch.dtype):
             # TODO FIX ME for `dynamic`, non-quantized modules should be in native type
-            torch_dtype = auto_dtype(config=config, device=quantize_config.device, quant_inference=False)
+            dtype = auto_dtype(config=config, device=quantize_config.device, quant_inference=False)
+
+        if isinstance(dtype, torch.dtype) and getattr(config, "torch_dtype", None) != dtype:
+            # Align config metadata with the dtype we will materialize weights in.
+            config.torch_dtype = dtype
 
         # enforce some values despite user specified
         # non-quantized models are always loaded into cpu
         model_init_kwargs["device_map"] = cpu_device_map
-        model_init_kwargs["torch_dtype"] = model_init_kwargs.get("torch_dtype", torch_dtype)
+        model_init_kwargs["torch_dtype"] = model_init_kwargs.get("torch_dtype", dtype)
+        model_init_kwargs["dtype"] = dtype
         model_init_kwargs["_fast_init"] = cls.require_fast_init
-        # model_init_kwargs["low_cpu_mem_usage"] = True
+        #model_init_kwargs["low_cpu_mem_usage"] = True
 
-        model = cls.loader.from_pretrained(model_local_path, config=config, **model_init_kwargs)
+        cls.before_model_load(cls, load_quantized_model=False)
+        from ..utils.hf import build_shell_model
 
-        # from concurrent.futures import ThreadPoolExecutor
-        #
-        # def fast_pin_model(model):
-        #     # Get total size needed in bytes
-        #     total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-        #
-        #     # Create pinned memory buffer (byte tensor)
-        #     pinned_buffer = torch.ByteTensor(total_bytes).pin_memory()
-        #
-        #     # Copy all parameters into the buffer
-        #     offset = 0
-        #     for param in model.parameters():
-        #         num_bytes = param.numel() * param.element_size()
-        #
-        #         # Create view into buffer
-        #         param_bytes = pinned_buffer[offset:offset + num_bytes].view(param.dtype)
-        #         param_bytes.copy_(param.data.view(-1))
-        #
-        #         # Replace parameter data with pinned version
-        #         param.data = param_bytes.view_as(param.data)
-        #         offset += num_bytes
-        #
-        #     return model
+        # XIELUActivation will use some weights when activation init, so can't use init_empty_weights
+        if hasattr(config, "hidden_act") and config.hidden_act == "xielu":
+            quantize_config.offload_to_disk = False
 
-        # model = fast_pin_model(model)  # 10-100x faster than per-tensor pinning
+        # some models need convert moe-experts after model loaded, like GPTOSS and Llama4
+        # so offload_to_disk is not supported for them.
+        if not cls.support_offload_to_disk:
+            quantize_config.offload_to_disk = False
+            log.warn(f"{cls} doesn't support offload_to_disk, set quantize_config.offload_to_disk to False.")
 
-        # log.info("Model: pinned memory to cpu")
-        # model = fast_pin_model(model)
+        if quantize_config.offload_to_disk:
+            model = build_shell_model(cls.loader, config=config, **model_init_kwargs)
+            model._model_init_kwargs = model_init_kwargs
+            print_module_tree(model=model)
 
-        # log.info(f"pinned memory == {next(model.parameters()).is_pinned()}")  # Should return `True`
+            # enable mmap with low_cpu_mem_usage
+            turtle_spinner = log.spinner(title="Turtle model loading...", interval=0.1)
+            try:
+                turtle_model = cls.loader.from_pretrained(
+                    model_local_path,
+                    config=config,
+                    low_cpu_mem_usage=True,
+                    **model_init_kwargs,
+                )
+            finally:
+                turtle_spinner.close()
+
+            # TODO FIX ME...temp store model_init args
+            turtle_model._model_init_kwargs = model_init_kwargs
+            # print("actual turtle model-----------")
+            # print_module_tree(model=turtle_model)
+        else:
+            print("loading model directly to CPU (not using meta device or turtle_model)-----------")
+            model = cls.loader.from_pretrained(model_local_path, config=config, **model_init_kwargs)
+            model._model_init_kwargs = model_init_kwargs
+            print_module_tree(model=model)
+
+            turtle_model = None
 
         model_config = model.config.to_dict()
         seq_len_keys = ["max_position_embeddings", "seq_length", "n_positions", "multimodal_max_length"]
@@ -238,18 +262,28 @@ def ModelLoader(cls):
         else:
             log.warn("Model: can't get model's sequence length from model config, will set to 4096.")
             model.seqlen = 4096
+
         model.eval()
+        turtle_model.eval() if turtle_model is not None else None
 
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_id_or_path, trust_remote_code=trust_remote_code)
 
-        return cls(
+        instance = cls(
             model,
+            turtle_model=turtle_model,
             quantized=False,
             quantize_config=quantize_config,
             tokenizer=tokenizer,
             trust_remote_code=trust_remote_code,
             model_local_path=model_local_path,
         )
+
+        timer = getattr(instance, "quant_region_timer", None)
+        if timer is not None:
+            source_label = getattr(instance, "model_local_path", None) or str(pretrained_model_id_or_path)
+            timer.record("model_load", time.perf_counter() - load_start, source=source_label)
+
+        return instance
 
     cls.from_pretrained = from_pretrained
 
@@ -261,19 +295,24 @@ def ModelLoader(cls):
             device: Optional[Union[str, int]] = None,
             backend: Union[str, BACKEND] = BACKEND.AUTO,
             adapter: Optional[Adapter] = None,
-            torch_dtype: [str | torch.dtype] = "auto",
+            dtype: [str | torch.dtype] = "auto",
             trust_remote_code: bool = False,
-            verify_hash: Optional[Union[str, List[str]]] = None,
             **kwargs,
     ):
+
+        # post-quant is safe with GIL=0 and torch.compile/graphs
+
+        import torch._dynamo
+        torch._dynamo.reset()
+
         # normalized device + device_map into single device
-        device = normalize_device_device_map(device, device_map)
+        normalized_device = device if device_map is None else None  # let device_map dictate placement when present
+        device = normalize_device_device_map(normalized_device, device_map)
 
         # TODO need to normalize backend and others in a unified api
         if isinstance(backend, str):
             backend =  (backend)
         device = auto_select_device(device, backend)
-        device_map = device.to_device_map()
 
         if backend == BACKEND.VLLM:
             import os
@@ -306,6 +345,7 @@ def ModelLoader(cls):
         revision = kwargs.pop("revision", None)
         subfolder = kwargs.pop("subfolder", "")
         commit_hash = kwargs.pop("_commit_hash", None)
+        attn_implementation = kwargs.pop("attn_implementation", None)
 
         cached_file_kwargs = {
             "cache_dir": cache_dir,
@@ -318,6 +358,7 @@ def ModelLoader(cls):
             "subfolder": subfolder,
             "_raise_exceptions_for_missing_entries": False,
             "_commit_hash": commit_hash,
+            "attn_implementation": attn_implementation,
         }
 
         # == step1: prepare configs and file names == #
@@ -346,13 +387,27 @@ def ModelLoader(cls):
                 )
 
         if cls.require_dtype:
-            torch_dtype = cls.require_dtype
+            dtype = cls.require_dtype
 
-        if torch_dtype is None or torch_dtype == "auto" or not isinstance(torch_dtype, torch.dtype) :
+        if dtype is None or dtype == "auto" or not isinstance(dtype, torch.dtype) :
             # TODO FIX ME for `dynamic`, non-quantized modules should be in native type
-            torch_dtype = auto_dtype(config=config, device=device, quant_inference=True)
+            dtype = auto_dtype(config=config, device=device, quant_inference=True)
+
+        if isinstance(dtype, torch.dtype) and getattr(config, "torch_dtype", None) != dtype:
+            # Ensure flash attention kernels see an explicit dtype instead of relying on defaults.
+            config.torch_dtype = dtype
 
         qcfg = QuantizeConfig.from_pretrained(model_local_path, **cached_file_kwargs, **kwargs)
+
+        if qcfg.quant_method == METHOD.AWQ and qcfg.format in [FORMAT.GEMV_FAST]:
+            # GEMV_FAST only supports torch.float16
+            log.info("Loading Quantized Model: Auto fix `dtype` to `torch.float16`")
+            dtype = torch.float16
+
+        if backend == BACKEND.EXLLAMA_EORA:
+            # EXLLAMA_EORA only supports torch.float16
+            log.info("Loading Quantized Model: Auto fix `dtype` to `torch.float16`")
+            dtype = torch.float16
 
         # inject adapter into qcfg
         if adapter is not None:
@@ -360,9 +415,16 @@ def ModelLoader(cls):
 
         qcfg.calculate_bits_per_weight()
 
+        tokenizer = AutoTokenizer.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code)
+
         if backend == BACKEND.VLLM or backend == BACKEND.SGLANG:
-            if qcfg.format != FORMAT.GPTQ:
-                raise ValueError(f"{backend} backend only supports FORMAT.GPTQ: actual = {qcfg.format}")
+            if backend == BACKEND.VLLM:
+                if qcfg.format != FORMAT.GPTQ and qcfg.format != FORMAT.GEMM:
+                    raise ValueError(f"{backend} backend only supports FORMAT.GPTQ or FORMAT.GEMM: actual = {qcfg.format}")
+            elif backend == BACKEND.SGLANG:
+                if qcfg.format != FORMAT.GPTQ:
+                    raise ValueError(f"{backend} backend only supports FORMAT.GPTQ: actual = {qcfg.format}")
+
             if backend == BACKEND.VLLM:
                 from ..utils.vllm import load_model_by_vllm, vllm_generate
 
@@ -373,7 +435,7 @@ def ModelLoader(cls):
                 )
 
                 model.config = model.llm_engine.model_config
-                model.device = model.llm_engine.device_config.device
+                model.device = model.llm_engine.vllm_config.device_config.device
 
                 cls.generate = lambda self, **kwargs: vllm_generate(self.model, **kwargs)
 
@@ -392,7 +454,10 @@ def ModelLoader(cls):
                 model,
                 quantized=True,
                 quantize_config=qcfg,
+                tokenizer=tokenizer,
                 qlinear_kernel=None,
+                load_quantized_model=True,
+                trust_remote_code=trust_remote_code,
                 model_local_path=model_local_path,
             )
 
@@ -448,14 +513,6 @@ def ModelLoader(cls):
         qcfg.runtime_format = qcfg.format
 
         model_save_name = resolved_archive_file  # In case a model is sharded, this would be `model.safetensors.index.json` which may later break.
-        if verify_hash:
-            if is_sharded:
-                verfieid = verify_sharded_model_hashes(model_save_name, verify_hash)
-            else:
-                verfieid = verify_model_hash(model_save_name, verify_hash)
-            if not verfieid:
-                raise ValueError(f"Hash verification failed for {model_save_name}")
-            log.info(f"Hash verification succeeded for {model_save_name}")
 
         # == step2: convert model to gptq-model (replace Linear with QuantLinear) == #
         def skip(*args, **kwargs):
@@ -469,7 +526,9 @@ def ModelLoader(cls):
 
         init_contexts = [no_init_weights()]
 
-        with ContextManagers(init_contexts):
+        with (ContextManagers(init_contexts)):
+            cls.before_model_load(cls, load_quantized_model=True)
+
             if config.architectures:
                 model_class = getattr(transformers, config.architectures[0], None)
                 if model_class is not None and hasattr(model_class, "_supports_flash_attn_2"):
@@ -483,37 +542,30 @@ def ModelLoader(cls):
             if supports_flash_attn and device in [DEVICE.CUDA, DEVICE.ROCM]:
                 if ATTN_IMPLEMENTATION in kwargs:
                     args[ATTN_IMPLEMENTATION] = kwargs.pop(ATTN_IMPLEMENTATION, None)
-                if USE_FLASH_ATTENTION_2 in kwargs:
-                    args[USE_FLASH_ATTENTION_2] = kwargs.pop(USE_FLASH_ATTENTION_2, None)
-                if not args and importlib.util.find_spec("flash_attn") is not None:
-                    has_attn_implementation = Version(transformers.__version__) >= Version("4.46.0")
-                    if is_flash_attn_2_available() and has_attn_implementation:
-                        args = {ATTN_IMPLEMENTATION: "flash_attention_2"}
-                    elif is_flash_attn_2_available() and not has_attn_implementation:
-                        args = {USE_FLASH_ATTENTION_2: True}
-
-                    log.info("Optimize: Auto enabling flash attention2")
+                elif is_flash_attn_2_available():
+                    args = {ATTN_IMPLEMENTATION: "flash_attention_2"}
+                    log.info("Loader: Auto enabling flash attention2")
 
             model = cls.loader.from_config(
-                config, trust_remote_code=trust_remote_code, torch_dtype=torch_dtype, **args
+                config, trust_remote_code=trust_remote_code, dtype=dtype, **args
             )
             model.checkpoint_file_name = model_save_name
 
-            if cls.dynamic_expert_index is not None:
-                num_experts = getattr(config, cls.dynamic_expert_index)
-                cls.layer_modules = get_moe_layer_modules(layer_modules=cls.layer_modules,
-                                                          num_experts=num_experts)
+            # Get the first layer to determine layer type
+            layers, _ = get_module_by_name_prefix(model, cls.extract_layers_node())
+
+            layers[0]
 
             modules = find_modules(model)
-            ignore_modules = [cls.lm_head] + cls.base_modules
+            ignore_modules = [cls.lm_head] + cls.get_base_modules(model)
 
             for name in list(modules.keys()):
                 # allow loading of quantized lm_head
                 if qcfg.lm_head and name == cls.lm_head:
                     continue
 
-                if not any(name.startswith(prefix) for prefix in cls.layers_node) or any(name.startswith(ignore_module) for ignore_module in ignore_modules) or all(
-                        not name.endswith(ignore_module) for sublist in cls.layer_modules for ignore_module in sublist
+                if not any(name.startswith(prefix) for prefix in cls.extract_layers_node()) or any(name.startswith(ignore_module) for ignore_module in ignore_modules) or all(
+                        not name.endswith(ignore_module) for sublist in cls.simple_layer_modules(config, qcfg) for ignore_module in sublist
                 ):
                     # log non-lm-head quantized modules only
                     if name is not cls.lm_head:
@@ -522,42 +574,256 @@ def ModelLoader(cls):
 
             preload_qlinear_kernel = make_quant(
                 model,
-                quant_result=modules,
                 qcfg=qcfg,
+                quant_result=modules,
                 backend=backend,
                 lm_head_name=cls.lm_head,
                 device=device,
             )
 
-            if preload_qlinear_kernel == IPEXQuantLinear:
-                qcfg.runtime_format = FORMAT.IPEX
+        if isinstance(device_map, str) and device_map not in [
+                "auto",
+                "balanced",
+                "balanced_low_0",
+                "sequential",
+            ]:
+                raise ValueError(
+                    "If passing a string for `device_map`, please choose 'auto', 'balanced', 'balanced_low_0' or "
+                    "'sequential'."
+                )
+
+
+        def build_layerwise_device_map(
+                model,
+                device,
+                layers: List[torch.nn.Module],
+                ignore_modules: List[torch.nn.Module],
+                num_gpus: Optional[int] = None,
+        ) -> Dict[str, str]:
+            """
+            Build a deterministic alternating device_map for multi-GPU loading.
+            Designed for quantized GPTQ models.
+
+            Rules:
+              • Input embedding(s) → GPU 0
+              • Each repeating layer → alternate across GPUs (round-robin)
+              • Output head (lm_head / embed_out):
+                  – If weight-tied with input embedding → GPU 0
+                  – Else → last GPU
+              • Ignore modules (e.g., norms, projections) → co-located with last layer’s GPU
+            """
+
+            if num_gpus is None:
+                num_gpus = torch.cuda.device_count()
+            if num_gpus < 1:
+                raise RuntimeError("No CUDA devices detected")
+
+            device_ids = list(range(num_gpus))
+            device_map: Dict[str, str] = {}
+            mod2name = {m: n for n, m in model.named_modules()}
+
+            if device == DEVICE.CUDA:
+                if torch.cuda.is_available():
+                    device_strs = [f"cuda:{i}" for i in range(num_gpus)]
+                else:
+                    raise RuntimeError("CUDA is not available")
+            elif device == DEVICE.XPU:
+                if hasattr(torch, "xpu") and torch.xpu.is_available():
+                    device_strs = [f"xpu:{i}" for i in range(num_gpus)]
+                else:
+                    raise RuntimeError("XPU is not available")
+            else:
+                device_strs = ["cpu"] * num_gpus
+
+            def assign(mod, device_id):
+                if mod is None:
+                    return
+                name = mod2name.get(mod)
+                if name is not None:
+                    device_map[name] = device_strs[device_id]
+
+            # -------------------------------------------------------------
+            # 1–3. Assign input embeddings, layers, and ignored modules
+            # -------------------------------------------------------------
+            # Input embeddings → GPU 0
+            try:
+                in_emb = model.get_input_embeddings()
+            except NotImplementedError:
+                log.warning("Model does not implement get_input_embeddings. Skipping input embeddings assignment.")
+                in_emb = None
+            assign(in_emb, device_ids[0])
+
+            # Alternating layers
+            layer_name2devid: Dict[str, int] = {}
+
+            for i, layer in enumerate(layers):
+                gpu = device_ids[i % num_gpus]
+                assign(layer, gpu)
+                lname = mod2name.get(layer)
+                if lname is not None:
+                    layer_name2devid[lname] = gpu
+
+            # Ignored modules - skip input embeddings to avoid overriding GPU 0 assignment
+            # Iterate over modules that should be ignored during default layer-wise mapping
+            for mod in ignore_modules:
+                # Preserve GPU-0 placement for the input embedding module if it exists
+                if in_emb is not None and mod is in_emb:
+                    continue  # Skip input embedding to preserve GPU 0 assignment
+                # Retrieve the module’s fully-qualified name
+                name = mod2name.get(mod)
+                if name is None:
+                    continue
+                # Walk up the module hierarchy to find the closest ancestor that already has a device assignment
+                owner = name
+                dev_id = None
+                while owner:
+                    if owner in layer_name2devid:
+                        dev_id = layer_name2devid[owner]
+                        break
+                    if "." not in owner:
+                        break
+                    owner = owner.rsplit(".", 1)[0]
+                # If no ancestor is found, fall back to the last GPU
+                if dev_id is None:
+                    dev_id = device_ids[-1]
+                # Assign the current module to the determined device
+                assign(mod, dev_id)
+            # -------------------------------------------------------------
+            # 4. Handle lm_head / output projection explicitly
+            # -------------------------------------------------------------
+            # Look for lm_head or similar projection
+            head = getattr(model, "lm_head", None)
+            if head is None:
+                for cand in ("embed_out", "output_projection", "output_head"):
+                    if hasattr(model, cand):
+                        head = getattr(model, cand)
+                        break
+
+            if head is not None:
+                assign(head, device_ids[-1])
+                # If weight-tied, co-locate on GPU 0
+                tie_cfg = bool(getattr(getattr(model, "config", None), "tie_word_embeddings", False))
+                if (
+                    in_emb is not None
+                    and tie_cfg
+                ):
+                    assign(head, device_ids[0])
+
+            # -------------------------------------------------------------
+            # 5. Safety check: ensure all params are covered
+            # -------------------------------------------------------------
+            missing = [
+                n for n, _ in chain(model.named_parameters(), model.named_buffers())
+                if not any(n == k or n.startswith(k + ".") for k in device_map)
+            ]
+            module_names = set(mod2name.values())
+            if missing:
+                # map any leftover params (rare) to last GPU
+                fallback_device = device_ids[-1]
+                for param_name in missing:
+                    owner = param_name
+                    while owner and owner not in module_names:
+                        if "." not in owner:
+                            owner = ""
+                        else:
+                            owner = owner.rsplit(".", 1)[0]
+                    if owner:
+                        device_map.setdefault(owner, device_strs[fallback_device])
+                    else:
+                        log.info(f"Loader: unable to map param '{param_name}' to a module; skipping fallback assignment.")
+
+            # -------------------------------------------------------------
+            # 6. Prune parent assignments that would override child devices
+            # -------------------------------------------------------------
+            for name, device_str in list(device_map.items()):
+                if not name:
+                    continue
+                child_devices = {
+                    device_map[child_name]
+                    for child_name in device_map
+                    if child_name != name and child_name.startswith(f"{name}.")
+                }
+                if child_devices and (len(child_devices) > 1 or device_str not in child_devices):
+                    log.info(f"Loader: dropping parent '{name}' from device_map to preserve child placements.")
+                    device_map.pop(name, None)
+
+            # Collect parameters/buffers that were not assigned to any device in the current device_map
+            missing_after_prune = [
+                n for n, _ in chain(model.named_parameters(), model.named_buffers())
+                if not any(n == k or n.startswith(k + ".") for k in device_map)
+            ]
+            # If any tensors remain unmapped, assign them to the last GPU as a fallback
+            if missing_after_prune:
+                fallback_device = device_ids[-1]
+                for param_name in missing_after_prune:
+                    # Walk up the module tree until we find a module name that exists in module_names
+                    owner = param_name
+                    while owner and owner not in module_names:
+                        if "." not in owner:
+                            owner = ""
+                        else:
+                            owner = owner.rsplit(".", 1)[0]
+                    # Map the closest owning module to the fallback device
+                    if owner:
+                        device_map.setdefault(owner, device_strs[fallback_device])
+                    else:
+                        log.info(f"Loader: unable to map param '{param_name}' to a module; skipping fallback assignment.")
+            # optional logging for debug
+            log.info(f"Loader: Built map across {num_gpus} GPU(s), "
+                  f"{len(device_map)} entries. First 8: {list(device_map.items())[:8]}")
+
+            return device_map
+
+        log.info(f"Loader: device = {device}")
+        layers, _ = get_module_by_name_prefix(model, cls.extract_layers_node())
+        num_gpus = 1
+        if device is DEVICE.CUDA:
+            num_gpus = torch.cuda.device_count()
+        elif device is DEVICE.XPU:
+            num_gpus = torch.xpu.device_count()
+        device_map = build_layerwise_device_map(model, device, layers, ignore_modules, num_gpus)
+        log.info(f"Loader: device_map = {device_map}")
 
         load_checkpoint_in_model = True
         # compat: runtime convert checkpoint gptq(v1) to gptq_v2 format
-        if qcfg.format == FORMAT.GPTQ and backend not in [BACKEND.IPEX]:
+        if qcfg.format in [FORMAT.GPTQ, FORMAT.GEMM]:
             load_checkpoint_in_model_then_tie_weights(
                 model,
-                dtype=torch_dtype,
+                dtype=dtype,
                 # This is very hacky but works due to https://github.com/huggingface/accelerate/blob/bd72a5f1a80d5146554458823f8aeda0a9db5297/src/accelerate/utils/modeling.py#L292
                 checkpoint=model_save_name,
                 device_map=device_map,
                 offload_state_dict=True,
                 offload_buffers=True,
             )
-            # validate sym=False v1 loading needs to be protected for models produced with new v2 format codebase
-            if not qcfg.sym and not qcfg.is_quantized_by_v2():
-                raise ValueError(
-                    f"Format: Loading of a sym=False model with format={FORMAT.GPTQ} is only supported if produced by gptqmodel version >= {MIN_VERSION_WITH_V2}"
-                )
-
-            model = convert_gptq_v1_to_v2_format(
-                model,
-                cfg=qcfg,
-                qlinear_kernel=preload_qlinear_kernel,
-            )
 
             load_checkpoint_in_model = False
-            qcfg.runtime_format = FORMAT.GPTQ_V2
+
+            if qcfg.format == FORMAT.GPTQ:
+                # validate sym=False v1 loading needs to be protected for models produced with new v2 format codebase
+                if not qcfg.sym and not qcfg.is_quantized_by_gptaq():
+                    raise ValueError(
+                        f"Format: Loading of a sym=False model with format={FORMAT.GPTQ} is only supported if produced by gptqmodel version >= {MIN_VERSION_WITH_V2}"
+                    )
+
+                if preload_qlinear_kernel.REQUIRES_FORMAT_V2:
+                    model = convert_gptq_v1_to_v2_format(
+                        model,
+                        cfg=qcfg,
+                        qlinear_kernel=preload_qlinear_kernel,
+                    )
+
+                    qcfg.runtime_format = FORMAT.GPTQ_V2
+
+        if backend == BACKEND.MACHETE:
+            if is_sharded:
+                raise ValueError(
+                    "Format: The loading of sharded checkpoints with Machete is currently not supported."
+                )
+            if not _validate_machete_device_support():
+                raise ValueError(
+                    f"Kernel: Machete kernel requires compute capability >= 9.0. Detected capability: {torch.cuda.get_device_capability()}"
+                )
 
         if backend in [BACKEND.MARLIN, BACKEND.MARLIN_FP16] and (
                 preload_qlinear_kernel == ExllamaV2QuantLinear or qcfg.format == FORMAT.MARLIN):
@@ -571,10 +837,8 @@ def ModelLoader(cls):
                 )
 
             # Validate the model can run in Marlin.
-            if torch_dtype != torch.float16:
-                raise ValueError("Marlin kernel requires torch_dtype=torch.float16.")
-
-            _validate_marlin_compatibility(qcfg, throw_error=True)
+            if dtype != torch.float16:
+                raise ValueError("Marlin kernel requires dtype=torch.float16.")
 
 
         if backend == BACKEND.BITBLAS:
@@ -586,7 +850,7 @@ def ModelLoader(cls):
                 model=model,
                 qcfg=qcfg,
                 quant_linear_class=preload_qlinear_kernel,
-                torch_dtype=torch_dtype,
+                dtype=dtype,
                 model_save_name=model_save_name,
                 device_map=device_map,
                 desc_act=qcfg.desc_act,
@@ -596,10 +860,10 @@ def ModelLoader(cls):
 
         # If we use marlin or bitblas to load the quantized model, the model is already a converted model,
         # and we no longer need to call load_checkpoint_in_model()
-        if load_checkpoint_in_model and backend not in [BACKEND.MARLIN, BACKEND.MARLIN_FP16, BACKEND.BITBLAS]:
+        if load_checkpoint_in_model and backend not in [BACKEND.MACHETE, BACKEND.MARLIN, BACKEND.MARLIN_FP16, BACKEND.BITBLAS]:
             load_checkpoint_in_model_then_tie_weights(
                 model,
-                dtype=torch_dtype,
+                dtype=dtype,
                 # This is very hacky but works due to https://github.com/huggingface/accelerate/blob/bd72a5f1a80d5146554458823f8aeda0a9db5297/src/accelerate/utils/modeling.py#L292
                 checkpoint=model_save_name,
                 device_map=device_map,
@@ -618,6 +882,7 @@ def ModelLoader(cls):
             sym=qcfg.sym,
             backend=backend,
             format=qcfg.format,
+            quant_method=qcfg.quant_method,
             device=device,
             pack_dtype=qcfg.pack_dtype,
         )
@@ -637,13 +902,11 @@ def ModelLoader(cls):
 
         model.eval()
 
-        tokenizer = AutoTokenizer.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code)
-
         if backend == BACKEND.MLX:
             import tempfile
             try:
                 from mlx_lm import load
-                from mlx_lm.utils import save_config, save_weights
+                from mlx_lm.utils import save_config, save_model
 
                 from ..utils.mlx import convert_gptq_to_mlx_weights, mlx_generate
             except ModuleNotFoundError as exception:
@@ -655,7 +918,7 @@ def ModelLoader(cls):
             with tempfile.TemporaryDirectory() as temp_dir:
                 mlx_weights, mlx_config = convert_gptq_to_mlx_weights(model_id_or_path, model, qcfg.to_dict(), cls.lm_head)
 
-                save_weights(temp_dir, mlx_weights, donate_weights=True)
+                save_model(temp_dir, mlx_weights, donate_model=True)
                 save_config(mlx_config, config_path=temp_dir + "/config.json")
                 tokenizer.save_pretrained(temp_dir)
 

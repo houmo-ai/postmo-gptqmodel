@@ -21,6 +21,7 @@ from peft.tuners.lora.gptq import GPTQLoraLinear
 from safetensors.torch import load_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 # -- end do not touch
 
@@ -28,14 +29,16 @@ import tempfile  # noqa: E402
 from typing import Optional  # noqa: E402
 
 from datasets import load_dataset  # noqa: E402
-from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
-from gptqmodel.adapter.adapter import HF_ADAPTER_FILE_NAME, HF_ADAPTER_WEIGHT_KEY_PREFIX, Lora  # noqa: E402
-from gptqmodel.utils.eval import EVAL  # noqa: E402
-from gptqmodel.utils.torch import torch_empty_cache  # noqa: E402
 from lm_eval.utils import make_table  # noqa: E402
 from logbar import LogBar
 from models.model_test import ModelTest  # noqa: E402
 from tabulate import tabulate  # noqa: E402
+
+from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
+from gptqmodel.adapter.adapter import HF_ADAPTER_FILE_NAME, HF_ADAPTER_WEIGHT_KEY_PREFIX, Lora  # noqa: E402
+from gptqmodel.utils.eval import EVAL  # noqa: E402
+from gptqmodel.utils.torch import torch_empty_cache  # noqa: E402
+
 
 log = LogBar.shared()
 
@@ -45,9 +48,12 @@ class Test(ModelTest):
     # NATIVE_MODEL_ID = "/monster/data/model/tinyllama-15M-stories"
     NATIVE_MODEL_ID = "/monster/data/model/Llama-3.2-1B"
 
-    NATIVE_ARC_CHALLENGE_ACC = 0.3567
-    NATIVE_ARC_CHALLENGE_ACC_NORM = 0.3805
-    QUANT_ARC_MAX_DELTA_FLOOR_PERCENT = 0.36
+    EVAL_TASKS = {
+        EVAL.LM_EVAL.ARC_CHALLENGE: {
+            "acc": {"value": 0.3567, "floor_pct": 0.36},
+            "acc_norm": {"value": 0.3805, "floor_pct": 0.36},
+        },
+    }
 
     @classmethod
     def setUpClass(cls):
@@ -61,7 +67,6 @@ class Test(ModelTest):
         batch_size = 1
         calibration_dataset_rows = 512
         calibration_dataset_concat_size = 0  # disable
-        auto_gc = False
         adapter_path = "eora"
         dataset_id = "allenai/c4"
         dataset_files = "en/c4-train.00001-of-01024.json.gz"
@@ -77,7 +82,6 @@ class Test(ModelTest):
             "batch_size": batch_size,
             "calibration_dataset_rows": calibration_dataset_rows,
             "calibration_dataset_concat_size": calibration_dataset_concat_size,
-            "auto_gc": auto_gc,
             "adapter_path": adapter_path,
         }
 
@@ -114,10 +118,9 @@ class Test(ModelTest):
             )
 
             model.quantize(
-                calibration_dataset=calibration_dataset,
+                calibration=calibration_dataset,
                 batch_size=batch_size,
-                auto_gc=auto_gc,
-                calibration_dataset_concat_size=calibration_dataset_concat_size,
+                calibration_concat_size=calibration_dataset_concat_size,
             )  #
 
             # EoRA adapter is saved according to Lora.path property
@@ -194,7 +197,7 @@ class Test(ModelTest):
         bench_result = GPTQModel.eval(
             model_or_id_or_path=model,
             framework=EVAL.LM_EVAL,
-            tasks=[EVAL.LM_EVAL.ARC_CHALLENGE, EVAL.LM_EVAL.MMLU],
+            tasks=[EVAL.LM_EVAL.ARC_CHALLENGE, EVAL.LM_EVAL.MMLU_STEM],
         )
 
         del model

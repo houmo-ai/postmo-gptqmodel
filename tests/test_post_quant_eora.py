@@ -16,20 +16,20 @@
 # -- do not touch
 import os
 
+
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 # -- end do not touch
 
-import gzip  # noqa: E402
-import json
 import tempfile  # noqa: E402
 from typing import Optional  # noqa: E402
+
+from datasets import load_dataset
+from models.model_test import ModelTest  # noqa: E402
 
 from gptqmodel import BACKEND, GPTQModel  # noqa: E402
 from gptqmodel.adapter.adapter import Lora  # noqa: E402
 from gptqmodel.utils.eval import EVAL  # noqa: E402
 from gptqmodel.utils.torch import torch_empty_cache  # noqa: E402
-# from lm_eval.utils import make_table  # noqa: E402
-from models.model_test import ModelTest  # noqa: E402
 
 
 def bench(path: str, backend: BACKEND, adapter: Optional[Lora]):
@@ -53,7 +53,7 @@ def bench(path: str, backend: BACKEND, adapter: Optional[Lora]):
     bench_result = GPTQModel.eval(
         model_or_id_or_path=model,
         framework=EVAL.LM_EVAL,
-        tasks=[EVAL.LM_EVAL.ARC_CHALLENGE, EVAL.LM_EVAL.MMLU]
+        tasks=[EVAL.LM_EVAL.ARC_CHALLENGE, EVAL.LM_EVAL.MMLU_STEM]
     )
 
     del model
@@ -74,14 +74,15 @@ class TestEoraPostQuant(ModelTest):
         rank = 256
         calibration_dataset_rows = 512
         calibration_dataset_concat_size = 0  # disable
-        auto_gc = False
 
+        dataset_id = "allenai/c4"
+        dataset_files = "en/c4-train.00001-of-01024.json.gz"
 
-        with gzip.open("/monster/data/model/dataset/c4-train.00000-of-01024.json.gz", 'rt', encoding='utf-8') as f:
-            data = [json.loads(line)["text"] for line in f]
-            calibration_dataset = data[:calibration_dataset_rows]
-
-        # calibration_dataset = self.load_dataset(rows=calibration_dataset_rows)["text"]
+        calibration_dataset = load_dataset(
+            dataset_id,
+            data_files=dataset_files,
+            split="train"
+        ).select(range(calibration_dataset_rows))["text"]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             eora = Lora(
@@ -97,10 +98,10 @@ class TestEoraPostQuant(ModelTest):
                 quantized_model_id_or_path=self.QUANTIZED_MODEL_PATH,
                 calibration_dataset=calibration_dataset,
                 calibration_dataset_concat_size=calibration_dataset_concat_size,
-                auto_gc=auto_gc)
+            )
 
             # BACKEND.EXLLAMA_V2, BACKEND.EXLLAMA_V1, BACKEND.TRITON, BACKEND.CUDA,
-            # for backend in [BACKEND.TORCH]:  # BACKEND.IPEX, BACKEND.BITBLAS, BACKEND.EXLLAMA_V2V BACKEND.MARLIN
+            # for backend in [BACKEND.MARLIN]:  # BACKEND.IPEX, BACKEND.BITBLAS, BACKEND.EXLLAMA_V2V BACKEND.MARLIN
             #     base_bench = bench(path=self.QUANTIZED_MODEL_PATH, backend=backend, adapter=None)  # inference using qweights only
             #     eora_bench = bench(path=self.QUANTIZED_MODEL_PATH, backend=backend, adapter=eora)  # inference using eora (lora)
             #

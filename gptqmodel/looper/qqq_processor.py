@@ -1,70 +1,64 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
+import contextlib
 import copy
-from typing import Callable, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 from torch.nn import Module
 
 from .. import BACKEND
-from ..looper.loop_processor import LoopProcessor
+from ..looper.loop_processor import DTYPE_SIZE_COLUMN, MODULE_FEATURE_COLUMN, LoopProcessor
 from ..looper.named_module import NamedModule
-from ..models import BaseGPTQModel
+from ..models import BaseQModel
 from ..models.writer import (PROCESS_LOG_FWD_TIME, PROCESS_LOG_LAYER, PROCESS_LOG_MODULE, PROCESS_LOG_NAME,
                              PROCESS_LOG_TIME, QUANT_LOG_DAMP, QUANT_LOG_LOSS, QUANT_LOG_NSAMPLES)
-from ..quantization.config import QUANT_METHOD, QuantizeConfig
+from ..nn_modules.qlinear.qqq import QQQQuantLinear
+from ..quantization.config import METHOD, QuantizeConfig
 from ..quantization.qqq import QQQ
-from ..utils.logger import setup_logger
-from ..utils.model import move_to, pack_model
-from ..utils.torch import CPU, DEVICE_0, DEVICE_0_STREAM, torch_streamCtx, torch_sync
+from ..utils.logger import setup_logger, log_time_block
+from ..utils.model import create_quant_module, find_modules, move_to, pack_model, pack_module
+from ..utils.torch import CPU, DEVICE_0, tf32_disable_guard, torch_streamCtx, torch_sync
 
 log = setup_logger()
 
 class QQQProcessor(LoopProcessor):
-    def __init__(self, tokenizer, qcfg: QuantizeConfig, calibration_dataset, prepare_dataset_func,
-                 calibration_dataset_concat_size: Optional[int], batch_size: int,
-                 logger_board: str = "", require_fwd: bool = True, calculate_w_wq_diff: bool = False):
+    def __init__(
+        self,
+        tokenizer,
+        qcfg: QuantizeConfig,
+        calibration,
+        prepare_dataset_func,
+        calibration_concat_size: Optional[int],
+        calibration_sort: Optional[str],
+        batch_size: int,
+        require_fwd: bool = True,
+        calculate_w_wq_diff: bool = False,
+        calibration_concat_separator: Optional[str] = None,
+    ):
 
-        super().__init__(tokenizer=tokenizer, qcfg=qcfg, calibration_dataset=calibration_dataset,
-                         calibration_dataset_concat_size=calibration_dataset_concat_size,
-                         prepare_dataset_func=prepare_dataset_func, batch_size=batch_size,
-                         logger_board=logger_board, require_fwd=require_fwd)
+        super().__init__(
+            tokenizer=tokenizer,
+            qcfg=qcfg,
+            calibration=calibration,
+            calibration_concat_size=calibration_concat_size,
+            calibration_sort=calibration_sort,
+            calibration_concat_separator=calibration_concat_separator,
+            prepare_dataset_func=prepare_dataset_func,
+            batch_size=batch_size,
+            require_fwd=require_fwd,
+        )
 
         self.calculate_w_wq_diff = calculate_w_wq_diff
         self.avg_losses = []
 
-    def log_plotly(self):
-        task = self.logger_task
-        if task is not None:
-            from ..utils.plotly import create_plotly
-            x = list(range(self.layer_count))
-            gpu_fig = create_plotly(x=x, y=self.gpu_memorys, xaxis_title="layer", yaxis_title="GPU usage (GB)")
-            cpu_fig = create_plotly(x=x, y=self.cpu_memorys, xaxis_title="layer", yaxis_title="CPU usage (GB)")
-            loss_fig = create_plotly(x=self.module_names, y=self.avg_losses, xaxis_title="layer", yaxis_title="loss")
-            time_fig = create_plotly(x=self.module_names, y=self.durations, xaxis_title="layer", yaxis_title="time")
-            task.get_logger().report_plotly('GPU Memory', 'GPU Memory', gpu_fig)
-            task.get_logger().report_plotly('CPU Memory', 'CPU Memory', cpu_fig)
-            task.get_logger().report_plotly('avg_loss', 'avg_loss', loss_fig)
-            task.get_logger().report_plotly('quant_time', 'quant_time', time_fig)
-
     def set_calibration_dataset(self, calibration_dataset):
-        raise NotImplementedError("GPTQProcessor's calibration_dataset cannot be modified")
+        raise NotImplementedError("QQQProcessor's calibration_dataset cannot be modified")
 
-    def preprocess(self, module: NamedModule, buffered_fwd: bool):
+    def preprocess(self, module: NamedModule):
         # entire module is skipped
         if self.qcfg.dynamic_get(layer_name=module.full_name) == False:
             return
@@ -78,24 +72,34 @@ class QQQProcessor(LoopProcessor):
             qcfg_clone.mse = self.qcfg.dynamic_get(module.full_name, "mse", qcfg_clone.mse)
 
             qcfg_clone.group_size = self.qcfg.dynamic_get(module.full_name, "group_size", qcfg_clone.group_size)
-            qcfg_clone.desc_act = self.qcfg.dynamic_get(module.full_name, "desc_act", qcfg_clone.desc_act)
+            desc_act_override = self.qcfg.dynamic_get(module.full_name, "desc_act", None)
+            if desc_act_override is not None:
+                qcfg_clone.desc_act = desc_act_override
+            act_group_aware_override = self.qcfg.dynamic_get(module.full_name, "act_group_aware", None)
+            if act_group_aware_override is not None:
+                qcfg_clone.act_group_aware = act_group_aware_override
             qcfg_clone.damp_percent = self.qcfg.dynamic_get(module.full_name, "damp_percent", qcfg_clone.damp_percent)
             qcfg_clone.static_groups = self.qcfg.dynamic_get(module.full_name, "static_groups", qcfg_clone.static_groups)
 
+            qcfg_clone._resolve_activation_ordering(desc_act_override, act_group_aware_override)
+
         tmp = QQQ(module=module, qcfg=qcfg_clone)
 
-        # models like DeepSeek v3/r1 has > 256 $ of sub-modules per layer
-        # use buffered mode go vram don't explode: gptq needs to store fwd inputs per each layer fwd
-        # all sub-modules within a single layer needs to store all the inputs.
-        # deepseek has massive # of sub-modules per layer, causing vram pressure
-        # buffered mode is slower due to gpu<->cpu movement
-        if buffered_fwd:
-            log.info(f"Quantize: Enabling fwd buffered mode for: `{module.name}`")
-            tmp.fwd_inputs_buffered = True
-
+        if self.qcfg.mse > 0.0:
+            mse = True
+            norm = self.qcfg.mse
+        else:
+            mse = False
+            norm = 100
         tmp.quantizer.configure(
+            self.qcfg.bits,
             perchannel=True,
+            sym=self.qcfg.sym,
+            mse=mse,
+            norm=norm,
+            groupsize=self.qcfg.group_size,
         )
+
         self.tasks[module.name] = tmp
 
     def is_skipped(self, module: NamedModule) -> bool:
@@ -113,22 +117,27 @@ class QQQProcessor(LoopProcessor):
             q.add_batch(inp[0].data, out.data)  # noqa: F821
         return tmp
 
-    def pre_process_streaming(self, module: NamedModule):
-        q = self.tasks[module.name]
-        with torch_streamCtx(module.target_device_stream):
-            if q.H is not None:
-                q.H = q.H.to(device=module.target_device, non_blocking=True)
-            module.weight.data = module.weight.data.to(device=module.target_device, non_blocking=True)
-
-
-    def process(self, module: NamedModule, auto_gc: bool = True):
+    def process(
+        self,
+        module: NamedModule,
+        device: torch.device = None,
+        subset: Optional[Dict[str, NamedModule]] = None,
+        previous_subset: Optional[Dict[str, NamedModule]] = None,
+        subset_index: Optional[int] = None,
+        subset_total: Optional[int] = None,
+    ):
         self.pb.title(f"Quantizing {module.name} in layer ").draw()
         qqq = self.tasks
 
         # logger.info(f"Quantizing module START: {name}, {gptq[name].shape()}")
         ## Need to return the quantized_weight for offloading
         q = qqq[module.name]
-        wq, scale, zero, g_idx, duration, avg_loss, damp_percent, scale_extra, nsamples = q.quantize()
+        wq, q_scales, q_zeros, q_g_idx, duration, avg_loss, damp_percent, q_scales_extra, nsamples = q.quantize()
+
+        q_scales = q_scales.to(CPU)
+        q_zeros = q_zeros.to(CPU)
+        q_g_idx = q_g_idx.to(CPU)
+
         ## Assign the quantized weight to the weight
         #gptq[name].layer.weight.data = q_full_weight.to(device=gptq[name].device)
 
@@ -149,33 +158,35 @@ class QQQProcessor(LoopProcessor):
         #         value=duration,
         #         iteration=name_index,
         #     )
-        self.durations.append(duration)
-        self.avg_losses.append(avg_loss)
-        self.module_names.append(f"layer-{module.layer_index}-{module.name}")
-
         stat = {
             PROCESS_LOG_NAME:  self.name(),
             PROCESS_LOG_LAYER: module.layer_index,
             PROCESS_LOG_MODULE: module.name,
+            MODULE_FEATURE_COLUMN: self.module_feature_summary(module),
+            DTYPE_SIZE_COLUMN: self.module_dtype_size_summary(module),
             QUANT_LOG_LOSS: f"{avg_loss:.10f}",
             QUANT_LOG_NSAMPLES: f"{nsamples}",
             QUANT_LOG_DAMP: f"{damp_percent:.5f}",
             PROCESS_LOG_TIME: f"{duration:.3f}",
-            PROCESS_LOG_FWD_TIME: f"{self.fwd_time:.3f}",
+            PROCESS_LOG_FWD_TIME: self.formatted_fwd_time(),
         }
 
         if self.qcfg.dynamic is not None:
             stat["dynamic"] = self.qcfg.dynamic_get(layer_name=module.full_name)
 
-        self.log.append(stat)
+        with self.lock:
+            self.durations.append(duration)
+            self.avg_losses.append(avg_loss)
+            self.module_names.append(f"layer-{module.layer_index}-{module.name}")
+            self.log.append(stat)
+
         self.log_new_row(stat)
 
-        self.result_save(module.full_name, {
-            "scale": move_to(scale, device=CPU, stream=self.stream),
-            "zero": move_to(zero, device=CPU, stream=self.stream),
-            "g_idx": move_to(g_idx, device=CPU, stream=self.stream),
-            "scale_extra": move_to(scale_extra, device=CPU, stream=self.stream),
-        })
+        with self.lock:
+            module.state.update({"q_scales": q_scales})
+            module.state.update({"q_zeros": q_zeros})
+            module.state.update({"q_g_idx": q_g_idx})
+            module.state.update({"q_scales_extra": q_scales_extra})
 
         if self.calculate_w_wq_diff:
             if module.weight.data.dtype == torch.float16:
@@ -185,47 +196,94 @@ class QQQProcessor(LoopProcessor):
                 # diff in float32
                 w_wq_diff = module.weight.data.to(dtype=torch.float32) - wq.to(dtype=torch.float32)
 
-            module.state.update({
-                "w_wq_diff": w_wq_diff,
-            })
+            with self.lock:
+                module.state.update({
+                    "w_wq_diff": w_wq_diff,
+                })
 
         # with torch_streamCtx(DEVICE_0_STREAM):
         #     wq = wq.to(device=DEVICE_0, non_blocking=True) # move to d0 for post quant inference
-        wq = wq.to(device=DEVICE_0, non_blocking=False)
+        # wq = wq.to(device=DEVICE_0, non_blocking=False)
 
         # prepare for module.forward post generate
         module.weight.data = wq
 
     # submodule_finalized is called in reverse after all next sequential processes are called
-    def submodule_finalize(self, module: NamedModule):
+    def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):
         # generate complete, safe to move to cpu
-        module.weight.data = move_to(module.weight.data, device=CPU, stream=self.stream) # large weights is slow to init on cpu
+        module.weight.data = move_to(module.weight.data, device=CPU) # large weights is slow to init on cpu
         module.state.pop("w", None) # no need for original weights now
 
-    def finalize(self, model: BaseGPTQModel, **kwargs):
-        # block for streams
-        if self.stream:
-            torch_sync()
+        # cleanup all memory or states vars persistently added by this processor
+        with self.lock:
+            module.state.pop("w", None)  #
+            module.state.pop("w_wq_diff", None)
 
-        model.qlinear_kernel = pack_model(
-            model=model.model,
-            quant_result=self.results(),
-            bits=self.qcfg.bits,
-            group_size=self.qcfg.group_size,
-            backend=BACKEND.QQQ,
-            desc_act=self.qcfg.desc_act,
-            format=self.qcfg.format,
-            quant_method=self.qcfg.quant_method,
-            lm_head_name=model.lm_head,
-            dynamic=self.qcfg.dynamic,
-            parallel_packing=self.qcfg.parallel_packing,
-            pack_dtype=self.qcfg.pack_dtype,
-        )
+            q_zeros = module.state.pop("q_zeros")
+            q_scales = module.state.pop("q_scales")
+            q_g_idx = module.state.pop("q_g_idx")
+            q_scales_extra = module.state.pop("q_scales_extra")
 
+        layers = find_modules(model.model)
+        module_label = getattr(module, "full_name", getattr(module, "name", ""))
+
+        # replace module with quantized module
+        with log_time_block(
+            "create_quant_module",
+            logger=log,
+            module_name=module_label,
+        ):
+            create_quant_module(
+                name=module.full_name,
+                linear_cls=QQQQuantLinear,
+                bits=self.qcfg.bits,
+                desc_act=self.qcfg.desc_act,
+                dynamic=self.qcfg.dynamic,
+                group_size=self.qcfg.group_size,
+                module=model.model,
+                submodule=module,
+                sym=self.qcfg.sym,
+                device=self.qcfg.device,
+                lm_head_name=model.lm_head,
+                pack_dtype=self.qcfg.pack_dtype,
+                register_buffers=False,
+            )
+
+        # pack module
+        qModules = {
+            name: submodule
+            for name, submodule in find_modules(model.model, [QQQQuantLinear]).items()
+            if name == module.full_name
+        }
+        with log_time_block(
+            "pack",
+            logger=log,
+            module_name=module_label,
+        ):
+            pack_module(
+                name=module.full_name,
+                qModules=qModules,
+                q_scales=q_scales,
+                q_zeros=q_zeros,
+                q_g_idx=q_g_idx,
+                layers=layers,
+                quant_linear_cls=QQQQuantLinear,
+                lock=self.lock,
+                q_scales_extra=q_scales_extra,
+                quantize_config=self.qcfg,
+            )
+
+        # TODO: store module quant results in module, not global processor result
+        with self.lock:
+            self.result_pop(module.full_name)
+
+        module.unregister_parameter("weight")
+
+    def finalize(self, model: BaseQModel, **kwargs):
         # set quantized state
         model.quantized = True
 
-        model.quantize_config.quant_method = QUANT_METHOD.QQQ
+        model.quantize_config.quant_method = METHOD.QQQ
 
         super().finalize(model=model, **kwargs)
 

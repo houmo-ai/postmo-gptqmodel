@@ -1,8 +1,15 @@
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
+# Contact: qubitium@modelcloud.ai, x.com/qubitium
+
 import os
 
+
 os.environ["GPTQMODEL_USE_MODELSCOPE"] = "True"
-from gptqmodel import GPTQModel  # noqa: E402
 from models.model_test import ModelTest  # noqa: E402
+
+from gptqmodel import GPTQModel  # noqa: E402
 
 
 class TestLoadModelscope(ModelTest):

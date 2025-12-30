@@ -1,21 +1,12 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import copy
 import math
+import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -27,7 +18,10 @@ from torch.nn.modules.conv import _ConvNd
 from ...adapter.adapter import LORA_MERGED_WEIGHT_PATHS, Adapter
 from ...models._const import DEVICE, PLATFORM
 from ...utils.backend import BACKEND
+from ...utils.env import env_flag
 from ...utils.logger import setup_logger
+from ...utils.safe import THREADPOOLCTL
+
 
 log = setup_logger()
 
@@ -52,6 +46,8 @@ class BaseQuantLinear(nn.Module):
     SUPPORTS_PLATFORM: List[PLATFORM] = None
 
     SUPPORTS_DTYPES: List[t.dtype] = None
+
+    REQUIRES_FORMAT_V2: bool = False
 
     def __init__(self,
                  bits: int,
@@ -231,6 +227,8 @@ class BaseQuantLinear(nn.Module):
             in_features:int=None,
             out_features:int=None,
             pack_dtype:t.dtype=None,
+            dtype: Optional[t.dtype]=None,
+            zero_point: Optional[bool]=None,
             dynamic:Optional[dict]=None,
             device:Optional[DEVICE]=None,
             trainable:Optional[bool]=None,
@@ -239,6 +237,7 @@ class BaseQuantLinear(nn.Module):
         bool, Optional[Exception]]:
         return cls._validate(bits=bits, group_size=group_size, desc_act=desc_act, sym=sym,
                              in_features=in_features, out_features=out_features, pack_dtype=pack_dtype,
+                             dtype=dtype, zero_point=zero_point,
                              dynamic=dynamic, device=device, trainable=trainable, adapter=adapter)
 
     @classmethod
@@ -278,7 +277,7 @@ class BaseQuantLinear(nn.Module):
             #     raise ValueError(f"{cls.__name__}.{name} cannot be an empty list.")
 
     @classmethod
-    def _validate(cls, bits: int=4, group_size: int=128, desc_act: bool=False, sym: bool=False, pack_dtype:t.dtype=None, dynamic:Optional[dict]=None, in_features:int=None,
+    def _validate(cls, bits: int=4, group_size: int=128, desc_act: bool=False, sym: bool=False, pack_dtype:t.dtype=None, dtype: Optional[t.dtype]=None, zero_point: Optional[bool]=None, dynamic:Optional[dict]=None, in_features:int=None,
                   out_features:int=None, device:Optional[DEVICE]=None, trainable:Optional[bool]=None, adapter:Optional[Adapter]=None) -> Tuple[bool, Optional[Exception]]:
         cls.verify_supports_params()
 
@@ -288,6 +287,10 @@ class BaseQuantLinear(nn.Module):
 
         if pack_dtype not in cls.SUPPORTS_PACK_DTYPES:
             err = f"{cls} does not support `pack_dtype`: {pack_dtype}"
+            return False, NotImplementedError(err)
+
+        if dtype is not None and dtype not in cls.SUPPORTS_DTYPES:
+            err = f"{cls} only supports `{cls.SUPPORTS_DTYPES}` dtype: actual dtype = `{dtype}`"
             return False, NotImplementedError(err)
 
         if PLATFORM.ALL not in cls.SUPPORTS_PLATFORM and sys.platform not in cls.SUPPORTS_PLATFORM:
@@ -423,16 +426,18 @@ class PackableQuantLinear(BaseQuantLinear):
                 dtype=t.int32,
             ).reshape(1, 3, 12).to(device=self.g_idx.device)
 
-        self.register_buffer("wf_unsqueeze_zero", wf.unsqueeze(0).to(device=self.g_idx.device))
-        self.register_buffer("wf_unsqueeze_neg_one", wf.unsqueeze(-1).to(device=self.g_idx.device))
+        self.register_buffer("wf_unsqueeze_zero", wf.unsqueeze(0).to(device=self.g_idx.device), persistent=False)
+        self.register_buffer("wf_unsqueeze_neg_one", wf.unsqueeze(-1).to(device=self.g_idx.device), persistent=False)
 
         super().post_init(**kwargs)
 
     def list_buffers(self):
-        return super().list_buffers() + [
-            self.wf_unsqueeze_zero,
-            self.wf_unsqueeze_neg_one,
-        ]
+        buf = super().list_buffers()
+        if hasattr(self, "wf_unsqueeze_zero") and self.wf_unsqueeze_zero is not None:
+            buf.append(self.wf_unsqueeze_zero)
+        if hasattr(self, "wf_unsqueeze_neg_one") and self.wf_unsqueeze_neg_one is not None:
+            buf.append(self.wf_unsqueeze_neg_one)
+        return buf
 
     def dequantize_weight(self, num_itr: int = 1):
         if self.bits in [2, 4, 8]:
@@ -487,96 +492,595 @@ class PackableQuantLinear(BaseQuantLinear):
 
         return weights
 
-    def pack(self, linear: nn.Module, scales: t.Tensor, zeros: t.Tensor, g_idx: t.Tensor=None):
-        W = linear.weight.data.clone()
+    # FIXME, optimum needs call pack(), we need to remove it
+    def pack(
+            self,
+            linear: nn.Module,
+            scales: t.Tensor,
+            zeros: t.Tensor,
+            g_idx: t.Tensor,
+            block_in: int = 8192,
+            workers: int = 8,
+    ):
+        self.pack_block(linear, scales, zeros, g_idx, block_in, workers)
+
+    @t.inference_mode()
+    def pack_block(
+            self,
+            linear: nn.Module,
+            scales: t.Tensor,
+            zeros: t.Tensor,
+            g_idx: t.Tensor,
+            block_in: int = 8192,
+            workers: int = 1,
+    ):
+        """
+        Parallel qweight pack on CPU (threaded over input blocks). qzeros path = original logic.
+
+        - qweight: streamed in 32-aligned blocks; each block packed by a worker into
+          non-overlapping rows of the preallocated output tensor (no locks).
+        - qzeros: EXACT original numpy-based packing to preserve layout/shape.
+        - math done on CPU; no .numpy() round trips for qweight.
+
+        Args:
+          block_in: number of input channels per task (must be multiple of 32).
+          workers:  number of worker threads (None -> auto; 1 -> single-thread).
+        """
+
+        MASK32 = (1 << 32) - 1  # for safe masking when packing via int64
+
+        # ---------- normalize weight to [out, in] (same as your code) ----------
+        W = linear.weight.detach()
         if isinstance(linear, _ConvNd):
             W = W.flatten(1)
         if isinstance(linear, transformers.pytorch_utils.Conv1D):
             W = W.T
+        W = W.to("cpu", copy=False)
+        out_features, in_features = W.shape
 
-        self.g_idx = g_idx.clone() if g_idx is not None else self.g_idx
+        # ---------- g_idx buffer ----------
+        if g_idx.numel() != in_features:
+            raise ValueError(f"g_idx length {g_idx.numel()} != in_features {in_features}")
+        g_idx = g_idx.to("cpu")
+        self.register_buffer("g_idx", g_idx)
 
-        scales = scales.T.contiguous()
-        zeros = zeros.T.contiguous()
-        scale_zeros = zeros * scales
-        self.scales = scales.clone().to(dtype=t.float16)
+        # ---------- ORIGINAL scales/zeros logic (unchanged) ----------
+        scales = scales.T.contiguous()  # [G, out]
+        zeros = zeros.T.contiguous()  # [G, out]
+        scale_zeros = zeros * scales  # [G, out]
+        num_groups = scales.shape[0]
+
+        # small buffers
+        self.register_buffer("scales", scales.to(dtype=t.float16))
         if linear.bias is not None:
-            self.bias = linear.bias.clone().to(dtype=t.float16)
+            self.register_buffer("bias", linear.bias.detach().to("cpu", dtype=t.float16))
 
-        int_weight = t.round((W + scale_zeros[self.g_idx].T) / scales[self.g_idx].T).to(t.int32)
-        int_weight = int_weight.T.contiguous()
-        int_weight = int_weight.numpy().astype(self.pack_np_math_dtype)
+        # ---------- constants ----------
+        bits = int(self.bits)  # 2,3,4,8
+        word_bits = int(self.pack_dtype_bits)  # expect 32
+        assert word_bits == 32, "Only 32-bit packing words supported."
+        if (in_features % word_bits) != 0:
+            raise ValueError("in_features must be divisible by 32")
+        if (out_features % word_bits) != 0:
+            raise ValueError(
+                "pack_block extension requires out_features to be divisible by 32"
+            )
 
-        qweight = np.zeros((int_weight.shape[0] // self.pack_dtype_bits * self.bits, int_weight.shape[1]),
-                           dtype=self.pack_np_math_dtype)
-        if self.bits in [2, 4, 8]:
-            for row in range(qweight.shape[0]):
-                for j in range(self.pack_factor):
-                    qweight[row] |= int_weight[row * self.pack_factor + j] << (self.bits * j)
-        elif self.bits == 3:
-            i = 0
-            row = 0
-            while row < qweight.shape[0]:
-                for j in range(i, i + 10):
-                    qweight[row] |= int_weight[j] << (3 * (j - i))
-                i += 10
-                qweight[row] |= int_weight[i] << 30
-                row += 1
-                qweight[row] |= (int_weight[i] >> 2) & 1
-                i += 1
-                for j in range(i, i + 10):
-                    qweight[row] |= int_weight[j] << (3 * (j - i) + 1)
-                i += 10
-                qweight[row] |= int_weight[i] << 31
-                row += 1
-                qweight[row] |= (int_weight[i] >> 1) & 0x3
-                i += 1
-                for j in range(i, i + 10):
-                    qweight[row] |= int_weight[j] << (3 * (j - i) + 2)
-                i += 10
-                row += 1
+        disable_ext = env_flag("GPTQMODEL_DISABLE_PACK_EXT")
+        force_ext = env_flag("GPTQMODEL_FORCE_PACK_EXT")
+        pack_block_threads = workers if workers and workers > 0 else 1
+        env_threads = os.getenv("GPTQMODEL_PACK_THREADS")
+        if env_threads:
+            try:
+                pack_block_threads = max(int(env_threads), 1)
+            except ValueError:
+                log.warning(
+                    "pack_block: invalid GPTQMODEL_PACK_THREADS `%s`; defaulting to %d.",
+                    env_threads,
+                    pack_block_threads,
+                )
 
-        self.qweight = t.from_numpy(qweight.astype(self.pack_np_dtype))
+        if not disable_ext and bits in (2, 4, 8):
+            try:
+                from .pack_block_ext import pack_block_cpu as pack_block_cpu_ext
 
-        zeros = zeros.numpy().astype(self.pack_np_math_dtype)
-        qzeros = np.zeros((zeros.shape[0], zeros.shape[1] // self.pack_dtype_bits * self.bits), dtype=self.pack_np_math_dtype)
-        if self.bits in [2, 4, 8]:
-            for col in range(qzeros.shape[1]):
-                for j in range(self.pack_factor):
-                    qzeros[:, col] |= zeros[:, col * self.pack_factor + j] << (self.bits * j)
-        elif self.bits == 3:
+                qweight_ext, qzeros_ext = pack_block_cpu_ext(
+                    W,
+                    scales,
+                    zeros,
+                    g_idx.to(dtype=t.int32),
+                    bits,
+                    word_bits,
+                    block_in,
+                    pack_block_threads,
+                )
+
+                self.register_buffer("qweight", qweight_ext.to(dtype=self.pack_dtype))
+                self.register_buffer("qzeros", qzeros_ext.to(dtype=self.pack_dtype))
+                return
+            except Exception as exc:
+                if force_ext:
+                    raise
+                log.debug("pack_block: native extension unavailable, falling back to Python path (%s)", exc)
+
+        # NOTE: pack_factor is only meaningful for {2,4,8}. There is NO integer pack_factor for 3-bit.
+        if bits in (2, 4, 8):
+            pack_factor = word_bits // bits  # 16, 8, 4 respectively
+            # If the instance carries a different pack_factor, ignore it for safety.
+        elif bits == 3:
+            pack_factor = None  # sentinel: use the 10-1-10-1-10 scheme
+        else:
+            raise NotImplementedError(f"Unsupported bits={bits}")
+
+        # ---------- qweight allocation (storage dtype = int32) ----------
+        OUT_DTYPE = self.pack_dtype  # should be torch.int32 per your dtype table
+        if OUT_DTYPE != t.int32:
+            raise ValueError("pack_block() expects self.pack_dtype == torch.int32 for 32-bit words.")
+
+        # rows = (in // 32) * ({2,4,8} -> bits rows ; 3 -> 3 rows)
+        rows_per_group = (bits if bits != 3 else 3)
+        qweight_rows = (in_features // word_bits) * rows_per_group
+        qweight = t.empty((qweight_rows, out_features), dtype=OUT_DTYPE, device="cpu")
+
+        # ---------- precompute shifts for 2/4/8-bit vectorized packing ----------
+        if bits in (2, 4, 8):
+            shifts_pf64 = (t.arange(pack_factor, dtype=t.int64) * bits).view(1, pack_factor, 1)  # [1,pf,1]
+
+        # ---------- pack helpers (int64 shifts -> mask -> int32) ----------
+        @t.inference_mode()
+        def _pack_rows_2_4_8(int32_blk_32xN: t.Tensor, dst: t.Tensor, dst_rows_base: int):
+            # int32_blk_32xN: [32, N]
+            r64 = int32_blk_32xN.to(t.int64)  # [32,N]
+            # interpret the 32 input rows as [bits, pack_factor, N] in row-major order
+            R = r64.view(bits, pack_factor, -1)  # [bits,pf,N]
+            packed64 = (R << shifts_pf64).sum(dim=1, dtype=t.int64)  # [bits,N]
+            dst[dst_rows_base:dst_rows_base + bits] = ((packed64 & MASK32).to(t.int32))
+
+        @t.inference_mode()
+        def _pack_rows_3(int32_blk_32xN: t.Tensor, dst: t.Tensor, dst_rows_base: int):
+            # Layout: 32 inputs -> 3 output rows with pattern 10 | 1 | 10 | 1 | 10 (=> 32 scalars * 3 bits = 96 bits)
+            x = int32_blk_32xN.to(t.int64)  # [32,N]
+            # A: first 10 values at bit offsets {0,3,6,...,27} plus low 2 bits of the 11th value at bit 30
+            A = ((x[0:10] << (t.arange(10, dtype=t.int64).view(-1, 1) * 3)).sum(dim=0, dtype=t.int64)) & MASK32
+            A = (A | ((x[10] << 30) & MASK32)) & MASK32
+            # B: carry bit 2 of the 11th into bit 0, then 10 values at offsets {1,4,7,...,28}, then bit 31 from 22nd
+            B = (((x[10] >> 2) & 1) & MASK32)
+            B = (B | (
+                (x[11:21] << (t.arange(10, dtype=t.int64).view(-1, 1) * 3 + 1)).sum(dim=0, dtype=t.int64))) & MASK32
+            B = (B | ((x[21] << 31) & MASK32)) & MASK32
+            # C: carry bits 1..0 of the 22nd into bits 0..1, then 10 values at offsets {2,5,8,...,29}
+            C = (((x[21] >> 1) & 0x3) & MASK32)
+            C = (C | (
+                (x[22:32] << (t.arange(10, dtype=t.int64).view(-1, 1) * 3 + 2)).sum(dim=0, dtype=t.int64))) & MASK32
+            dst[dst_rows_base + 0] = A.to(t.int32)
+            dst[dst_rows_base + 1] = B.to(t.int32)
+            dst[dst_rows_base + 2] = C.to(t.int32)
+
+        # ---------- thread task: process a single [i0,i1) block ----------
+        block_in = max(word_bits, (block_in // word_bits) * word_bits)
+
+        @t.inference_mode()
+        def _process_block(i0: int, i1: int):
+            blk = i1 - i0
+            # [out, blk]
+            Wblk = W[:, i0:i1]
+            # select group rows for these inputs from [G, out] -> [blk, out], then T -> [out, blk]
+            gsel = g_idx[i0:i1].to(dtype=t.int64, copy=False)  # [blk]
+            if gsel.numel() == 0:
+                return
+
+            neg_mask = gsel < 0
+            if neg_mask.any():
+                gsel = gsel.clone()
+                gsel[neg_mask] += num_groups
+
+            gsel_max = int(gsel.max().item())
+            gsel_min = int(gsel.min().item())
+            if gsel_min < 0 or gsel_max >= num_groups:
+                raise IndexError(
+                    f"pack_block: g_idx values out of range after normalization (min={gsel_min}, max={gsel_max}, groups={num_groups})."
+                )
+
+            sz_blk_T = scale_zeros.index_select(0, gsel).T  # [out, blk]
+            s_blk_T = scales.index_select(0, gsel).T  # [out, blk]
+
+            # int_block = round((W + scale_zeros[g_idx]^T) / scales[g_idx]^T)
+            int_block = t.round((Wblk + sz_blk_T) / s_blk_T).to(t.int32)  # [out, blk]
+            int_block = int_block.T.contiguous()  # [blk, out]
+
+            groups32 = blk // word_bits
+            base_group = (i0 // word_bits)
+            for g in range(groups32):
+                sub = int_block[g * word_bits:(g + 1) * word_bits]  # [32, out] int32
+                dst_rows = (base_group + g) * (bits if bits != 3 else 3)
+                if bits in (2, 4, 8):
+                    _pack_rows_2_4_8(sub, qweight, dst_rows)
+                elif bits == 3:
+                    _pack_rows_3(sub, qweight, dst_rows)
+                else:
+                    raise NotImplementedError(f"Unsupported bits={bits}")
+
+            # free temps
+            del Wblk, gsel, sz_blk_T, s_blk_T, int_block
+
+        # ---------- schedule blocks across a thread pool ----------
+        starts = list(range(0, in_features, block_in))
+        ranges = [(i0, min(i0 + block_in, in_features)) for i0 in starts]
+        len(ranges)
+
+        # TODO FIX ME...threads safety issue with threaded block work
+        workers_eff = 1 # max(1, min(workers, total_blocks))
+        if workers_eff == 1:
+            for i0, i1 in ranges:
+                _process_block(i0, i1)
+        else:
+            with ThreadPoolExecutor(max_workers=workers_eff, thread_name_prefix="pack qweight") as ex:
+                futs = [ex.submit(_process_block, i0, i1) for (i0, i1) in ranges]
+                for f in futs:
+                    f.result()
+
+        # ---------- qzeros: EXACT original numpy path (unchanged) ----------
+        zeros_np = zeros.detach().cpu().numpy().astype(self.pack_np_math_dtype, copy=False)  # [G, out]
+        qzeros_np = np.zeros(
+            (zeros_np.shape[0], (zeros_np.shape[1] // self.pack_dtype_bits) * bits),
+            dtype=self.pack_np_math_dtype
+        )
+
+        if bits in [2, 4, 8]:
+            pf = (32 // bits)  # compute locally to avoid relying on attribute
+            for col in range(qzeros_np.shape[1]):
+                base = col * pf
+                for j in range(pf):
+                    qzeros_np[:, col] |= zeros_np[:, base + j] << (bits * j)
+        elif bits == 3:
             i = 0
             col = 0
-            while col < qzeros.shape[1]:
+            while col < qzeros_np.shape[1]:
                 for j in range(i, i + 10):
-                    qzeros[:, col] |= zeros[:, j] << (3 * (j - i))
+                    qzeros_np[:, col] |= zeros_np[:, j] << (3 * (j - i))
                 i += 10
-                qzeros[:, col] |= zeros[:, i] << 30
+                qzeros_np[:, col] |= zeros_np[:, i] << 30
                 col += 1
-                qzeros[:, col] |= (zeros[:, i] >> 2) & 1
+                qzeros_np[:, col] |= (zeros_np[:, i] >> 2) & 1
                 i += 1
                 for j in range(i, i + 10):
-                    qzeros[:, col] |= zeros[:, j] << (3 * (j - i) + 1)
+                    qzeros_np[:, col] |= zeros_np[:, j] << (3 * (j - i) + 1)
                 i += 10
-                qzeros[:, col] |= zeros[:, i] << 31
+                qzeros_np[:, col] |= zeros_np[:, i] << 31
                 col += 1
-                qzeros[:, col] |= (zeros[:, i] >> 1) & 0x3
+                qzeros_np[:, col] |= (zeros_np[:, i] >> 1) & 0x3
                 i += 1
                 for j in range(i, i + 10):
-                    qzeros[:, col] |= zeros[:, j] << (3 * (j - i) + 2)
+                    qzeros_np[:, col] |= zeros_np[:, j] << (3 * (j - i) + 2)
                 i += 10
                 col += 1
+        else:
+            raise NotImplementedError(f"Unsupported bits={bits}")
 
-        self.qzeros = t.from_numpy(qzeros.astype(self.pack_np_dtype))
+        # ---------- register buffers ----------
+        self.register_buffer("qweight", qweight.to(dtype=self.pack_dtype))
+        self.register_buffer("qzeros", t.from_numpy(qzeros_np.astype(self.pack_np_dtype, copy=False)))
 
-        # assert
-        # assert isinstance(self, TorchQuantLinear), f"type: {self.__class_}"
-        # wq = linear.weight.data
-        # wq_dequantized = self.dequantize_weight().T
-        # print(f"------ WQ -----")
-        # print(wq)
-        # print(f"------ WQ Dequantized -----")
-        # print(wq_dequantized)
-        # assert t.equal(wq, wq_dequantized)
+    @t.inference_mode()
+    def pack_gpu(
+        self,
+        linear: nn.Module,
+        scales: t.Tensor,
+        zeros: t.Tensor,
+        g_idx: t.Tensor,
+        *,
+        block_in: int = 8192,
+        device: Optional[t.device] = None,
+    ):
+        """Pack quantized weights using CUDA kernels."""
 
-        # print("self qw", self.qweight, self.scales, self.qzeros)
+        if not t.cuda.is_available():
+            raise RuntimeError("pack_gpu requires CUDA availability but none was detected.")
+
+        target_device = t.device(device) if device is not None else t.device("cuda")
+        if target_device.type != "cuda":
+            raise ValueError(f"pack_gpu expected a CUDA device, got `{target_device}`.")
+
+        MASK32 = (1 << 32) - 1
+        mask_tensor = t.tensor(MASK32, dtype=t.int64, device=target_device)
+
+        weight = linear.weight.detach().to(device=target_device, copy=True)
+        # weight = linear.weight.detach()
+        if isinstance(linear, _ConvNd):
+            weight = weight.flatten(1)
+        if isinstance(linear, transformers.pytorch_utils.Conv1D):
+            weight = weight.T
+        # weight = weight.to(device=target_device, copy=True)
+        out_features, in_features = weight.shape
+
+        if g_idx is None:
+            raise ValueError("pack_gpu requires non-null g_idx")
+        if g_idx.numel() != in_features:
+            raise ValueError(f"g_idx length {g_idx.numel()} != in_features {in_features}")
+
+        g_idx_cpu = g_idx.to(device="cpu", dtype=t.long, copy=False)
+        g_idx_dev = g_idx_cpu.to(device=target_device)
+        self.register_buffer("g_idx", g_idx_cpu.to(dtype=t.int32))
+
+        # Align layout with CPU paths: expect [groups, out_features]
+        scales_g = scales.T.contiguous()
+        zeros_g = zeros.T.contiguous()
+        scale_zeros_g = zeros_g * scales_g
+
+        scales_dev = scales_g.to(device=target_device)
+        zeros_dev = zeros_g.to(device=target_device)
+        scale_zeros_dev = scale_zeros_g.to(device=target_device)
+
+        self.register_buffer("scales", scales_g.to(device="cpu", dtype=t.float16))
+        if linear.bias is not None:
+            self.register_buffer("bias", linear.bias.detach().to(device="cpu", dtype=t.float16))
+        else:
+            self.bias = None
+
+        bits = int(self.bits)
+        word_bits = int(self.pack_dtype_bits)
+        if word_bits != 32:
+            raise ValueError("pack_gpu currently supports 32-bit packing words only.")
+        if in_features % word_bits != 0:
+            raise ValueError("in_features must be divisible by 32 for pack_gpu")
+
+        if bits in (2, 4, 8):
+            pack_factor = word_bits // bits
+            shifts_pf64 = (
+                t.arange(pack_factor, dtype=t.int64, device=target_device)
+                .view(1, pack_factor, 1)
+                * bits
+            )
+        elif bits == 3:
+            shifts_pf64 = None
+        else:
+            raise NotImplementedError(f"Unsupported bits={bits}")
+
+        rows_per_group = (bits if bits != 3 else 3)
+        qweight_dev = t.empty(
+            (in_features // word_bits * rows_per_group, out_features),
+            dtype=self.pack_dtype,
+            device=target_device,
+        )
+
+        range10 = t.arange(10, dtype=t.int64, device=target_device).view(-1, 1)
+
+        @t.inference_mode()
+        def _pack_rows_2_4_8(int32_blk_32xN: t.Tensor, dst: t.Tensor, dst_rows_base: int):
+            r64 = int32_blk_32xN.to(t.int64)
+            reshaped = r64.view(bits, pack_factor, -1)
+            packed64 = (reshaped << shifts_pf64).sum(dim=1, dtype=t.int64)
+            dst[dst_rows_base:dst_rows_base + bits] = (
+                (packed64 & mask_tensor).to(self.pack_dtype)
+            )
+
+        @t.inference_mode()
+        def _pack_rows_3_values(int32_blk_32xN: t.Tensor) -> t.Tensor:
+            x = int32_blk_32xN.to(t.int64)
+            A = ((x[0:10] << (range10 * 3)).sum(dim=0, dtype=t.int64)) & mask_tensor
+            A = (A | ((x[10] << 30) & mask_tensor)) & mask_tensor
+
+            B = (((x[10] >> 2) & 1) & mask_tensor)
+            B = (B | ((x[11:21] << (range10 * 3 + 1)).sum(dim=0, dtype=t.int64))) & mask_tensor
+            B = (B | ((x[21] << 31) & mask_tensor)) & mask_tensor
+
+            C = (((x[21] >> 1) & 0x3) & mask_tensor)
+            C = (C | ((x[22:32] << (range10 * 3 + 2)).sum(dim=0, dtype=t.int64))) & mask_tensor
+
+            return t.stack([A, B, C], dim=0)
+
+        def _pack_rows_3(int32_blk_32xN: t.Tensor, dst: t.Tensor, dst_rows_base: int):
+            packed = _pack_rows_3_values(int32_blk_32xN)
+            dst[dst_rows_base:dst_rows_base + 3] = packed.to(self.pack_dtype)
+
+        block_in = max(word_bits, (block_in // word_bits) * word_bits)
+        for i0 in range(0, in_features, block_in):
+            i1 = min(i0 + block_in, in_features)
+            blk = i1 - i0
+            Wblk = weight[:, i0:i1]
+            gsel = g_idx_dev[i0:i1]
+            sz_blk_T = scale_zeros_dev.index_select(0, gsel).T
+            s_blk_T = scales_dev.index_select(0, gsel).T
+
+            int_block = t.round((Wblk + sz_blk_T) / s_blk_T).to(t.int32)
+            int_block = int_block.T.contiguous()
+
+            groups32 = blk // word_bits
+            base_group = (i0 // word_bits)
+            for g in range(groups32):
+                sub = int_block[g * word_bits:(g + 1) * word_bits]
+                dst_rows = (base_group + g) * rows_per_group
+                if bits in (2, 4, 8):
+                    _pack_rows_2_4_8(sub, qweight_dev, dst_rows)
+                else:
+                    _pack_rows_3(sub, qweight_dev, dst_rows)
+
+        zeros_int = zeros_dev.to(dtype=t.int64)
+        if bits in (2, 4, 8):
+            pack_factor = word_bits // bits
+            if zeros_int.shape[1] % pack_factor != 0:
+                raise ValueError(
+                    f"pack_gpu expected zeros second dimension divisible by pack_factor={pack_factor}, "
+                    f"got shape {zeros_int.shape}"
+                )
+            zeros_view = zeros_int.view(zeros_int.shape[0], zeros_int.shape[1] // pack_factor, pack_factor)
+            shifts = (
+                t.arange(pack_factor, dtype=t.int64, device=target_device)
+                .view(1, 1, pack_factor)
+                * bits
+            )
+            packed = (zeros_view << shifts).sum(dim=-1, dtype=t.int64) & mask_tensor
+            qzeros_dev = packed.to(dtype=self.pack_dtype)
+        elif bits == 3:
+            groups = zeros_int.shape[1] // word_bits
+            qzeros_chunks: List[t.Tensor] = []
+            for g in range(groups):
+                block = zeros_int[:, g * word_bits:(g + 1) * word_bits]
+                packed = _pack_rows_3_values(block.T).transpose(0, 1)
+                qzeros_chunks.append(packed.to(dtype=self.pack_dtype))
+            qzeros_dev = t.cat(qzeros_chunks, dim=1)
+        else:
+            raise NotImplementedError(f"Unsupported bits={bits}")
+
+        t.cuda.synchronize(device=target_device)
+
+        self.register_buffer("qweight", qweight_dev.to(device="cpu", dtype=self.pack_dtype))
+        self.register_buffer("qzeros", qzeros_dev.to(device="cpu", dtype=self.pack_dtype))
+
+        del weight, scales_dev, zeros_dev, scale_zeros_dev, qweight_dev, qzeros_dev
+
+    def pack_original(self, linear: nn.Module, scales: t.Tensor, zeros: t.Tensor, g_idx: t.Tensor=None):
+        with THREADPOOLCTL.threadpool_limits(1):
+            # TODO why did we need to clone? at packing, the original weight is no longer used by other processors?
+            # W = linear.weight.data.clone()
+            W = linear.weight.data
+            if isinstance(linear, _ConvNd):
+                W = W.flatten(1)
+            if isinstance(linear, transformers.pytorch_utils.Conv1D):
+                W = W.T
+
+            # TODO why clone?
+            # self.g_idx = g_idx.clone() if g_idx is not None else self.g_idx
+            self.register_buffer("g_idx", g_idx if g_idx is not None else self.g_idx )
+
+            scales = scales.T.contiguous()
+            zeros = zeros.T.contiguous()
+            scale_zeros = zeros * scales
+
+            # TODO why clone?
+            # self.scales = scales.clone().to(dtype=t.float16)
+            self.register_buffer("scales", scales.to(dtype=t.float16))
+
+            if linear.bias is not None:
+                # TODO why clone?
+                # self.bias = linear.bias.clone().to(dtype=t.float16)
+                self.register_buffer("bias", linear.bias.to(dtype=t.float16))
+
+            int_weight = t.round((W + scale_zeros[self.g_idx].T) / scales[self.g_idx].T).to(t.int32)
+            int_weight = int_weight.T.contiguous()
+            int_weight = int_weight.numpy().astype(self.pack_np_math_dtype)
+
+            qweight = np.zeros((int_weight.shape[0] // self.pack_dtype_bits * self.bits, int_weight.shape[1]),
+                               dtype=self.pack_np_math_dtype)
+            if self.bits in [2, 4, 8]:
+                for row in range(qweight.shape[0]):
+                    for j in range(self.pack_factor):
+                        qweight[row] |= int_weight[row * self.pack_factor + j] << (self.bits * j)
+            elif self.bits == 3:
+                i = 0
+                row = 0
+                while row < qweight.shape[0]:
+                    for j in range(i, i + 10):
+                        qweight[row] |= int_weight[j] << (3 * (j - i))
+                    i += 10
+                    qweight[row] |= int_weight[i] << 30
+                    row += 1
+                    qweight[row] |= (int_weight[i] >> 2) & 1
+                    i += 1
+                    for j in range(i, i + 10):
+                        qweight[row] |= int_weight[j] << (3 * (j - i) + 1)
+                    i += 10
+                    qweight[row] |= int_weight[i] << 31
+                    row += 1
+                    qweight[row] |= (int_weight[i] >> 1) & 0x3
+                    i += 1
+                    for j in range(i, i + 10):
+                        qweight[row] |= int_weight[j] << (3 * (j - i) + 2)
+                    i += 10
+                    row += 1
+
+            # self.qweight = t.from_numpy(qweight.astype(self.pack_np_dtype))
+            self.register_buffer("qweight", t.from_numpy(qweight.astype(self.pack_np_dtype)))
+
+            zeros = zeros.numpy().astype(self.pack_np_math_dtype)
+            qzeros = np.zeros((zeros.shape[0], zeros.shape[1] // self.pack_dtype_bits * self.bits), dtype=self.pack_np_math_dtype)
+            if self.bits in [2, 4, 8]:
+                for col in range(qzeros.shape[1]):
+                    for j in range(self.pack_factor):
+                        qzeros[:, col] |= zeros[:, col * self.pack_factor + j] << (self.bits * j)
+            elif self.bits == 3:
+                i = 0
+                col = 0
+                while col < qzeros.shape[1]:
+                    for j in range(i, i + 10):
+                        qzeros[:, col] |= zeros[:, j] << (3 * (j - i))
+                    i += 10
+                    qzeros[:, col] |= zeros[:, i] << 30
+                    col += 1
+                    qzeros[:, col] |= (zeros[:, i] >> 2) & 1
+                    i += 1
+                    for j in range(i, i + 10):
+                        qzeros[:, col] |= zeros[:, j] << (3 * (j - i) + 1)
+                    i += 10
+                    qzeros[:, col] |= zeros[:, i] << 31
+                    col += 1
+                    qzeros[:, col] |= (zeros[:, i] >> 1) & 0x3
+                    i += 1
+                    for j in range(i, i + 10):
+                        qzeros[:, col] |= zeros[:, j] << (3 * (j - i) + 2)
+                    i += 10
+                    col += 1
+
+            # self.qzeros = t.from_numpy(qzeros.astype(self.pack_np_dtype))
+            self.register_buffer("qzeros", t.from_numpy(qzeros.astype(self.pack_np_dtype)))
+
+            # assert
+            # assert isinstance(self, TorchQuantLinear), f"type: {self.__class_}"
+            # wq = linear.weight.data
+            # wq_dequantized = self.dequantize_weight().T
+            # print(f"------ WQ -----")
+            # print(wq)
+            # print(f"------ WQ Dequantized -----")
+            # print(wq_dequantized)
+            # assert t.equal(wq, wq_dequantized)
+
+            # print("self qw", self.qweight, self.scales, self.qzeros)
+
+class AWQuantLinear(BaseQuantLinear):
+    def __init__(self,
+                 bias: bool = False,
+                 register_buffers: bool = False,
+                 **kwargs):
+        super().__init__(bias=bias, register_buffers=False, **kwargs)
+
+
+        in_features = self.in_features
+        out_features = self.out_features
+
+        if register_buffers:
+            self.register_buffer(
+                "qweight",
+                t.zeros((in_features, out_features // (self.pack_dtype_bits // self.bits)), dtype=self.pack_dtype),
+            )
+            self.register_buffer(
+                "qzeros",
+                t.zeros(
+                    (in_features // self.group_size, out_features // (self.pack_dtype_bits // self.bits)),
+                    dtype=self.pack_dtype,
+                ),
+            )
+            self.register_buffer(
+                "scales",
+                t.zeros(
+                    (in_features // self.group_size, out_features),
+                    dtype=t.float16,
+                ),
+            )
+
+            if bias:
+                self.register_buffer("bias", t.zeros(out_features, dtype=t.float16))
+            else:
+                self.bias = None
+
+    # TODO FIX ME. this hack was needed because other part of code forgot to call nn.module register_buffer()!
+    def list_buffers(self) -> List:
+        buf = []
+        if hasattr(self, "qweight") and self.qweight is not None:
+            buf.append(self.qweight)
+        if hasattr(self, "qzeros") and self.qzeros is not None:
+            buf.append(self.qzeros)
+        if hasattr(self, "scales") and self.scales is not None:
+            buf.append(self.scales)
+        if hasattr(self, "bias") and self.bias is not None:
+            buf.append(self.bias)
+        return buf

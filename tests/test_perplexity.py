@@ -1,22 +1,12 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 # -- do not touch
 import os
 import time
+
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 # -- end do not touch
@@ -25,13 +15,14 @@ import tempfile  # noqa: E402
 import unittest  # noqa: E402
 
 from datasets import load_dataset  # noqa: E402
-from gptqmodel import BACKEND, GPTQModel  # noqa: E402
-from gptqmodel.quantization.config import FORMAT, QUANT_METHOD, AutoRoundQuantizeConfig, QuantizeConfig  # noqa: E402
-from gptqmodel.utils import Perplexity  # noqa: E402
-from gptqmodel.utils.rocm import IS_ROCM  # noqa: E402
-from gptqmodel.utils.torch import torch_empty_cache  # noqa: E402
 from parameterized import parameterized  # noqa: E402
 from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: E402
+
+from gptqmodel import BACKEND, GPTQModel  # noqa: E402
+from gptqmodel.quantization.config import FORMAT, METHOD, QuantizeConfig  # noqa: E402
+from gptqmodel.utils.perplexity import Perplexity  # noqa: E402
+from gptqmodel.utils.rocm import IS_ROCM  # noqa: E402
+from gptqmodel.utils.torch import torch_empty_cache  # noqa: E402
 
 
 class TestPerplexity(unittest.TestCase):
@@ -124,22 +115,22 @@ class TestPerplexity(unittest.TestCase):
 
         length = 512 if format == FORMAT.MARLIN or format == FORMAT.BITBLAS else 2048
         traindata = load_dataset(dataset_path, dataset_name, split=dataset_split).filter(lambda x: len(x[dataset_column]) >= length)
-        calibration_dataset = [tokenizer(example[dataset_column]) for example in traindata.select(range(1024))]
+        calibration_dataset = traindata.select(range(1024))
         return calibration_dataset, native_ppl
 
     @parameterized.expand(
         [
-            # (QUANT_METHOD.GPTQ, FORMAT.GPTQ, 8, 32, True), # A100, 4889 max ram
-            (QUANT_METHOD.GPTQ, FORMAT.GPTQ, 8, 32, False), # A100, 6571 max ram
-            # (QUANT_METHOD.GPTQ, FORMAT.GPTQ_V2, 8, 32, False),
-            # (QUANT_METHOD.GPTQ, FORMAT.GPTQ_V2, 4, 32, False),
-            # (QUANT_METHOD.GPTQ, FORMAT.GPTQ, 4, 32, False),
-            # (QUANT_METHOD.GPTQ, FORMAT.BITBLAS, 4, 32, False),
-            # (QUANT_METHOD.AUTO_ROUND, FORMAT.GPTQ, 4, 32, False),
+            # (QUANT_METHOD.GPTQ, FORMAT.GPTQ, 8, 32), # A100, 4889 max ram
+            (METHOD.GPTQ, FORMAT.GPTQ, 8, 32), # A100, 6571 max ram
+            # (QUANT_METHOD.GPTQ, FORMAT.GPTQ_V2, 8, 32),
+            # (QUANT_METHOD.GPTQ, FORMAT.GPTQ_V2, 4, 32),
+            # (QUANT_METHOD.GPTQ, FORMAT.GPTQ, 4, 32),
+            # (QUANT_METHOD.GPTQ, FORMAT.BITBLAS, 4, 32),
+            # (QUANT_METHOD.AUTO_ROUND, FORMAT.GPTQ, 4, 32),
         ]
     )
-    def test_quantized_perplexity(self, method: QUANT_METHOD, format: FORMAT, bits: int, group_size: int, buffered_fwd: bool = False):
-        if method == QUANT_METHOD.GPTQ:
+    def test_quantized_perplexity(self, method: METHOD, format: FORMAT, bits: int, group_size: int):
+        if method == METHOD.GPTQ:
             quantize_config = QuantizeConfig(
                 bits=bits,
                 group_size=group_size,
@@ -151,12 +142,6 @@ class TestPerplexity(unittest.TestCase):
                     "+:.*mlp\.NEVER_POSITIVE_MATCH_proj.*": {"bits": 8 if format != FORMAT.BITBLAS else 4, "group_size": 32},
                     ":.*mlp\.NEVER_POSITIVE_MATCH2_proj.*": {"bits": 8 if format != FORMAT.BITBLAS else 4, "group_size": 32},
                 }
-            )
-        elif method == QUANT_METHOD.AUTO_ROUND:
-            quantize_config = AutoRoundQuantizeConfig(
-                bits=bits,
-                group_size=group_size,
-                format=format,
             )
         else:
             raise ValueError(f"Invalid quantization method: {method}")
@@ -173,8 +158,6 @@ class TestPerplexity(unittest.TestCase):
         model.quantize(
             dataset,
             batch_size=128 if IS_ROCM else 256,
-            # buffered_fwd=buffered_fwd,  TODO FIX ME
-            auto_gc=False, # speed up quant
         )
         quant_time = time.time() - start
 

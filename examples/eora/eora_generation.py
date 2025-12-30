@@ -16,16 +16,19 @@
 # -- do not touch
 import os
 
+
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 # -- end do not touch
 
 
 # from models.model_test import ModelTest  # noqa: E402
 from eora_calibration_data_construction import construct_c4, construct_mmlu
+
 from gptqmodel import GPTQModel, QuantizeConfig  # noqa: E402
 from gptqmodel.adapter.adapter import Lora
 from gptqmodel.utils.torch import torch_empty_cache  # noqa: E402
+
 
 ## meta-llama/Llama-3.2-1B
 ## meta-llama/Llama-3.2-3B
@@ -72,7 +75,6 @@ if __name__ == '__main__':
     rank = args.eora_rank
     batch_size = 1
     calibration_dataset_concat_size = 0  # disable
-    auto_gc = False
 
     if args.quant_save_path is not None:
         quant_path = args.quant_save_path
@@ -109,20 +111,18 @@ if __name__ == '__main__':
 
     if args.eora_dataset == "c4":
         model.quantize(
-            calibration_dataset=calibration_dataset,
+            calibration=calibration_dataset,
             batch_size=batch_size,
-            auto_gc=auto_gc,
-            calibration_dataset_concat_size=calibration_dataset_concat_size,
+            calibration_concat_size=calibration_dataset_concat_size,
         )  #
     else:
 
         eora_calibration_dataset = construct_mmlu()
 
         model.quantize(
-            calibration_dataset=calibration_dataset,
+            calibration=calibration_dataset,
             batch_size=batch_size,
-            auto_gc=auto_gc,
-            calibration_dataset_concat_size=calibration_dataset_concat_size,
+            calibration_concat_size=calibration_dataset_concat_size,
             adapter_calibration_dataset=eora_calibration_dataset
         )  #
 

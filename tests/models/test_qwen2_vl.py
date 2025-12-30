@@ -1,35 +1,29 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
-from gptqmodel.models.definitions.qwen2_vl import Qwen2VLGPTQ
 from model_test import ModelTest
+
+from gptqmodel.models.definitions.qwen2_vl import Qwen2VLQModel
+from gptqmodel.utils.eval import EVAL
 
 
 class TestQwen2_VL(ModelTest):
     NATIVE_MODEL_ID = "/monster/data/model/Qwen2-VL-2B-Instruct"
-    QUANT_ARC_MAX_DELTA_FLOOR_PERCENT = 0.2
-    NATIVE_ARC_CHALLENGE_ACC = 0.2329
-    NATIVE_ARC_CHALLENGE_ACC_NORM = 0.2765
+    EVAL_TASKS = {
+        EVAL.LM_EVAL.ARC_CHALLENGE: {
+            "chat_template": True,
+            "acc": {"value": 0.3524, "floor_pct": 0.2},
+            "acc_norm": {"value": 0.3763, "floor_pct": 0.2},
+        },
+    }
     TRUST_REMOTE_CODE = False
-    APPLY_CHAT_TEMPLATE = True
     EVAL_BATCH_SIZE = 6
 
     def test_qwen2_vl(self):
         model, tokenizer, processor = self.quantModel(self.NATIVE_MODEL_ID, trust_remote_code=self.TRUST_REMOTE_CODE,
-                                           torch_dtype=self.TORCH_DTYPE)
+                                                      dtype=self.TORCH_DTYPE)
 
         # check image to text
         messages = [
@@ -49,7 +43,7 @@ class TestQwen2_VL(ModelTest):
             messages, tokenize=False, add_generation_prompt=True
         )
 
-        image_inputs = Qwen2VLGPTQ.process_vision_info(messages)
+        image_inputs = Qwen2VLQModel.process_vision_info(messages)
         inputs = processor(
             text=[text],
             images=image_inputs,
@@ -76,7 +70,6 @@ class TestQwen2_VL(ModelTest):
         self.check_kernel(model, self.KERNEL_INFERENCE)
 
         task_results = self.lm_eval(model=model,
-                                    apply_chat_template=self.APPLY_CHAT_TEMPLATE,
                                     trust_remote_code=self.TRUST_REMOTE_CODE,
                                     delete_quantized_model=self.DELETE_QUANTIZED_MODEL)
         self.check_results(task_results)

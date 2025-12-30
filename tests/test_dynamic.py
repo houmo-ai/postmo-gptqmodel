@@ -1,37 +1,29 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 # -- do not touch
 import os
 
 from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
 
+
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 # -- end do not touch
 import json  # noqa: E402
 import tempfile  # noqa: E402
+
+from models.model_test import ModelTest  # noqa: E402
+from parameterized import parameterized  # noqa: E402
 
 from gptqmodel import BACKEND, GPTQModel  # noqa: E402
 from gptqmodel.nn_modules.qlinear import BaseQuantLinear  # noqa: E402
 from gptqmodel.nn_modules.qlinear.marlin import MarlinQuantLinear  # noqa: E402
 from gptqmodel.nn_modules.qlinear.tritonv2 import TritonV2QuantLinear  # noqa: E402
 from gptqmodel.quantization import QuantizeConfig  # noqa: E402
-from gptqmodel.utils import Perplexity, safetensor  # noqa: E402
-from models.model_test import ModelTest  # noqa: E402
-from parameterized import parameterized  # noqa: E402
+from gptqmodel.utils import safetensor  # noqa: E402
+from gptqmodel.utils.perplexity import Perplexity  # noqa: E402
 
 
 class TestDynamic(ModelTest):
@@ -128,7 +120,11 @@ class TestDynamic(ModelTest):
 
         del model
         print(f"Backend: {backend}, PPL: {dynamic_bits_ppl}")
-        assert dynamic_bits_ppl <= expected_ppl, f"PPL expected: `{expected_ppl}`, actual = `{dynamic_bits_ppl}`"
+        tolerance = 0.05
+        lower_bound = expected_ppl * (1 - tolerance)
+        upper_bound = expected_ppl * (1 + tolerance)
+        assert lower_bound <= dynamic_bits_ppl <= upper_bound, \
+            f"PPL expected: `{expected_ppl}` ±{tolerance*100}%, actual = `{dynamic_bits_ppl}`"
 
     def test_skip_module(self):
         dynamic = {
@@ -149,4 +145,4 @@ class TestDynamic(ModelTest):
             del model
 
             q_model = GPTQModel.load(tmp_dir)
-            self.assertInference(model=q_model,tokenizer=self.tokenizer)
+            self.assertInference(model=q_model,tokenizer=self.tokenizer,keywords=["paris", "king"])

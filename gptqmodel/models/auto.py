@@ -1,36 +1,36 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 from __future__ import annotations
 
 import os
 
-import threadpoolctl
-
 from ..utils.logger import setup_logger
 
+
 log = setup_logger()
+
+ASCII_LOGO = r"""
+_____/\\\\\\\\\\\\__/\\\\\\\\\\\\\____/\\\\\\\\\\\\\\\______________________/\\\________/\\\\____________/\\\\_______________________/\\\__________________/\\\\\\____
+ ___/\\\//////////__\/\\\/////////\\\_\///////\\\/////____________________/\\\\/\\\\____\/\\\\\\________/\\\\\\______________________\/\\\_________________\////\\\____
+  __/\\\_____________\/\\\_______\/\\\_______\/\\\_______________________/\\\//\////\\\__\/\\\//\\\____/\\\//\\\______________________\/\\\____________________\/\\\____
+   _\/\\\____/\\\\\\\_\/\\\\\\\\\\\\\/________\/\\\________/\\\\\\\\\\\__/\\\______\//\\\_\/\\\\///\\\/\\\/_\/\\\_____/\\\\\___________\/\\\______/\\\\\\\\_____\/\\\____
+    _\/\\\___\/////\\\_\/\\\/////////__________\/\\\_______\///////////__\//\\\______/\\\__\/\\\__\///\\\/___\/\\\___/\\\///\\\____/\\\\\\\\\____/\\\/////\\\____\/\\\____
+     _\/\\\_______\/\\\_\/\\\___________________\/\\\______________________\///\\\\/\\\\/___\/\\\____\///_____\/\\\__/\\\__\//\\\__/\\\////\\\___/\\\\\\\\\\\_____\/\\\____
+      _\/\\\_______\/\\\_\/\\\___________________\/\\\________________________\////\\\//_____\/\\\_____________\/\\\_\//\\\__/\\\__\/\\\__\/\\\__\//\\///////______\/\\\____
+       _\//\\\\\\\\\\\\/__\/\\\___________________\/\\\___________________________\///\\\\\\__\/\\\_____________\/\\\__\///\\\\\/___\//\\\\\\\/\\__\//\\\\\\\\\\__/\\\\\\\\\_
+        __\////////////____\///____________________\///______________________________\//////___\///______________\///_____\/////______\///////\//____\//////////__\/////////__
+"""
 
 # if not os.environ.get("PYTHON_GIL", None):
 #     os.environ["PYTHON_GIL"] = '0'
 #     log.info("ENV: Auto disable GIL and use free-threading mode when applicable: Python 3.13t+. You must install the -t edition of Python.")
 
-if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF", None):
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = 'expandable_segments:True'
-    log.info("ENV: Auto setting PYTORCH_CUDA_ALLOC_CONF='expandable_segments:True' for memory saving.")
+if not os.environ.get("PYTORCH_ALLOC_CONF", None):
+    os.environ["PYTORCH_ALLOC_CONF"] = 'expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.7'
+    log.info("ENV: Auto setting PYTORCH_ALLOC_CONF='expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.7' for memory saving.")
 
 if not os.environ.get("CUDA_DEVICE_ORDER", None):
     os.environ["CUDA_DEVICE_ORDER"] = 'PCI_BUS_ID'
@@ -40,7 +40,12 @@ if not os.environ.get("CUDA_DEVICE_ORDER", None):
 if 'CUDA_VISIBLE_DEVICES' in os.environ and 'ROCR_VISIBLE_DEVICES' in os.environ:
     del os.environ['ROCR_VISIBLE_DEVICES']
 
+# if not os.environ.get("NCCL_SHM_DISABLE", None):
+#     os.environ["NCCL_SHM_DISABLE"] = '1'
+#     log.info("ENV: Auto setting NCCL_SHM_DISABLE=1 for multi-gpu memory safety.")
+
 import sys  # noqa: E402
+
 
 # TODO: waiting for pytorch implementgation of aten ops for MPS
 if sys.platform == "darwin":
@@ -59,75 +64,86 @@ from transformers import AutoConfig, GenerationConfig, PreTrainedModel, PreTrain
 
 from ..adapter.adapter import Adapter, Lora, normalize_adapter  # noqa: E402
 from ..nn_modules.qlinear.torch import TorchQuantLinear  # noqa: E402
-from ..quantization import QUANT_CONFIG_FILENAME  # noqa: E402
+from ..quantization import METHOD, QUANT_CONFIG_FILENAME  # noqa: E402
 from ..utils import BACKEND  # noqa: E402
 from ..utils.eval import EVAL  # noqa: E402
 from ..utils.model import find_modules  # noqa: E402
 from ..utils.torch import CPU, torch_empty_cache  # noqa: E402
-from .base import BaseGPTQModel, QuantizeConfig  # noqa: E402
-from .definitions.baichuan import BaiChuanGPTQ  # noqa: E402
-from .definitions.bloom import BloomGPTQ  # noqa: E402
-from .definitions.chatglm import ChatGLM  # noqa: E402
-from .definitions.codegen import CodeGenGPTQ  # noqa: E402
-from .definitions.cohere import CohereGPTQ  # noqa: E402
-from .definitions.cohere2 import Cohere2GPTQ  # noqa: E402
-from .definitions.dbrx import DbrxGPTQ  # noqa: E402
-from .definitions.dbrx_converted import DbrxConvertedGPTQ  # noqa: E402
-from .definitions.decilm import DeciLMGPTQ  # noqa: E402
-from .definitions.deepseek_v2 import DeepSeekV2GPTQ  # noqa: E402
-from .definitions.deepseek_v3 import DeepSeekV3GPTQ  # noqa: E402
-from .definitions.dream import DreamGPTQ  # noqa: E402
-from .definitions.exaone import ExaoneGPTQ  # noqa: E402
-from .definitions.ernie4_5 import ERNIE4_5GPTQ  # noqa: E402
-from .definitions.ernie4_5_moe import ERNIE4_5_MOEGPTQ  # noqa: E402
-from .definitions.gemma import GemmaGPTQ  # noqa: E402
-from .definitions.gemma2 import Gemma2GPTQ  # noqa: E402
-from .definitions.gemma3 import Gemma3ForConditionalGenerationGPTQ, Gemma3GPTQ  # noqa: E402
-from .definitions.glm import GLM  # noqa: E402
-from .definitions.gpt2 import GPT2GPTQ  # noqa: E402
-from .definitions.gpt_bigcode import GPTBigCodeGPTQ  # noqa: E402
-from .definitions.gpt_neox import GPTNeoXGPTQ  # noqa: E402
-from .definitions.gptj import GPTJGPTQ  # noqa: E402
-from .definitions.granite import GraniteGPTQ  # noqa: E402
-from .definitions.grinmoe import GrinMOEGPTQ  # noqa: E402
-from .definitions.hymba import HymbaGPTQ  # noqa: E402
-from .definitions.instella import InstellaGPTQ  # noqa: E402
-from .definitions.internlm import InternLMGPTQ  # noqa: E402
-from .definitions.internlm2 import InternLM2GPTQ  # noqa: E402
-from .definitions.llama import LlamaGPTQ  # noqa: E402
-from .definitions.longllama import LongLlamaGPTQ  # noqa: E402
-from .definitions.mimo import MimoGPTQ  # noqa: E402
+from .base import BaseQModel, QuantizeConfig  # noqa: E402
+from .definitions.apertus import ApertusQModel  # noqa: E402
+from .definitions.baichuan import BaiChuanQModel  # noqa: E402
+from .definitions.bailing_moe import BailingMoeQModel  # noqa: E402
+from .definitions.bloom import BloomQModel  # noqa: E402
+from .definitions.brumby import BrumbyQModel  # noqa: E402
+from .definitions.chatglm import ChatGLMQModel  # noqa: E402
+from .definitions.codegen import CodeGenQModel  # noqa: E402
+from .definitions.dbrx import DbrxQModel  # noqa: E402
+from .definitions.dbrx_converted import DbrxConvertedQModel  # noqa: E402
+from .definitions.decilm import DeciLMQModel  # noqa: E402
+from .definitions.deepseek_v2 import DeepSeekV2QModel  # noqa: E402
+from .definitions.deepseek_v3 import DeepSeekV3QModel  # noqa: E402
+from .definitions.dots1 import Dots1QModel  # noqa: E402
+from .definitions.dream import DreamQModel  # noqa: E402
+from .definitions.ernie4_5 import Ernie4_5QModel  # noqa: E402
+from .definitions.ernie4_5_moe import Ernie4_5_MoeQModel  # noqa: E402
+from .definitions.exaone import ExaOneQModel  # noqa: E402
+from .definitions.falcon_h1 import FalconH1QModel  # noqa: E402
+from .definitions.gemma2 import Gemma2QModel  # noqa: E402
+from .definitions.gemma3 import Gemma3ForConditionalGenerationGPTQ, Gemma3QModel  # noqa: E402
+from .definitions.glm import GlmQModel  # noqa: E402
+from .definitions.glm4_moe import GLM4MoEGPTQ  # noqa: E402
+from .definitions.gpt2 import GPT2QModel  # noqa: E402
+from .definitions.gpt_bigcode import GptBigCodeQModel  # noqa: E402
+from .definitions.gpt_neo import GptNeoQModel  # noqa: E402
+from .definitions.gpt_neox import GPTNeoXQModel  # noqa: E402
+from .definitions.gpt_oss import GPTOSSGPTQ  # noqa: E402
+from .definitions.gptj import GptJQModel  # noqa: E402
+from .definitions.granitemoehybrid import GraniteMoeHybridQModel
+from .definitions.grinmoe import GrinMoeQModel  # noqa: E402
+from .definitions.hymba import HymbaQModel  # noqa: E402
+from .definitions.instella import InstellaQModel  # noqa: E402
+from .definitions.internlm import InternLMQModel  # noqa: E402
+from .definitions.internlm2 import InternLM2QModel  # noqa: E402
+from .definitions.klear import KlearQModel  # noqa: E402
+from .definitions.lfm2_moe import LFM2MoeQModel  # noqa: E402
+from .definitions.llama import LlamaQModel  # noqa: E402
+from .definitions.llama4 import Llama4QModel  # noqa: E402
+from .definitions.llava_qwen2 import LlavaQwen2QModel  # noqa: E402
+from .definitions.longcat_flash import LongCatFlashQModel  # noqa: E402
+from .definitions.mimo import MimoQModel  # noqa: E402
 from .definitions.minicpm import MiniCPMGPTQ  # noqa: E402
-from .definitions.minicpm3 import MiniCPM3GPTQ  # noqa: E402
-from .definitions.mistral import MistralGPTQ  # noqa: E402
-from .definitions.mixtral import MixtralGPTQ  # noqa: E402
-from .definitions.mllama import MLlamaGPTQ  # noqa: E402
-from .definitions.mobilellm import MobileLLMGPTQ  # noqa: E402
-from .definitions.moss import MOSSGPTQ  # noqa: E402
-from .definitions.mpt import MPTGPTQ  # noqa: E402
-from .definitions.olmo2 import Olmo2GPTQ  # noqa: E402
-from .definitions.opt import OPTGPTQ  # noqa: E402
-from .definitions.ovis import OvisGPTQ  # noqa: E402
-from .definitions.phi import PhiGPTQ  # noqa: E402
-from .definitions.phi3 import Phi3GPTQ, PhiMoEGPTQForCausalLM  # noqa: E402
+from .definitions.minicpm3 import MiniCpm3QModel  # noqa: E402
+from .definitions.minimax_m2 import MiniMaxM2GPTQ  # noqa: E402
+from .definitions.mixtral import MixtralQModel  # noqa: E402
+from .definitions.mllama import MLlamaQModel  # noqa: E402
+from .definitions.mobilellm import MobileLLMQModel  # noqa: E402
+from .definitions.moss import MossQModel  # noqa: E402
+from .definitions.mpt import MptQModel  # noqa: E402
+from .definitions.nemotron_h import NemotronHQModel  # noqa: E402
+from .definitions.opt import OptQModel  # noqa: E402
+from .definitions.ovis import OvisQModel  # noqa: E402
+from .definitions.ovis2 import Ovis2QModel  # noqa: E402
+from .definitions.pangu_alpha import PanguAlphaQModel  # noqa: E402
+from .definitions.phi import PhiQModel  # noqa: E402
+from .definitions.phi3 import Phi3QModel, PhiMoEGPTQForCausalLM  # noqa: E402
 from .definitions.phi4 import Phi4MMGPTQ  # noqa: E402
-from .definitions.qwen import QwenGPTQ  # noqa: E402
-from .definitions.qwen2 import Qwen2GPTQ  # noqa: E402
-from .definitions.qwen2_5_vl import Qwen2_5_VLGPTQ  # noqa: E402
+from .definitions.qwen import QwenQModel  # noqa: E402
+from .definitions.qwen2 import Qwen2QModel  # noqa: E402
 from .definitions.qwen2_5_omni import Qwen2_5_OmniGPTQ
-from .definitions.qwen2_moe import Qwen2MoeGPTQ  # noqa: E402
-from .definitions.qwen2_vl import Qwen2VLGPTQ  # noqa: E402
-from .definitions.qwen3 import Qwen3GPTQ  # noqa: E402
-from .definitions.qwen3_moe import Qwen3MoeGPTQ  # noqa: E402
-from .definitions.rw import RWGPTQ  # noqa: E402
 from .definitions.stablelmepoch import StableLMEpochGPTQ  # noqa: E402
-from .definitions.starcoder2 import Starcoder2GPTQ  # noqa: E402
-from .definitions.telechat2 import TeleChat2GPTQ
-from .definitions.xverse import XverseGPTQ  # noqa: E402
 from .definitions.yi import YiGPTQ  # noqa: E402
-from .definitions.falcon_h1 import FalconH1GPTQ  # noqa: E402
-from .definitions.pangu_alpha import PanguAlphaGPTQ  # noqa: E402
-from .definitions.gpt_oss import GptOssGPTQ  # noqa: E402
+from .definitions.qwen2_5_vl import Qwen2_5_VLQModel  # noqa: E402
+from .definitions.qwen2_moe import Qwen2MoeQModel  # noqa: E402
+from .definitions.qwen2_vl import Qwen2VLQModel  # noqa: E402
+from .definitions.qwen3 import Qwen3QModel  # noqa: E402
+from .definitions.qwen3_moe import Qwen3MoeQModel  # noqa: E402
+from .definitions.qwen3_next import Qwen3NextGPTQ  # noqa: E402
+from .definitions.qwen3_omni_moe import Qwen3OmniMoeGPTQ
+from .definitions.qwen3_vl import Qwen3_VLQModel
+from .definitions.rw import RwgQModel  # noqa: E402
+from .definitions.starcoder2 import Starcoder2QModel  # noqa: E402
+from .definitions.telechat2 import TeleChat2QModel
+from .definitions.xverse import XverseQModel  # noqa: E402
 
 # make quants and inference more determinisitc
 torch.manual_seed(787)
@@ -135,87 +151,158 @@ random.seed(787)
 numpy.random.seed(787)
 
 MODEL_MAP = {
-    "dream": DreamGPTQ,
-    "bloom": BloomGPTQ,
-    "gpt_neox": GPTNeoXGPTQ,
-    "gptj": GPTJGPTQ,
-    "gpt2": GPT2GPTQ,
-    "llama": LlamaGPTQ,
-    "opt": OPTGPTQ,
-    "moss": MOSSGPTQ,
-    "chatglm": ChatGLM,
-    "glm": GLM,
-    "glm4": GLM,
-    "gpt_bigcode": GPTBigCodeGPTQ,
-    "codegen": CodeGenGPTQ,
-    "cohere": CohereGPTQ,
-    "cohere2": Cohere2GPTQ,
-    "RefinedWebModel": RWGPTQ,
-    "RefinedWeb": RWGPTQ,
-    "falcon": RWGPTQ,
-    "baichuan": BaiChuanGPTQ,
-    "internlm": InternLMGPTQ,
-    "internlm2": InternLM2GPTQ,
-    "qwen": QwenGPTQ,
-    "mistral": MistralGPTQ,
-    "Yi": YiGPTQ,
-    "xverse": XverseGPTQ,
-    "deci": DeciLMGPTQ,
-    "nemotron-nas": DeciLMGPTQ,
-    "stablelm_epoch": StableLMEpochGPTQ,
-    "stablelm": StableLMEpochGPTQ,
-    "starcoder2": Starcoder2GPTQ,
-    "mixtral": MixtralGPTQ,
-    "qwen2": Qwen2GPTQ,
-    "qwen3": Qwen3GPTQ,
-    "longllama": LongLlamaGPTQ,
-    "gemma": GemmaGPTQ,
-    "gemma2": Gemma2GPTQ,
-    "gemma3_text": Gemma3GPTQ,
+    "apertus": ApertusQModel,
+    "dream": DreamQModel,
+    "bloom": BloomQModel,
+    "brumby": BrumbyQModel,
+    "gpt_neo": GptNeoQModel,
+    "kimi_k2": DeepSeekV3QModel, # 100% DeepSeekV3QModel clone
+    "klear": KlearQModel,
+    "gpt_neox": GPTNeoXQModel,
+    "gptj": GptJQModel,
+    "gpt2": GPT2QModel,
+    "llama": LlamaQModel,
+    "llama4": Llama4QModel,
+    "opt": OptQModel,
+    "moss": MossQModel,
+    "chatglm": ChatGLMQModel,
+    "glm": GlmQModel,
+    "glm4": GlmQModel,
+    "glm4_moe": GLM4MoEGPTQ,
+    "gpt_bigcode": GptBigCodeQModel,
+    "codegen": CodeGenQModel,
+    "cohere": LlamaQModel, # 100% llama clone
+    "cohere2": LlamaQModel, # 100% llama clone
+    "refinedWebModel": RwgQModel,
+    "refinedWeb": RwgQModel,
+    "falcon": RwgQModel,
+    "baichuan": BaiChuanQModel,
+    "internlm": InternLMQModel,
+    "internlm2": InternLM2QModel,
+    "qwen": QwenQModel,
+    "mistral": LlamaQModel, # 100% llama clone
+    "yi": LlamaQModel, # 100% llama clone
+    "xverse": XverseQModel,
+    "deci": DeciLMQModel,
+    "nemotron-nas": DeciLMQModel,
+    "stablelm_epoch": LlamaQModel, # 100% llama clone
+    "stablelm": LlamaQModel, # 100% llama clone
+    "starcoder2": Starcoder2QModel,
+    "mixtral": MixtralQModel,
+    "qwen2": Qwen2QModel,
+    "qwen3": Qwen3QModel,
+    "longllama": LlamaQModel,  # 100% llama clone
+    "gemma": LlamaQModel, # 100% llama clone
+    "gemma2": Gemma2QModel,
+    "gemma3_text": Gemma3QModel,
     "gemma3": Gemma3ForConditionalGenerationGPTQ,
-    "phi": PhiGPTQ,
-    "phi3": Phi3GPTQ,
+    "phi": PhiQModel,
+    "phi3": Phi3QModel,
     "phi4mm": Phi4MMGPTQ,
     "phimoe": PhiMoEGPTQForCausalLM,
-    "mpt": MPTGPTQ,
+    "mpt": MptQModel,
     "minicpm": MiniCPMGPTQ,
-    "minicpm3": MiniCPM3GPTQ,
-    "qwen2_moe": Qwen2MoeGPTQ,
-    "qwen3_moe": Qwen3MoeGPTQ,
-    "qwen2_vl": Qwen2VLGPTQ,
-    "qwen2_5_vl": Qwen2_5_VLGPTQ,
+    "minicpm3": MiniCpm3QModel,
+    "minimax": MiniMaxM2GPTQ,
+    "minimax_m2": MiniMaxM2GPTQ,
+    "qwen2_moe": Qwen2MoeQModel,
+    "qwen3_moe": Qwen3MoeQModel,
+    "qwen3_next": Qwen3NextGPTQ,
+    "qwen2_vl": Qwen2VLQModel,
+    "qwen2_vl_text": Qwen2VLQModel,
+    "qwen2_5_vl": Qwen2_5_VLQModel,
+    "qwen2_5_vl_text": Qwen2_5_VLQModel,
     "qwen2_5_omni": Qwen2_5_OmniGPTQ,
-    "dbrx": DbrxGPTQ,
-    "dbrx_converted": DbrxConvertedGPTQ,
-    "deepseek_v2": DeepSeekV2GPTQ,
-    "deepseek_v3": DeepSeekV3GPTQ,
-    "exaone": ExaoneGPTQ,
-    "grinmoe": GrinMOEGPTQ,
-    "mllama": MLlamaGPTQ,
-    "granite": GraniteGPTQ,
-    "mobilellm": MobileLLMGPTQ,
-    "hymba": HymbaGPTQ,
-    "olmo2": Olmo2GPTQ,
-    "ovis": OvisGPTQ,
-    "telechat": TeleChat2GPTQ,
-    "instella": InstellaGPTQ,
-    "mimo": MimoGPTQ,
-    "falcon_h1": FalconH1GPTQ,
-    "gpt_pangu": PanguAlphaGPTQ,
-    "ernie4_5": ERNIE4_5GPTQ,
-    "ernie4_5_moe": ERNIE4_5_MOEGPTQ,
-    "gpt_oss": GptOssGPTQ,
+    # "dbrx": DbrxGPTQ,
+    # "dbrx_converted": DbrxConvertedGPTQ,
+    # "deepseek_v2": DeepSeekV2GPTQ,
+    # "deepseek_v3": DeepSeekV3GPTQ,
+    # "exaone": ExaoneGPTQ,
+    # "grinmoe": GrinMOEGPTQ,
+    # "mllama": MLlamaGPTQ,
+    # "granite": GraniteGPTQ,
+    # "mobilellm": MobileLLMGPTQ,
+    # "hymba": HymbaGPTQ,
+    # "olmo2": Olmo2GPTQ,
+    # "ovis": OvisGPTQ,
+    # "telechat": TeleChat2GPTQ,
+    # "instella": InstellaGPTQ,
+    # "mimo": MimoGPTQ,
+    # "falcon_h1": FalconH1GPTQ,
+    # "gpt_pangu": PanguAlphaGPTQ,
+    # "ernie4_5": ERNIE4_5GPTQ,
+    # "ernie4_5_moe": ERNIE4_5_MOEGPTQ,
+    # "gpt_oss": GptOssGPTQ,
+    "qwen3_omni_moe": Qwen3OmniMoeGPTQ,
+    "qwen3_vl": Qwen3_VLQModel,
+    "dbrx": DbrxQModel,
+    "dbrx_converted": DbrxConvertedQModel,
+    "deepseek_v2": DeepSeekV2QModel,
+    "deepseek_v3": DeepSeekV3QModel,
+    "dots1": Dots1QModel,
+    "exaone": ExaOneQModel,
+    "grinmoe": GrinMoeQModel,
+    "mllama": MLlamaQModel,
+    "marin": Qwen3QModel,
+    "granite": LlamaQModel, # 100% llama clone
+    "granitemoehybrid": GraniteMoeHybridQModel,
+    "mobilellm": MobileLLMQModel,
+    "hymba": HymbaQModel,
+    "olmo2": LlamaQModel, # 100% llama clone
+    "ovis": OvisQModel,
+    "ovis2": Ovis2QModel,
+    "telechat": TeleChat2QModel,
+    "instella": InstellaQModel,
+    "mimo": MimoQModel,
+    "falcon_h1": FalconH1QModel,
+    "gpt_pangu": PanguAlphaQModel,
+    "ernie4_5": Ernie4_5QModel,
+    "ernie4_5_moe": Ernie4_5_MoeQModel,
+    "seed_oss": LlamaQModel, # 100% llama clone
+    "gpt_oss": GPTOSSGPTQ,
+    "longcat_flash": LongCatFlashQModel,
+    "llava_qwen2": LlavaQwen2QModel,
+    "nemotron_h": NemotronHQModel,
+    "bailing_moe": BailingMoeQModel,
+    "lfm2_moe": LFM2MoeQModel,
 }
 
 SUPPORTED_MODELS = list(MODEL_MAP.keys())
 
 
-def check_and_get_model_type(model_dir, trust_remote_code=False):
+def _is_supported_quantization_config(config: AutoConfig) -> bool:
+    quantization_config = getattr(config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        return False
+
+    quant_format = quantization_config.get("quant_format")
+    if isinstance(quant_format, str) and quant_format.lower() in (
+        METHOD.GPTQ,
+        METHOD.AWQ,
+        METHOD.QQQ,
+    ):
+        return True
+
+    quant_method = quantization_config.get("quant_method")
+    if isinstance(quant_method, str) and quant_method.lower() in (
+        METHOD.GPTQ,
+        METHOD.AWQ,
+        METHOD.QQQ,
+    ):
+        return True
+
+    return False
+
+
+def check_and_get_model_definition(model_dir, trust_remote_code=False):
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=trust_remote_code)
-    if config.model_type.lower() not in SUPPORTED_MODELS:
-        raise TypeError(f"{config.model_type} isn't supported yet.")
-    model_type = config.model_type
-    return model_type.lower()
+    model_type = config.model_type.lower()
+
+    # if model_type is not supported, use BaseQModel, will use auto_detect_module_tree to generate module tree
+    if model_type not in SUPPORTED_MODELS:
+        return BaseQModel
+
+    return MODEL_MAP[model_type]
 
 class GPTQModel:
     def __init__(self):
@@ -234,7 +321,6 @@ class GPTQModel:
             device: Optional[Union[str, torch.device]] = None,
             backend: Union[str, BACKEND] = BACKEND.AUTO,
             trust_remote_code: bool = False,
-            verify_hash: Optional[Union[str, List[str]]] = None,
             **kwargs,
     ):
         if isinstance(model_id_or_path, str):
@@ -247,7 +333,7 @@ class GPTQModel:
         if isinstance(backend, str):
             backend = BACKEND(backend)
 
-        is_quantized = False
+        is_gptqmodel_quantized = False
         cfg = AutoConfig.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code)
         if hasattr(cfg, "quantization_config"):
             # auto-bypass unsupported HF quantization configs (e.g., mxfp4)
@@ -255,35 +341,40 @@ class GPTQModel:
             qmethod = str(qc.get("quant_method", qc.get("quantization_method", ""))).lower()
             if qmethod == "mxfp4":
                 log.info("Loader: Detected unsupported quantization_config quant_method=mxfp4. Treating as unquantized and loading weights in BF16/FP16 for re-quantization.")
-                is_quantized = False
+                is_gptqmodel_quantized = False
             else:
-                is_quantized = True
+                is_gptqmodel_quantized = True
+        # is_gptqmodel_quantized = False
+        # model_cfg = AutoConfig.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code)
+        # if _is_supported_quantization_config(model_cfg):
+        #     # only if the model is quantized or compatible with gptqmodel should we set is_quantized to true
+        #     is_gptqmodel_quantized = True
         else:
+            # TODO FIX ME...not decoded to check if quant method is compatible or quantized by gptqmodel
             for name in [QUANT_CONFIG_FILENAME, "quant_config.json"]:
                 if isdir(model_id_or_path):  # Local
                     if os.path.exists(join(model_id_or_path, name)):
-                        is_quantized = True
+                        is_gptqmodel_quantized = True
                         break
 
                 else:  # Remote
                     files = list_repo_files(repo_id=model_id_or_path)
                     for f in files:
                         if f == name:
-                            is_quantized = True
+                            is_gptqmodel_quantized = True
                             break
 
-        if is_quantized:
-            return cls.from_quantized(
+        if is_gptqmodel_quantized:
+            m = cls.from_quantized(
                 model_id_or_path=model_id_or_path,
                 device_map=device_map,
                 device=device,
                 backend=backend,
                 trust_remote_code=trust_remote_code,
-                verify_hash=verify_hash,
                 **kwargs,
             )
         else:
-            return cls.from_pretrained(
+            m = cls.from_pretrained(
                 model_id_or_path=model_id_or_path,
                 quantize_config=quantize_config,
                 device_map=device_map,
@@ -292,6 +383,13 @@ class GPTQModel:
                 **kwargs,
             )
 
+        # debug model structure
+        # if debug:
+        #     print_module_tree(m.model)
+
+        return m
+
+
     @classmethod
     def from_pretrained(
             cls,
@@ -299,7 +397,7 @@ class GPTQModel:
             quantize_config: QuantizeConfig,
             trust_remote_code: bool = False,
             **model_init_kwargs,
-    ) -> BaseGPTQModel:
+    ) -> BaseQModel:
         cfg = AutoConfig.from_pretrained(model_id_or_path, trust_remote_code=trust_remote_code)
         if hasattr(cfg, "quantization_config"):
             qc = getattr(cfg, "quantization_config", {}) or {}
@@ -310,13 +408,19 @@ class GPTQModel:
                              "`from_pretrained` with `quantize_config`.")
                 return cls.from_quantized(model_id_or_path, trust_remote_code=trust_remote_code)
             # else: mxfp4 -> treat as unquantized and continue
+        if _is_supported_quantization_config(cfg):
+            log.warn("Model is already quantized, will use `from_quantized` to load quantized model.\n"
+                           "If you want to quantize the model, please pass un_quantized model path or id, and use "
+                           "`from_pretrained` with `quantize_config`.")
+            return cls.from_quantized(model_id_or_path, trust_remote_code=trust_remote_code)
 
         if quantize_config and quantize_config.dynamic:
             log.warn(
                 "GPTQModel's per-module `dynamic` quantization feature is fully supported in latest vLLM and SGLang but not yet available in hf transformers.")
 
-        model_type = check_and_get_model_type(model_id_or_path, trust_remote_code)
-        return MODEL_MAP[model_type].from_pretrained(
+        model_definition = check_and_get_model_definition(model_id_or_path, trust_remote_code)
+
+        return model_definition.from_pretrained(
             pretrained_model_id_or_path=model_id_or_path,
             quantize_config=quantize_config,
             trust_remote_code=trust_remote_code,
@@ -332,28 +436,23 @@ class GPTQModel:
             backend: Union[str, BACKEND] = BACKEND.AUTO,
             adapter: Optional[Adapter | Dict] = None,
             trust_remote_code: bool = False,
-            # verify weight files matches predefined hash during loading
-            # usage: hash_format:hash_value, example: md5:ugkdh232
-            # supports all hashlib hash methods
-            verify_hash: Optional[Union[str, List[str]]] = None,
             **kwargs,
-    ) -> BaseGPTQModel:
+    ) -> BaseQModel:
         # normalize adapter to instance
         adapter = normalize_adapter(adapter)
 
         print(f"from_quantized: adapter: {adapter}")
-        model_type = check_and_get_model_type(model_id_or_path, trust_remote_code)
+        model_definition = check_and_get_model_definition(model_id_or_path, trust_remote_code)
 
         if isinstance(backend, str):
             backend = BACKEND(backend)
 
-        return MODEL_MAP[model_type].from_quantized(
+        return model_definition.from_quantized(
             model_id_or_path=model_id_or_path,
             device_map=device_map,
             device=device,
             backend=backend,
             trust_remote_code=trust_remote_code,
-            verify_hash=verify_hash,
             adapter=adapter,
             **kwargs,
         )
@@ -381,7 +480,7 @@ class GPTQModel:
         if tasks is None:
             if framework == EVAL.LM_EVAL:
                 tasks = [EVAL.LM_EVAL.ARC_CHALLENGE]
-            if framework == EVAL.MMLU_PRO:
+            elif framework == EVAL.MMLU_PRO:
                 tasks = [EVAL.MMLU_PRO.MATH]
             else:
                 tasks = [EVAL.EVALPLUS.HUMAN]
@@ -398,27 +497,50 @@ class GPTQModel:
         if llm_backend not in ['gptqmodel', 'vllm']:
             raise ValueError('Eval framework support llm_backend: [gptqmodel, vllm]')
 
+        if llm_backend == "vllm":
+            if "tensor_parallel_size" not in model_args:
+                try:
+                    cuda_devices = torch.cuda.device_count() if torch.cuda.is_available() else 0
+                except Exception:
+                    cuda_devices = 0
+                if cuda_devices:
+                    model_args["tensor_parallel_size"] = cuda_devices
+            if "gpu_memory_utilization" not in model_args:
+                model_args["gpu_memory_utilization"] = 0.90
+
         if isinstance(model_or_id_or_path, str):
-            log.info(f"Eval: loading using backend = `{backend}`")
-            model = GPTQModel.load(model_id_or_path=model_or_id_or_path, backend=backend)
+            load_backend = backend
+            load_kwargs = {}
+
+            if llm_backend == "vllm":
+                disallowed_keys = {"pretrained", "tokenizer", "gptqmodel", "trust_remote_code", "backend", "model_id_or_path"}
+                load_kwargs = {k: v for k, v in model_args.items() if k not in disallowed_keys}
+
+            backend_name = load_backend.value if isinstance(load_backend, BACKEND) else str(load_backend)
+            log.info(f"Eval: loading using backend = `{backend_name}`")
+            model = GPTQModel.load(
+                model_id_or_path=model_or_id_or_path,
+                backend=load_backend,
+                trust_remote_code=trust_remote_code,
+                **load_kwargs,
+            )
             model_id_or_path = model_or_id_or_path
-        elif isinstance(model_or_id_or_path, BaseGPTQModel) or isinstance(model_or_id_or_path, (PreTrainedModel, PeftModel)):
+        elif isinstance(model_or_id_or_path, BaseQModel) or isinstance(model_or_id_or_path, (PreTrainedModel, PeftModel)):
             model = model_or_id_or_path
             model_id_or_path = model.config.name_or_path  #
         else:
             raise ValueError(f"`model_or_id_or_path` is invalid. expected: `model instance or str` actual: `{model_or_id_or_path}`")
 
         if tokenizer is None:
-            if isinstance(model, BaseGPTQModel):
+            if isinstance(model, BaseQModel):
                 tokenizer = model.tokenizer
             elif isinstance(model, PreTrainedModel) or model_id_or_path.strip():
-                tokenizer = Tokenicer.load(model_id_or_path)
+                tokenizer = Tokenicer.load(model_id_or_path.strip())
 
         if tokenizer is None:
             raise ValueError("Tokenizer: Auto-loading of tokenizer failed with `model_or_id_or_path`. Please pass in `tokenizer` as argument.")
 
-
-        if backend=="gptqmodel": # vllm loads tokenizer
+        if llm_backend == "gptqmodel": # vllm loads tokenizer
             model_args["tokenizer"] = tokenizer
 
         if framework == EVAL.LM_EVAL:
@@ -434,11 +556,26 @@ class GPTQModel:
                 model_args["gptqmodel"] = True
             model_args["pretrained"] = model_id_or_path
 
+            # TODO FIXME lm-eval latest broken imports
+            # lm_eval indirectly imports sglang, which expects newer Triton helpers.
+            # Provide shims so import succeeds on older triton/runtime builds.
+            try:
+                from triton.runtime import cache as triton_cache
+
+                if not hasattr(triton_cache, "default_cache_dir"):
+                    triton_cache.default_cache_dir = lambda: getattr(triton_cache.knobs.cache, "dir", None)
+                if not hasattr(triton_cache, "default_override_dir"):
+                    triton_cache.default_override_dir = lambda: getattr(triton_cache.knobs.cache, "override_dir", None)
+                if not hasattr(triton_cache, "default_dump_dir"):
+                    triton_cache.default_dump_dir = lambda: getattr(triton_cache.knobs.cache, "dump_dir", None)
+            except Exception as exc:
+                log.warning("Triton cache shim failed; lm_eval import may fail: %s", exc)
+
             try:
                 from lm_eval import simple_evaluate
                 from lm_eval.models.huggingface import HFLM
-            except BaseException:
-                raise ValueError("lm_eval is not installed. Please install via `pip install gptqmodel[eval]`.")
+            except BaseException as e:
+                raise ValueError(f"lm_eval import failed: {e}. Please install via `pip install gptqmodel[eval]`.") from e
 
             if llm_backend == "gptqmodel" and model is not None:
                 model_name = HFLM(
@@ -471,19 +608,35 @@ class GPTQModel:
             apply_chat_template = args.pop("apply_chat_template", False) # args.pop("apply_chat_template", True if tokenizer.chat_template is not None else False)
             log.info(f"LM-EVAL: `apply_chat_template` = `{apply_chat_template}`")
 
-            results = simple_evaluate(
-                model=model_name,
-                model_args=model_args,
-                tasks=[task.value for task in tasks],
-                batch_size=batch_size,
-                apply_chat_template=apply_chat_template,
-                gen_kwargs=gen_kwargs,
-                random_seed=random_seed,
-                numpy_random_seed=random_seed,
-                torch_random_seed=random_seed,
-                fewshot_random_seed=random_seed,
-                **args,
-            )
+            # TODO FIXME lm-eval latest broken imports
+            # lm_eval pretty prints task yaml paths using Path.relative_to; when custom tasks live outside the
+            # installed lm_eval package tree this raises ValueError. Monkeypatch to fall back to absolute paths.
+            from pathlib import Path
+            original_relative_to = Path.relative_to
+
+            def _relative_to_noerror(self, other, *extra_args, **kwargs):
+                try:
+                    return original_relative_to(self, other, *extra_args, **kwargs)
+                except ValueError:
+                    return self
+
+            Path.relative_to = _relative_to_noerror
+            try:
+                results = simple_evaluate(
+                    model=model_name,
+                    model_args=model_args,
+                    tasks=[task.value for task in tasks],
+                    batch_size=batch_size,
+                    apply_chat_template=apply_chat_template,
+                    gen_kwargs=gen_kwargs,
+                    random_seed=random_seed,
+                    numpy_random_seed=random_seed,
+                    torch_random_seed=random_seed,
+                    fewshot_random_seed=random_seed,
+                    **args,
+                )
+            finally:
+                Path.relative_to = original_relative_to
 
             if results is None:
                 raise ValueError('lm_eval run fail, check your code!!!')
@@ -552,7 +705,7 @@ class GPTQModel:
 
         if format == "mlx":
             try:
-                from mlx_lm.utils import save_config, save_weights
+                from mlx_lm.utils import save_config, save_model
 
                 from ..utils.mlx import convert_gptq_to_mlx_weights
             except ImportError:
@@ -562,7 +715,7 @@ class GPTQModel:
             mlx_weights, mlx_config = convert_gptq_to_mlx_weights(model_id_or_path, gptq_model, gptq_config,
                                                                   gptq_model.lm_head)
 
-            save_weights(target_path, mlx_weights, donate_weights=True)
+            save_model(target_path, mlx_weights, donate_model=True)
 
             save_config(mlx_config, config_path=target_path + "/config.json")
         elif format == "hf":
@@ -616,60 +769,54 @@ class GPTQModel:
             quantized_model_id_or_path: str, # gptqmodel quantized model
             calibration_dataset: Union[List[Dict[str, Union[List[int], torch.LongTensor]]], List[str], List[int]],
             calibration_dataset_concat_size: Optional[int] = None,
+            calibration_dataset_sort: Optional[str] = None,
             batch_size: Optional[int] = 1,
-            calibration_enable_gpu_cache: Optional[bool] = True,
             tokenizer: Optional[PreTrainedTokenizerBase] = None,
-            logger_board: Optional[str] = None,
-            # Experimental: enables the buffering of fwd inputs to cpu, slower than non-buffered, may reduce vram usage
-            buffered_fwd: bool = False,
-            # torch/cuda GC is auto enabled to reduce vram usage: disable to for small models or you know there is no possibility of oom due to vram to accelerate quantization
-            auto_gc: bool = True,
+            calibration_concat_separator: Optional[str] = None,
             # pass-through vars for load()
             trust_remote_code: bool = False,
-            torch_dtype: Optional[Union[str, torch.dtype]] = None,
+            dtype: Optional[Union[str, torch.dtype]] = None,
         ):
             if not adapter or not isinstance(adapter, Lora):
                 raise ValueError(f"Adapter: expected `adapter` type to be `Lora`: actual = `{adapter}`.")
 
             adapter.validate_path(local=True)
 
-            with threadpoolctl.threadpool_limits(limits=1):
-                log.info("Model: Quant Model Loading...")
-                quantized_model = GPTQModel.load(
-                    model_id_or_path=quantized_model_id_or_path,
-                    backend=BACKEND.TORCH,
-                    device=CPU,
-                    trust_remote_code=trust_remote_code,
-                    torch_dtype=torch_dtype,
-                )
+            log.info("Model: Quant Model Loading...")
+            quantized_model = GPTQModel.load(
+                model_id_or_path=quantized_model_id_or_path,
+                backend=BACKEND.TORCH,
+                device=CPU,
+                trust_remote_code=trust_remote_code,
+                dtype=dtype,
+            )
 
-                qcfg = quantized_model.quantize_config
-                qModules: Dict[str, TorchQuantLinear] = find_modules(module=quantized_model.model, layers=[TorchQuantLinear])
-                # for name, module in qModules.items():
-                #     quantized_weights[name] = module.dequantize_weight()
-                del quantized_model
-                torch_empty_cache()
+            qcfg = quantized_model.quantize_config
+            qModules: Dict[str, TorchQuantLinear] = find_modules(module=quantized_model.model, layers=[TorchQuantLinear])
+            # for name, module in qModules.items():
+            #     quantized_weights[name] = module.dequantize_weight()
+            del quantized_model
+            torch_empty_cache()
 
-                log.info("Model: Native Model Loading...")
-                model = GPTQModel.load(
-                    model_id_or_path=model_id_or_path,
-                    quantize_config=qcfg,
-                    backend=BACKEND.TORCH,
-                    trust_remote_code=trust_remote_code,
-                    torch_dtype=torch_dtype,
-                    device=CPU,
-                )
+            log.info("Model: Native Model Loading...")
+            model = GPTQModel.load(
+                model_id_or_path=model_id_or_path,
+                quantize_config=qcfg,
+                backend=BACKEND.TORCH,
+                trust_remote_code=trust_remote_code,
+                dtype=dtype,
+                device=CPU,
+            )
 
-                log.info("Model: Adapter generation started")
-                model._eora_generate(
-                    adapter=adapter,
-                    quantized_modules=qModules,
-                    calibration_dataset=calibration_dataset,
-                    calibration_dataset_concat_size=calibration_dataset_concat_size,
-                    batch_size=batch_size,
-                    calibration_enable_gpu_cache=calibration_enable_gpu_cache,
-                    tokenizer=tokenizer,
-                    logger_board=logger_board,
-                    buffered_fwd=buffered_fwd,
-                    auto_gc=auto_gc)
+            log.info("Model: Adapter generation started")
+            model._eora_generate(
+                adapter=adapter,
+                quantized_modules=qModules,
+                calibration_dataset=calibration_dataset,
+                calibration_dataset_concat_size=calibration_dataset_concat_size,
+                calibration_dataset_sort=calibration_dataset_sort,
+                batch_size=batch_size,
+                tokenizer=tokenizer,
+                calibration_concat_separator=calibration_concat_separator,
+            )
             return

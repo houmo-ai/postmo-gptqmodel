@@ -1,27 +1,18 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import argparse
 import os
 
-from gptqmodel.utils import Perplexity
 from transformers import AutoTokenizer
 
+from gptqmodel.utils.perplexity import Perplexity
+
+
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 if __name__ == "__main__":
     """
@@ -36,7 +27,7 @@ if __name__ == "__main__":
 
     """
     parser = argparse.ArgumentParser(description="Calculate Perplexity for a model.")
-    parser.add_argument("--model", type=str, default="ModelCloud/Llama-3.2-1B-Instruct-gptqmodel-4bit-vortex-v2.5", help="Model name.")
+    parser.add_argument("--model", type=str, default="/data01/datasets/Qwen3-8B-int4", help="Model name.")
     parser.add_argument("--n_ctx", type=int, default=1024, help="Context size.")
     parser.add_argument("--n_batch", type=int, default=1024, help="Batch size.")
     parser.add_argument("--dataset_path", type=str, default="wikitext", help="Path to the dataset.")
@@ -73,7 +64,7 @@ if __name__ == "__main__":
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
             device_map="auto",
-            torch_dtype="auto",
+            dtype="auto",
             trust_remote_code=args.trust_remote_code,
         )
 

@@ -1,18 +1,7 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 # Adapted from turboderp exllama: https://github.com/turboderp/exllama
 
@@ -26,11 +15,12 @@ from ...utils.backend import BACKEND
 from ...utils.logger import setup_logger
 from . import BaseQuantLinear
 
+
 exllama_import_exception = None
 try:
     from gptqmodel_exllama_kernels import make_q4, q4_matmul
 except ImportError as e:
-    exllama_import_exception = e
+    exllama_import_exception = str(e)
 
 log = setup_logger()
 
@@ -60,6 +50,8 @@ class ExllamaQuantLinear(BaseQuantLinear):
 
     SUPPORTS_DTYPES = [torch.float16, torch.bfloat16]
 
+    REQUIRES_FORMAT_V2 = True
+
     # for transformers/optimum tests compat
     QUANT_TYPE = "exllama"
 
@@ -76,11 +68,12 @@ class ExllamaQuantLinear(BaseQuantLinear):
         bias: bool = False,
         pack_dtype: torch.dtype = torch.int32,
         adapter: Adapter = None,
+        register_buffers: bool = True,
         **kwargs,
     ):
         if exllama_import_exception is not None:
             raise ValueError(
-                f"Trying to use the exllama backend, but could not import the C++/CUDA dependencies with the following error: {exllama_import_exception}"
+                f"Trying to use the Exllama v1 backend but could not import the kernel cpp extension error: {exllama_import_exception}. Please manually reinstall and recompile package as Exllama v1 kernel extension is not part of prebuilt wheels."
             )
 
         # backup original values
@@ -104,7 +97,7 @@ class ExllamaQuantLinear(BaseQuantLinear):
             pack_dtype=pack_dtype,
             backend=kwargs.pop("backend", BACKEND.EXLLAMA_V1),
             adapter=adapter,
-            register_buffers=True,
+            register_buffers=register_buffers,
             register_buffers_in_features=in_features,
             register_buffers_out_feature=out_features,
             **kwargs)
@@ -112,7 +105,7 @@ class ExllamaQuantLinear(BaseQuantLinear):
     @classmethod
     def validate(cls, **args) -> Tuple[bool, Optional[Exception]]:
         if exllama_import_exception is not None:
-            return False, exllama_import_exception
+            return False, ImportError(exllama_import_exception)
         return cls._validate(**args)
 
     def post_init(self):

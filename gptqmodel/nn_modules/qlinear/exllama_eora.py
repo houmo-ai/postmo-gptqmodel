@@ -25,12 +25,13 @@ from ...models._const import DEVICE, PLATFORM
 from ...nn_modules.qlinear import BaseQuantLinear
 from ...utils.logger import setup_logger
 
+
 exllama_eora_import_exception = None
 
 try:
     import gptqmodel_exllama_eora
 except ImportError as e:
-    exllama_eora_import_exception = e
+    exllama_eora_import_exception = str(e)
 
 log = setup_logger()
 
@@ -71,6 +72,8 @@ class ExllamaEoraQuantLinear(BaseQuantLinear):
 
     SUPPORTS_DTYPES = [torch.float16]
 
+    REQUIRES_FORMAT_V2 = False
+
     # for transformers/optimum tests compat
     QUANT_TYPE = "exllama_v2v"
 
@@ -89,7 +92,7 @@ class ExllamaEoraQuantLinear(BaseQuantLinear):
     ):
         if exllama_eora_import_exception is not None:
             raise ValueError(
-                f"Trying to use the exllama v2 backend, but could not import the C++/CUDA dependencies with the following error: {exllama_eora_import_exception}"
+                f"Trying to use the Exllama EoRA backend but could not import the kernel cpp extension with the following error: {exllama_eora_import_exception}. Please manually reinstall and recompile package as Eora kernel extension is not part of prebuilt by wheels."
             )
 
         # # backup original values
@@ -102,6 +105,8 @@ class ExllamaEoraQuantLinear(BaseQuantLinear):
         # in_features = in_features + (-in_features % group_size)
         # self.in_features_padding_size = in_features - self.original_in_features
         # self.in_features_padding_shape = (0, self.in_features_padding_size)
+
+        kwargs.pop("register_buffers")
 
         super().__init__(
             bits=bits,
@@ -122,7 +127,7 @@ class ExllamaEoraQuantLinear(BaseQuantLinear):
     @classmethod
     def validate(cls, **args) -> Tuple[bool, Optional[Exception]]:
         if exllama_eora_import_exception is not None:
-            return False, exllama_eora_import_exception
+            return False, ImportError(exllama_eora_import_exception)
         return cls._validate(**args)
 
     def post_init(self):

@@ -1,36 +1,28 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
+# SPDX-FileCopyrightText: 2024-2025 ModelCloud.ai
+# SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
+# SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 # -- do not touch
 import os
+
 
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 # -- end do not touch
 
 
 import torch  # noqa: E402
-from gptqmodel import BACKEND, GPTQModel, exllama_set_max_input_length  # noqa: E402
-from gptqmodel.models._const import EXLLAMA_DEFAULT_MAX_INPUT_LENGTH  # noqa: E402
-from gptqmodel.nn_modules.qlinear.exllama import ExllamaQuantLinear  # noqa: E402
-from gptqmodel.quantization import FORMAT  # noqa: E402
-from gptqmodel.utils.importer import select_quant_linear  # noqa: E402
-from gptqmodel.utils.model import gptqmodel_post_init  # noqa: E402
 from gptqmodel_exllama_kernels import prepare_buffers, set_tuning_params  # noqa: E402
 from models.model_test import ModelTest  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
+
+from gptqmodel import BACKEND, GPTQModel, exllama_set_max_input_length  # noqa: E402
+from gptqmodel.models._const import EXLLAMA_DEFAULT_MAX_INPUT_LENGTH  # noqa: E402
+from gptqmodel.nn_modules.qlinear.exllama import ExllamaQuantLinear  # noqa: E402
+from gptqmodel.quantization import FORMAT, METHOD  # noqa: E402
+from gptqmodel.utils.importer import select_quant_linear  # noqa: E402
+from gptqmodel.utils.model import gptqmodel_post_init  # noqa: E402
+
 
 REFERENCE = torch.Tensor(
     [
@@ -1087,6 +1079,7 @@ class TestsQ4ExllamaV1(ModelTest):
             sym=True,
             backend=BACKEND.EXLLAMA_V1,
             format=FORMAT.GPTQ,
+            quant_method=METHOD.GPTQ,
             pack_dtype=pack_dtype,
         )
 
@@ -1132,7 +1125,7 @@ class TestsQ4ExllamaV1(ModelTest):
 
         inp = torch.rand(1, m, k, dtype=torch.float16).to(device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             res = linear(inp)[0][0]
 
         reference = REFERENCE.to(device)
