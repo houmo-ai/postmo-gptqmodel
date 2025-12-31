@@ -931,7 +931,7 @@ class GPTQ:
                     if self.qcfg.group_size != -1:
                         if not self.qcfg.static_groups:
                             if (i1 + i) % self.qcfg.group_size == 0:
-                                self.quantizer.find_params(W[:, (i1 + i) : (i1 + i + self.qcfg.group_size)], weight=True, solve=Hinv1 if self.qcfg.hessian_mse else None)
+                                self.quantizer.find_params(W[:, (i1 + i) : (i1 + i + self.qcfg.group_size)], weight=True, solve=Hinv[i1+i:i1+i+self.qcfg.group_size, i1+i:i1+i+self.qcfg.group_size] if self.qcfg.hessian_mse else None)
 
                             if ((i1 + i) // self.qcfg.group_size) - now_idx == -1:
                                 scale.append(self.quantizer.scale)
