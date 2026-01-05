@@ -104,6 +104,50 @@ def get_orthogonal_matrix(size, mode, device):
         raise ValueError(f"Unknown mode {mode}")
 
 
+def rotate_conv(layer, Q_v, embed_dims):
+    dtype = layer.weight.dtype
+    weight_shape = layer.weight.data.shape
+    layer.weight.data = (
+        torch.matmul(Q_v.T, layer.weight.data.double().view(
+            embed_dims, -1)).to(dtype).view(weight_shape)
+    )
+    if layer.bias is not None:
+        layer.bias.data = torch.matmul(layer.bias.data.double(), Q_v).to(dtype)
+
+
+def rotate_visual_merger(model, Q: torch.Tensor) -> None:
+    # Rotate the head.
+    dtype = model.visual.merger.mlp[0].weight.dtype
+
+    q_shape = Q.shape[0]
+    o_shape, i_shape = model.visual.merger.mlp[0].weight.shape
+
+    W_ = model.visual.merger.mlp[0].weight.to(
+        dtype=torch.float64).reshape(o_shape, -1, q_shape)
+    model.visual.merger.mlp[0].weight.data = torch.matmul(W_, Q).to(
+        dtype=dtype).reshape(o_shape, i_shape).contiguous()
+
+
+def rotate_qwen3_vl_embeddings(model, Q, device) -> None:
+    for W in [model.language_model.embed_tokens]:
+        dtype  = W.weight.data.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+    W_ = model.visual.merger.linear_fc2.weight.data.to(dtype=torch.float64, device=device)
+    model.visual.merger.linear_fc2.weight.data = torch.matmul(Q.T, W_).to(dtype=dtype, device="cpu")
+    if model.visual.merger.linear_fc2.bias is not None:
+        b = model.visual.merger.linear_fc2.bias.data.to(dtype=torch.float64, device=device)
+        model.visual.merger.linear_fc2.bias.data = torch.matmul(b, Q).to(dtype=dtype, device="cpu")
+
+    for layer in model.visual.deepstack_merger_list:
+        W_ = layer.linear_fc2.weight.data.to(dtype=torch.float64, device=device)
+        layer.linear_fc2.weight.data = torch.matmul(Q.T, W_).to(dtype=dtype, device="cpu")
+        if layer.linear_fc2.bias is not None:
+            b = layer.linear_fc2.bias.data.to(dtype=torch.float64, device=device)
+            layer.linear_fc2.bias.data = torch.matmul(b, Q).to(dtype=dtype, device="cpu")
+
+
 def get_embeddings(model) -> list[torch.nn.Module]:
     return [model.model.embed_tokens]
 
@@ -197,4 +241,58 @@ def rotate_model(model: PreTrainedModel, rotate_mode: str, device: torch.device,
         rotate_mlp_input(layer, Q, device)
         rotate_mlp_output(layer, Q, device)
         rotate_ov_proj(layer, num_heads, head_dim)
+    return model, Q
+
+
+@torch.inference_mode()
+def rotate_model_qwen3_vl(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
+                          layers_node: str, Q=None):
+    Q = (
+        get_orthogonal_matrix(
+            model.config.text_config.hidden_size, rotate_mode, device
+        )
+        if Q is None
+        else Q
+    )
+    config = model.config
+    num_heads = config.text_config.num_attention_heads
+    model_dim = config.text_config.hidden_size
+    head_dim = model_dim // num_heads
+
+    rotate_qwen3_vl_embeddings(model, Q, device)
+    rotate_head(model, Q, device, lm_head_name)
+    torch_empty_cache()
+    layers , _ = get_module_by_name_prefix(model, layers_node)
+    for idx, layer in enumerate(log.pb(layers).title("Rotating")):
+        rotate_attention_inputs(layer, Q, device)
+        rotate_attention_output(layer, Q, device)
+        rotate_mlp_input(layer, Q, device)
+        rotate_mlp_output(layer, Q, device)
+    return model, Q
+
+
+@torch.inference_mode()
+def rotate_vision_model(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
+                        layers_node: str, Q=None):
+    num_heads = model.visual.blocks[0].attn.num_heads
+    Q = (
+        get_orthogonal_matrix(
+            model.visual.blocks[0].attn.qkv.in_features, rotate_mode, device
+        )
+        if Q is None
+        else Q
+    )
+    rotate_conv(
+            model.visual.patch_embed.proj,
+            Q,
+            model.visual.blocks[0].attn.qkv.in_features,
+    )
+    torch_empty_cache()
+    layers , _ = get_module_by_name_prefix(model, layers_node)
+    for idx, layer in enumerate(log.pb(layers).title("Rotating")):
+        rotate_attention_inputs(layer, Q, device)
+        rotate_attention_output(layer, Q, device)
+        rotate_mlp_input(layer, Q, device)
+        rotate_mlp_output(layer, Q, device)
+    rotate_visual_merger(model, Q)
     return model, Q

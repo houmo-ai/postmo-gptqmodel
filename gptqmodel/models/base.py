@@ -43,7 +43,7 @@ from ..nn_modules.qlinear.lookahead import configure_default_lookahead
 from ..nn_modules.qlinear.torch import TorchQuantLinear
 from ..quantization import QuantizeConfig
 from ..quantization.config import FORMAT, METHOD, QUANTIZE_BLACK_LIST, VRAMStrategy, dynamic_get
-from ..quantization.rotation.rotation import fuse_layer_norms, rotate_model
+from ..quantization.rotation.rotation import fuse_layer_norms, rotate_model, rotate_model_qwen3_vl, rotate_vision_model
 from ..utils.backend import BACKEND
 from ..utils.calibration import prepare_calibration_dataset
 from ..utils.device import get_device
@@ -587,13 +587,15 @@ class BaseQModel(nn.Module):
         if self.quantize_config.rotation:
             from gptqmodel.models.definitions.llama import LlamaQModel
             from gptqmodel.models.definitions.qwen2 import Qwen2QModel
-            if not isinstance(self, (LlamaQModel, Qwen2QModel)):
+            from gptqmodel.models.definitions.qwen3_vl import Qwen3_VLQModel
+            if not isinstance(self, (LlamaQModel, Qwen2QModel, Qwen3_VLQModel)):
                 raise ValueError(f"rotation only supports: llama/qwen2 model, "
                                     f"current model is {self.__class__.__name__}")
 
             if self.model.config.tie_word_embeddings:
                 log.info("Rotation requires word embeddings to be untied. Untying.")
                 self.model.config.tie_word_embeddings = False
+                self.model.config.text_config.tie_word_embeddings = False
                 lm_head, _ = get_module_by_name_prefix(self.model, self.lm_head)
                 lm_head.weight = nn.Parameter(lm_head.weight.data.clone())
 
@@ -607,8 +609,17 @@ class BaseQModel(nn.Module):
 
             # MPS does not support float64.
             rotation_device = self.quantize_config.device if self.quantize_config.device != DEVICE.MPS else DEVICE.CPU
-            self.model, _ = rotate_model(model=self.model, rotate_mode=self.quantize_config.rotation,
-                                            device=rotation_device, **module_name_args)
+            # self.model, _ = rotate_model(model=self.model, rotate_mode=self.quantize_config.rotation,
+            #                                 device=rotation_device, **module_name_args)
+            if self.quantize_config.rotation_vision:
+                self.model, _ = rotate_vision_model(model=self.model, rotate_mode=self.quantize_config.rotation_vision,
+                                                device=rotation_device, **module_name_args)
+            if not isinstance(self, Qwen3_VLQModel):
+                self.model, _ = rotate_model(model=self.model, rotate_mode=self.quantize_config.rotation,
+                                                device=rotation_device, **module_name_args)
+            else:   
+                self.model, _ = rotate_model_qwen3_vl(model=self.model, rotate_mode=self.quantize_config.rotation,
+                                                device=rotation_device, **module_name_args)
 
         # init processor with default GPTQ processor
         from ..looper.tensorparallel_weight_processor import TensorParallelWeightProcessor

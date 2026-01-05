@@ -237,6 +237,7 @@ class QuantizeConfig():
     offload_to_disk_path: str = field(default=None, metadata={"help": "Offload disk path. Only applicable if Offload to disk is enabled"})
 
     rotation: Optional[str] = field(default=None, metadata={"choices": ["hadamard", "random"]})
+    rotation_vision: Optional[str] = field(default=None, metadata={"choices": ["hadamard", "random"]})
 
     # deprecated: only used for compat
     is_marlin_format: bool = False
@@ -331,7 +332,7 @@ class QuantizeConfig():
                         raise ValueError("QuantizeConfig: `group_size` must be one of `[-1, 16, 32, 64, 128, 256, 512, 1024]`.")
 
         if self.group_size != 64:
-            raise ValueError("QuantizeConfig: `group_size` must be one of `[-1, 16, 32, 64, 128, 256, 512, 1024]`.")
+            raise ValueError("QuantizeConfig: `group_size` must be 64.")
 
         if not (0 < self.damp_percent < 1):
             raise ValueError("QuantizeConfig: `damp_percent` must between 0 and 1.")
