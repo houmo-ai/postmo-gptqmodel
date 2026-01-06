@@ -43,7 +43,7 @@ from ..nn_modules.qlinear.lookahead import configure_default_lookahead
 from ..nn_modules.qlinear.torch import TorchQuantLinear
 from ..quantization import QuantizeConfig
 from ..quantization.config import FORMAT, METHOD, QUANTIZE_BLACK_LIST, VRAMStrategy, dynamic_get
-from ..quantization.rotation.rotation import fuse_layer_norms, rotate_model, rotate_model_qwen3_vl, rotate_vision_model
+from ..quantization.rotation.rotation import fuse_layer_norms, rotate_model, rotate_model_qwen3_vl, rotate_vision_model, fuse_vision_layer_norms
 from ..utils.backend import BACKEND
 from ..utils.calibration import prepare_calibration_dataset
 from ..utils.device import get_device
@@ -64,7 +64,7 @@ from ._const import (
 from .loader import ModelLoader
 from .writer import ModelWriter
 
-
+from qwen_vl_utils import process_vision_info
 if TYPE_CHECKING:
     try:
         from datasets import Dataset as HFDatasetType
@@ -125,6 +125,60 @@ def apply_module_tree_override(module_tree, override):
                     if isinstance(b, dict):
                         apply_module_tree_override(b, o)
     return module_tree
+
+
+def demo(model, processor):
+    from accelerate import dispatch_model, infer_auto_device_map
+    from accelerate.utils import get_balanced_memory
+    raw_device = next(model.parameters()).device
+    no_split_module_classes = [
+        "LlamaDecoderLayer",
+        "QuantDecoderLayer",
+        "RotateModule",
+        "SmoothModule",
+        "Qwen2DecoderLayer",
+        "Qwen2_5_VLDecoderLayer",
+    ]
+    max_memory = get_balanced_memory(model, no_split_module_classes=no_split_module_classes)
+    device_map = infer_auto_device_map(model, max_memory=max_memory, no_split_module_classes=no_split_module_classes)
+    dispatch_model(
+        model, device_map=device_map, offload_buffers=True, offload_dir="offload", state_dict=model.state_dict()
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen-VL/assets/demo.jpeg",
+                },
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+    ]
+    # Preparation for inference
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    inputs = inputs.to("cuda")
+
+    # Inference: Generation of the output
+    generated_ids = model.generate(**inputs, max_new_tokens=512)
+    generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
+    output_text = processor.batch_decode(
+        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+    )
+    print(output_text)
+    from accelerate.hooks import remove_hook_from_module
+
+    remove_hook_from_module(model)
+    model.to(raw_device)
 
 
 NOT_QUANTIZE_FLAG = ":!"
@@ -588,7 +642,8 @@ class BaseQModel(nn.Module):
             from gptqmodel.models.definitions.llama import LlamaQModel
             from gptqmodel.models.definitions.qwen2 import Qwen2QModel
             from gptqmodel.models.definitions.qwen3_vl import Qwen3_VLQModel
-            if not isinstance(self, (LlamaQModel, Qwen2QModel, Qwen3_VLQModel)):
+            from gptqmodel.models.definitions.qwen2_5_vl import Qwen2_5_VLQModel
+            if not isinstance(self, (LlamaQModel, Qwen2QModel, Qwen3_VLQModel, Qwen2_5_VLQModel)):
                 raise ValueError(f"rotation only supports: llama/qwen2 model, "
                                     f"current model is {self.__class__.__name__}")
 
@@ -603,6 +658,11 @@ class BaseQModel(nn.Module):
                 "layers_node": self.extract_layers_node(),
                 "lm_head_name": self.lm_head
             }
+            # demo(self.model, self.processor)
+            if self.quantize_config.rotation_vision:
+                self.model = fuse_vision_layer_norms(model=self.model,
+                                            pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
+                                            **module_name_args)
             self.model = fuse_layer_norms(model=self.model,
                                             pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
                                             **module_name_args)
@@ -614,7 +674,8 @@ class BaseQModel(nn.Module):
             if self.quantize_config.rotation_vision:
                 self.model, _ = rotate_vision_model(model=self.model, rotate_mode=self.quantize_config.rotation_vision,
                                                 device=rotation_device, **module_name_args)
-            if not isinstance(self, Qwen3_VLQModel):
+
+            if not isinstance(self, Qwen3_VLQModel) and not isinstance(self, Qwen2_5_VLQModel):
                 self.model, _ = rotate_model(model=self.model, rotate_mode=self.quantize_config.rotation,
                                                 device=rotation_device, **module_name_args)
             else:   

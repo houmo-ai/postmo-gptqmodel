@@ -18,7 +18,7 @@ from ..base import BaseQModel
 class BaseQwen2VLGPTQ(BaseQModel):
     loader = AutoModelForImageTextToText
 
-    pre_lm_head_norm_module = "model.norm"
+    pre_lm_head_norm_module = "model.language_model.norm"
 
     module_tree = [
         "model",
