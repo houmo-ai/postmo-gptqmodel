@@ -18,7 +18,7 @@ def get_args():
     parser.add_argument("--image_dir", type=str, default="test")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--with_random", action="store_true", default=False)
-    parser.add_argument("--rotation", type=str, default=None)
+    parser.add_argument("--rotation", type=str, default=None, choices=['random', 'hadamard'])
     parser.add_argument("--hessian_mse", action="store_true", default=False)
     # parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
     return parser.parse_args()
