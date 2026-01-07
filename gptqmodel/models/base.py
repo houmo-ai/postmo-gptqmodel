@@ -43,7 +43,7 @@ from ..nn_modules.qlinear.lookahead import configure_default_lookahead
 from ..nn_modules.qlinear.torch import TorchQuantLinear
 from ..quantization import QuantizeConfig
 from ..quantization.config import FORMAT, METHOD, QUANTIZE_BLACK_LIST, VRAMStrategy, dynamic_get
-from ..quantization.rotation.rotation import fuse_layer_norms, rotate_model, rotate_model_qwen3_vl, rotate_vision_model, fuse_vision_layer_norms
+from ..quantization.rotation.rotation import fuse_layer_norms, rotate_model, rotate_model_qwen3_vl, rotate_vision_model
 from ..quantization.rotation.model import get_rotation_entry
 from ..utils.backend import BACKEND
 from ..utils.calibration import prepare_calibration_dataset
@@ -703,21 +703,19 @@ class BaseQModel(nn.Module):
             }
             # demo(self.model, self.processor)
             if self.quantize_config.rotation_vision:
-                self.model = fuse_vision_layer_norms(model=self.model,
-                                            pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
-                                            **module_name_args)
+                self.model = entry["fuse_vision_norm"](model=self.model,
+                                                       pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
+                                                       **module_name_args)
             self.model = fuse_layer_norms(model=self.model,
-                                            pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
-                                            **module_name_args)
-
+                                          pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
+                                          **module_name_args)
             # MPS does not support float64.
             rotation_device = self.quantize_config.device if self.quantize_config.device != DEVICE.MPS else DEVICE.CPU
             # self.model, _ = rotate_model(model=self.model, rotate_mode=self.quantize_config.rotation,
             #                                 device=rotation_device, **module_name_args)
             if self.quantize_config.rotation_vision:
-                self.model, _ = rotate_vision_model(model=self.model, rotate_mode=self.quantize_config.rotation_vision,
+                self.model, _ = entry['rotate_vision_fn'](model=self.model, rotate_mode=self.quantize_config.rotation_vision,
                                                 device=rotation_device, **module_name_args)
-
             self.model, _ = entry["rotate_fn"](model=self.model, rotate_mode=self.quantize_config.rotation,
                                             device=rotation_device, **module_name_args)
         # init processor with default GPTQ processor

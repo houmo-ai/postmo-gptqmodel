@@ -12,7 +12,7 @@ from safetensors.torch import load_file as load_safetensors_file
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_id", type=str, default="/data01/nfs_shared/llm_models/Qwen/Qwen2.5-VL-3B-Instruct")
+    parser.add_argument("--model_id", type=str, default="/data01/nfs_shared/llm_models/Qwen/Qwen3-VL-2B-Instruct")
     parser.add_argument("--quarot_model_path", type=str, default=None)
     parser.add_argument("--quant_path", type=str, default=None)
     parser.add_argument("--image_dir", type=str, default="test")

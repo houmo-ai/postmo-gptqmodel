@@ -20,14 +20,16 @@ def get_rotation_entry(model):
         {
             "cls": Qwen2_5_VLQModel,
             "vision": True,
-            "rotate_fn": rotate_model_qwen3_vl,
+            "fuse_vision_norm": fuse_vision_layer_norms_qwen2_5_vl,
+            "rotate_fn": rotate_model_qwen2_5_vl,
             "rotate_vision_fn": rotate_vision_model,
         },
         {
             "cls": Qwen3_VLQModel,
             "vision": True,
+            "fuse_vision_norm": fuse_vision_layer_norms_qwen3_vl,
             "rotate_fn": rotate_model_qwen3_vl,
-            "rotate_vision_fn": rotate_vision_model,
+            "rotate_vision_fn": rotate_vision_model_qwen3_vl,
         },
     ]
 
