@@ -112,6 +112,38 @@ def fuse_layer_norms(model: PreTrainedModel, pre_lm_head_norm_module_name: str, 
     return model
 
 
+def fuse_layer_norms_moe(model: PreTrainedModel, pre_lm_head_norm_module_name: str, layers_node: str, lm_head_name: str):
+    layers , _ = get_module_by_name_prefix(model, layers_node)
+
+    # Fuse the linear operations in Layernorm into the adjacent linear blocks.
+    for layer in layers:
+        # fuse the input layernorms into the linear layers
+        fuse_ln_linear(
+                layer.post_attention_layernorm, [layer.mlp.gate]
+            )
+        for i in range(128):
+            fuse_ln_linear(
+                layer.post_attention_layernorm, [layer.mlp.experts[i].gate_proj, layer.mlp.experts[i].up_proj]
+            )
+        fuse_ln_linear(
+            layer.input_layernorm,
+            [
+                layer.self_attn.q_proj,
+                layer.self_attn.k_proj,
+                layer.self_attn.v_proj,
+            ],
+        )
+        reset_ln(layer.post_attention_layernorm)
+        reset_ln(layer.input_layernorm)
+
+    pre_head_layernorm, _ = get_module_by_name_prefix(model, pre_lm_head_norm_module_name)
+    lm_head, _ = get_module_by_name_prefix(model, lm_head_name)
+
+    fuse_ln_linear(pre_head_layernorm, [lm_head])
+    reset_ln(pre_head_layernorm)
+    return model
+
+
 def bake_mean_into_linear_conv(linear: torch.nn.Linear, embed_dims) -> None:
     """
     This function takes a linear layer and subtracts the means from the
@@ -343,6 +375,18 @@ def rotate_mlp_input_qwen3_vl(layer, Q, device):
         W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
 
 
+def rotate_mlp_input_moe(layer, Q, device):
+    # Rotate the MLP input weights.
+    mlp_inputs = [layer.mlp.gate]
+    for i in range(128):
+        mlp_inputs.append(layer.mlp.experts[i].gate_proj)
+        mlp_inputs.append(layer.mlp.experts[i].up_proj)
+    for W in mlp_inputs:
+        dtype = W.weight.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+
 def rotate_mlp_output(layer, Q, device):
     # Rotate the MLP output weights and bias.
     W = layer.mlp.down_proj
@@ -365,6 +409,19 @@ def rotate_mlp_output_qwen3_vl(layer, Q, device):
     if W.bias is not None:
         b = W.bias.data.to(device=device, dtype=torch.float64)
         W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+
+def rotate_mlp_output_moe(layer, Q, device):
+    # Rotate the MLP output weights and bias.
+    for i in range(128):
+        W = layer.mlp.experts[i].down_proj
+        dtype = W.weight.data.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+        # apply_exact_had_to_linear(W, had_dim=-1, output=False) #apply exact (inverse) hadamard on the weights of mlp output
+        if W.bias is not None:
+            b = W.bias.data.to(device=device, dtype=torch.float64)
+            W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
 
 
 def rotate_head(model, Q, device, lm_head_name) -> None:
@@ -407,7 +464,7 @@ def rotate_model(model: PreTrainedModel, rotate_mode: str, device: torch.device,
         rotate_attention_output(layer, Q, device)
         rotate_mlp_input(layer, Q, device)
         rotate_mlp_output(layer, Q, device)
-        rotate_ov_proj(layer, num_heads, head_dim)
+        # rotate_ov_proj(layer, num_heads, head_dim)
     return model, Q
 
 
@@ -462,6 +519,30 @@ def rotate_model_qwen3_vl(model: PreTrainedModel, rotate_mode: str, device: torc
         rotate_attention_output(layer, Q, device)
         rotate_mlp_input(layer, Q, device)
         rotate_mlp_output(layer, Q, device)
+    return model, Q
+
+
+@torch.inference_mode()
+def rotate_model_moe(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
+                          layers_node: str, Q=None):
+    Q = (
+        get_orthogonal_matrix(
+            model.config.hidden_size, rotate_mode, device
+        )
+        if Q is None
+        else Q
+    )
+
+    rotate_embeddings(model, Q, device)
+    rotate_head(model, Q, device, lm_head_name)
+    torch_empty_cache()
+    layers , _ = get_module_by_name_prefix(model, layers_node)
+    for idx, layer in enumerate(log.pb(layers).title("Rotating")):
+        rotate_attention_inputs(layer, Q, device)
+        rotate_attention_output(layer, Q, device)
+        rotate_mlp_input_moe(layer, Q, device)
+        rotate_mlp_output_moe(layer, Q, device)
+        # rotate_ov_proj(layer, num_heads, head_dim)
     return model, Q
 
 

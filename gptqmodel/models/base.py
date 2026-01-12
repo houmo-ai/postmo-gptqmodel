@@ -182,6 +182,94 @@ def demo(model, processor):
     model.to(raw_device)
 
 
+def demo_qwen3_moe(model, tokenizer):
+    from accelerate import dispatch_model, infer_auto_device_map
+    from accelerate.utils import get_balanced_memory
+    from accelerate.hooks import remove_hook_from_module
+    import torch
+
+    raw_device = next(model.parameters()).device
+
+    no_split_module_classes = [
+        "Qwen3MoeDecoderLayer",
+        "MoEBlock",
+        "Experts",
+    ]
+
+    max_memory = get_balanced_memory(
+        model, no_split_module_classes=no_split_module_classes
+    )
+    device_map = infer_auto_device_map(
+        model,
+        max_memory=max_memory,
+        no_split_module_classes=no_split_module_classes,
+    )
+
+    dispatch_model(
+        model,
+        device_map=device_map,
+        offload_buffers=True,
+        offload_dir="offload",
+        state_dict=model.state_dict(),
+    )
+
+    messages = [
+        {"role": "user", "content": "请简单介绍一下什么是 MoE 模型。"}
+    ]
+
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+    ).to("cuda")
+
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=512,
+        )
+
+    generated_ids_trimmed = generated_ids[:, inputs.input_ids.shape[1]:]
+    output_text = tokenizer.batch_decode(
+        generated_ids_trimmed,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    print(output_text)
+
+    remove_hook_from_module(model)
+    model.to(raw_device)
+
+
+def demo_qwen3_moe_cpu(model, tokenizer):
+    model.to("cpu")
+    messages = [
+        {"role": "user", "content": "请简单介绍一下什么是 MoE 模型。"}
+    ]
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(
+        text,
+        return_tensors="pt",
+    ).to("cpu")
+
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=512,
+        )
+    generated_ids_trimmed = generated_ids[:, inputs.input_ids.shape[1]:]
+    output_text = tokenizer.batch_decode(
+        generated_ids_trimmed,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )
+    print(output_text)
+
 NOT_QUANTIZE_FLAG = ":!"
 CAPTURE_ONLY_FLAG = ":?"
 NON_QUANTIZE_FLAGS = (NOT_QUANTIZE_FLAG, CAPTURE_ONLY_FLAG)
@@ -706,7 +794,7 @@ class BaseQModel(nn.Module):
                 self.model = entry["fuse_vision_norm"](model=self.model,
                                                        pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
                                                        **module_name_args)
-            self.model = fuse_layer_norms(model=self.model,
+            self.model = entry["fuse_norm"](model=self.model,
                                           pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
                                           **module_name_args)
             # MPS does not support float64.

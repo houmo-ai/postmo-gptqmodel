@@ -15,7 +15,7 @@ calibration_dataset = [
 ][:1]
 print(f"校准数据集样本数：{len(calibration_dataset)}")
 
-quant_config = QuantizeConfig(bits=4, group_size=64)
+quant_config = QuantizeConfig(bits=4, group_size=64, rotation="random", offload_to_disk=False)
 model = GPTQModel.load(model_id, quant_config)
 model.quantize(calibration_dataset, batch_size=1)
 

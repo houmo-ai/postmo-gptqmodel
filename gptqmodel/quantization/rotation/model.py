@@ -5,21 +5,31 @@ def get_rotation_entry(model):
     from gptqmodel.models.definitions.qwen2 import Qwen2QModel
     from gptqmodel.models.definitions.qwen3_vl import Qwen3_VLQModel
     from gptqmodel.models.definitions.qwen2_5_vl import Qwen2_5_VLQModel
+    from gptqmodel.models.definitions.qwen3_moe import Qwen3MoeQModel
 
     MODEL_ROTATION_REGISTRY = [
         {
             "cls": LlamaQModel,
             "vision": False,
+            "fuse_norm": fuse_layer_norms,
             "rotate_fn": rotate_model,
         },
         {
             "cls": Qwen2QModel,
             "vision": False,
+            "fuse_norm": fuse_layer_norms,
             "rotate_fn": rotate_model,
+        },
+        {
+            "cls": Qwen3MoeQModel,
+            "vision": False,
+            "fuse_norm": fuse_layer_norms_moe,
+            "rotate_fn": rotate_model_moe,
         },
         {
             "cls": Qwen2_5_VLQModel,
             "vision": True,
+            "fuse_norm": fuse_layer_norms,
             "fuse_vision_norm": fuse_vision_layer_norms_qwen2_5_vl,
             "rotate_fn": rotate_model_qwen2_5_vl,
             "rotate_vision_fn": rotate_vision_model,
@@ -27,6 +37,7 @@ def get_rotation_entry(model):
         {
             "cls": Qwen3_VLQModel,
             "vision": True,
+            "fuse_norm": fuse_layer_norms,
             "fuse_vision_norm": fuse_vision_layer_norms_qwen3_vl,
             "rotate_fn": rotate_model_qwen3_vl,
             "rotate_vision_fn": rotate_vision_model_qwen3_vl,
