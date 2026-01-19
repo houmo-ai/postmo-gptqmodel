@@ -24,17 +24,17 @@ from datasets import load_dataset
 from gptqmodel import GPTQModel, QuantizeConfig
 
 model_id = "/data01/datasets/Qwen3-8B"
-quant_path = "/data01/datasets/Qwen3-8B-int4"
+quant_path = "/data01/datasets/Qwen3-8B-int5-8"
 
 dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 
 calibration_dataset = [
     text for text in dataset["text"] 
     if text.strip() and len(text.strip()) > 50  
-][:1024]
+][:128]
 print(f"校准数据集样本数：{len(calibration_dataset)}")
 
-quant_config = QuantizeConfig(bits=4, group_size=64)
+quant_config = QuantizeConfig(bits=5, group_size=64)
 model = GPTQModel.load(model_id, quant_config)
 
 model.quantize(calibration_dataset, batch_size=128)

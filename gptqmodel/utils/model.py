@@ -543,7 +543,7 @@ def convert_gptq_v1_to_v2_format_module(module: BaseQuantLinear, bits: int, pack
             module.qzeros.data += 0b0001000100010001
         elif pack_dtype == torch.int8:
             module.qzeros.data += 0b00010001
-    elif bits == 8:
+    elif bits == 8 or bits ==5:
         if pack_dtype == torch.int64:
             module.qzeros.data += 0b0000000100000001000000010000000100000001000000010000000100000001
         elif pack_dtype == torch.int32:
@@ -627,7 +627,7 @@ def convert_gptq_v2_to_v1_format_module(
         )
     elif quantize_config.bits == 4:
         module.qzeros.data -= 0b00010001000100010001000100010001
-    elif quantize_config.bits == 8:
+    elif quantize_config.bits == 8 or quantize_config.bits == 5:
         module.qzeros.data -= 0b00000001000000010000000100000001
     else:
         raise NotImplementedError("Only 2,3,4,8 bits are supported.")
@@ -765,7 +765,6 @@ def pack_module(
         }
 
         packer_label = label_map[effective_impl]
-
         with log_time_block(
             packer_label,
             logger=log,

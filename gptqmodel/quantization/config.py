@@ -176,7 +176,7 @@ def dynamic_get(dynamic: Dict[str, Dict[str, Union[int, bool]]], module_name: st
 
 @dataclass
 class QuantizeConfig():
-    bits: int = field(default=4, metadata={"choices": [2, 3, 4, 8]})
+    bits: int = field(default=4, metadata={"choices": [2, 3, 4, 5, 8]})
 
     # allow dynamic bitsize per layer, if None or some layer not set, use bits
     dynamic: Optional[Dict[str, Dict[str, Union[int, bool]]]] = field(default=None)

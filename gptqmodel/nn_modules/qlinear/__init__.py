@@ -72,11 +72,17 @@ class BaseQuantLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.group_size = group_size if group_size != -1 else in_features
-        self.bits = bits
+        if bits == 5:
+            self.bits = 8
+        else:
+            self.bits = bits
         self.desc_act = desc_act
         self.pack_dtype = pack_dtype
         self.backend = backend
-        self.maxq = 2 ** self.bits - 1
+        if bits == 5:
+            self.maxq = 2 ** 5 - 1
+        else:
+            self.maxq = 2 ** self.bits - 1
         self.pack_dtype = pack_dtype
         # we need to clone the adapter since passed in adapter may be shared
         # adapter tensors are lodaed inside adapter so they must be unique per module
@@ -579,21 +585,31 @@ class PackableQuantLinear(BaseQuantLinear):
                     env_threads,
                     pack_block_threads,
                 )
-
-        if not disable_ext and bits in (2, 4, 8):
+        if not disable_ext and bits in (2, 4, 5, 8):
             try:
                 from .pack_block_ext import pack_block_cpu as pack_block_cpu_ext
-
-                qweight_ext, qzeros_ext = pack_block_cpu_ext(
-                    W,
-                    scales,
-                    zeros,
-                    g_idx.to(dtype=t.int32),
-                    bits,
-                    word_bits,
-                    block_in,
-                    pack_block_threads,
-                )
+                if bits == 5:
+                    qweight_ext, qzeros_ext = pack_block_cpu_ext(
+                        W,
+                        scales,
+                        zeros,
+                        g_idx.to(dtype=t.int32),
+                        8,
+                        word_bits,
+                        block_in,
+                        pack_block_threads,
+                    )
+                else:
+                    qweight_ext, qzeros_ext = pack_block_cpu_ext(
+                        W,
+                        scales,
+                        zeros,
+                        g_idx.to(dtype=t.int32),
+                        bits,
+                        word_bits,
+                        block_in,
+                        pack_block_threads,
+                    )
 
                 self.register_buffer("qweight", qweight_ext.to(dtype=self.pack_dtype))
                 self.register_buffer("qzeros", qzeros_ext.to(dtype=self.pack_dtype))
@@ -609,6 +625,8 @@ class PackableQuantLinear(BaseQuantLinear):
             # If the instance carries a different pack_factor, ignore it for safety.
         elif bits == 3:
             pack_factor = None  # sentinel: use the 10-1-10-1-10 scheme
+        elif bits == 5:
+            pack_factor = word_bits // 8
         else:
             raise NotImplementedError(f"Unsupported bits={bits}")
 
@@ -618,13 +636,18 @@ class PackableQuantLinear(BaseQuantLinear):
             raise ValueError("pack_block() expects self.pack_dtype == torch.int32 for 32-bit words.")
 
         # rows = (in // 32) * ({2,4,8} -> bits rows ; 3 -> 3 rows)
-        rows_per_group = (bits if bits != 3 else 3)
+        if bits == 5:
+            rows_per_group = 8
+        else:
+            rows_per_group = (bits if bits != 3 else 3)
         qweight_rows = (in_features // word_bits) * rows_per_group
         qweight = t.empty((qweight_rows, out_features), dtype=OUT_DTYPE, device="cpu")
 
         # ---------- precompute shifts for 2/4/8-bit vectorized packing ----------
         if bits in (2, 4, 8):
             shifts_pf64 = (t.arange(pack_factor, dtype=t.int64) * bits).view(1, pack_factor, 1)  # [1,pf,1]
+        elif bits == 5:
+            shifts_pf64 = (t.arange(pack_factor, dtype=t.int64) * 8).view(1, pack_factor, 1)
 
         # ---------- pack helpers (int64 shifts -> mask -> int32) ----------
         @t.inference_mode()
@@ -635,6 +658,15 @@ class PackableQuantLinear(BaseQuantLinear):
             R = r64.view(bits, pack_factor, -1)  # [bits,pf,N]
             packed64 = (R << shifts_pf64).sum(dim=1, dtype=t.int64)  # [bits,N]
             dst[dst_rows_base:dst_rows_base + bits] = ((packed64 & MASK32).to(t.int32))
+
+        @t.inference_mode()
+        def _pack_rows_8(int32_blk_32xN: t.Tensor, dst: t.Tensor, dst_rows_base: int):
+            # int32_blk_32xN: [32, N]
+            r64 = int32_blk_32xN.to(t.int64)  # [32,N]
+            # interpret the 32 input rows as [bits, pack_factor, N] in row-major order
+            R = r64.view(8, pack_factor, -1)  # [bits,pf,N]
+            packed64 = (R << shifts_pf64).sum(dim=1, dtype=t.int64)  # [bits,N]
+            dst[dst_rows_base:dst_rows_base + 8] = ((packed64 & MASK32).to(t.int32))
 
         @t.inference_mode()
         def _pack_rows_3(int32_blk_32xN: t.Tensor, dst: t.Tensor, dst_rows_base: int):
@@ -692,11 +724,16 @@ class PackableQuantLinear(BaseQuantLinear):
             base_group = (i0 // word_bits)
             for g in range(groups32):
                 sub = int_block[g * word_bits:(g + 1) * word_bits]  # [32, out] int32
-                dst_rows = (base_group + g) * (bits if bits != 3 else 3)
+                if bits == 5:
+                    dst_rows = (base_group + g) * 8
+                else:
+                    dst_rows = (base_group + g) * (bits if bits != 3 else 3)
                 if bits in (2, 4, 8):
                     _pack_rows_2_4_8(sub, qweight, dst_rows)
                 elif bits == 3:
                     _pack_rows_3(sub, qweight, dst_rows)
+                elif bits == 5:
+                    _pack_rows_8(sub, qweight, dst_rows)
                 else:
                     raise NotImplementedError(f"Unsupported bits={bits}")
 
@@ -721,10 +758,16 @@ class PackableQuantLinear(BaseQuantLinear):
 
         # ---------- qzeros: EXACT original numpy path (unchanged) ----------
         zeros_np = zeros.detach().cpu().numpy().astype(self.pack_np_math_dtype, copy=False)  # [G, out]
-        qzeros_np = np.zeros(
-            (zeros_np.shape[0], (zeros_np.shape[1] // self.pack_dtype_bits) * bits),
+        if bits == 5:
+            qzeros_np = np.zeros(
+            (zeros_np.shape[0], (zeros_np.shape[1] // self.pack_dtype_bits) * 8),
             dtype=self.pack_np_math_dtype
         )
+        else:
+            qzeros_np = np.zeros(
+                (zeros_np.shape[0], (zeros_np.shape[1] // self.pack_dtype_bits) * bits),
+                dtype=self.pack_np_math_dtype
+            )
 
         if bits in [2, 4, 8]:
             pf = (32 // bits)  # compute locally to avoid relying on attribute
@@ -732,6 +775,12 @@ class PackableQuantLinear(BaseQuantLinear):
                 base = col * pf
                 for j in range(pf):
                     qzeros_np[:, col] |= zeros_np[:, base + j] << (bits * j)
+        elif bits == 5:
+            pf = (32 // 8)  # compute locally to avoid relying on attribute
+            for col in range(qzeros_np.shape[1]):
+                base = col * pf
+                for j in range(pf):
+                    qzeros_np[:, col] |= zeros_np[:, base + j] << (8 * j)
         elif bits == 3:
             i = 0
             col = 0
