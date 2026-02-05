@@ -92,6 +92,7 @@ from .definitions.gemma2 import Gemma2QModel  # noqa: E402
 from .definitions.gemma3 import Gemma3ForConditionalGenerationGPTQ, Gemma3QModel  # noqa: E402
 from .definitions.glm import GlmQModel  # noqa: E402
 from .definitions.glm4_moe import GLM4MoEGPTQ  # noqa: E402
+from .definitions.glm4_moe_lite import Glm4MoeLiteQModel  # noqa: E402
 from .definitions.gpt2 import GPT2QModel  # noqa: E402
 from .definitions.gpt_bigcode import GptBigCodeQModel  # noqa: E402
 from .definitions.gpt_neo import GptNeoQModel  # noqa: E402
@@ -169,6 +170,7 @@ MODEL_MAP = {
     "glm": GlmQModel,
     "glm4": GlmQModel,
     "glm4_moe": GLM4MoEGPTQ,
+    "glm4_moe_lite": Glm4MoeLiteQModel,
     "gpt_bigcode": GptBigCodeQModel,
     "codegen": CodeGenQModel,
     "cohere": LlamaQModel, # 100% llama clone

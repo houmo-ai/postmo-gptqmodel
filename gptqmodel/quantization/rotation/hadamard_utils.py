@@ -108,15 +108,19 @@ def random_hadamard_matrix(size, device):
 def import_fast_hadamard_transform():
     try:
         import fast_hadamard_transform  # noqa: F401
+        return True
     except ImportError as e:
-        log.error(
-            "Package: Please install missing `fast_hadamard_transform` module via: `pip install -U git+https://github.com/Dao-AILab/fast-hadamard-transform.git --no-build-isolation -v`"
+        log.warning(
+            "Package: `fast_hadamard_transform` module not found. Falling back to slow torch implementation. "
+            "Please install via: `pip install -U git+https://github.com/Dao-AILab/fast-hadamard-transform.git --no-build-isolation -v`"
         )
-        raise e
+        return False
 
 
 def matmul_hadU_cuda(X, hadK, K):
-    import_fast_hadamard_transform()
+    if not import_fast_hadamard_transform():
+         return matmul_hadU(X) # Fallback to torch implementation
+         
     import fast_hadamard_transform
 
     n = X.shape[-1]
@@ -170,34 +174,58 @@ def apply_exact_had_to_linear(module, had_dim=-1, output=False):
             had_K, K = get_hadK(in_features)
             W_ = matmul_hadU_cuda(W_, had_K, K)
     else:
+        # Check if fast kernel is available
+        has_fast = import_fast_hadamard_transform()
+        
         # Apply Hadamard to the last had_dim chunks of the weights
         if output:
             W_ = W_.t()
             transposed_shape = W_.shape
-            W_ = (
-                fast_hadamard_transform.hadamard_transform(  # noqa: F821
-                    W_.reshape(-1, transposed_shape[-1] // had_dim, had_dim),
-                    scale=1 / math.sqrt(had_dim),
-                )
-                .reshape(transposed_shape)
-                .t()
-                .contiguous()
-            )
-            if module.bias is not None:
-                b_ = (
+            
+            if has_fast:
+                import fast_hadamard_transform
+                W_ = (
                     fast_hadamard_transform.hadamard_transform(  # noqa: F821
-                        b_.reshape(-1, b_.shape[-1] // had_dim, had_dim),
+                        W_.reshape(-1, transposed_shape[-1] // had_dim, had_dim),
                         scale=1 / math.sqrt(had_dim),
                     )
-                    .reshape(b_init_shape)
+                    .reshape(transposed_shape)
+                    .t()
                     .contiguous()
                 )
+            else:
+                # Fallback implementation for output chunked hadamard
+                # W_: [Hidden, Out] -> reshape -> [Hidden * Chunks, had_dim] -> matmul_hadU -> reshape
+                W_reshaped = W_.reshape(-1, transposed_shape[-1] // had_dim, had_dim)
+                W_processed = matmul_hadU(W_reshaped) 
+                W_ = W_processed.reshape(transposed_shape).t().contiguous()
+
+            if module.bias is not None:
+                if has_fast:
+                    b_ = (
+                        fast_hadamard_transform.hadamard_transform(  # noqa: F821
+                            b_.reshape(-1, b_.shape[-1] // had_dim, had_dim),
+                            scale=1 / math.sqrt(had_dim),
+                        )
+                        .reshape(b_init_shape)
+                        .contiguous()
+                    )
+                else:
+                     b_reshaped = b_.reshape(-1, b_.shape[-1] // had_dim, had_dim)
+                     b_processed = matmul_hadU(b_reshaped)
+                     b_ = b_processed.reshape(b_init_shape).contiguous()
 
         else:
-            W_ = fast_hadamard_transform.hadamard_transform(  # noqa: F821
-                W_.reshape(-1, init_shape[1] // had_dim, had_dim),
-                scale=1 / math.sqrt(had_dim),
-            ).reshape(init_shape)
+            if has_fast:
+                import fast_hadamard_transform
+                W_ = fast_hadamard_transform.hadamard_transform(  # noqa: F821
+                    W_.reshape(-1, init_shape[1] // had_dim, had_dim),
+                    scale=1 / math.sqrt(had_dim),
+                ).reshape(init_shape)
+            else:
+                 W_reshaped = W_.reshape(-1, init_shape[1] // had_dim, had_dim)
+                 W_processed = matmul_hadU(W_reshaped)
+                 W_ = W_processed.reshape(init_shape)
     module.weight.data = W_.to(device=dev, dtype=dtype)
     if module.bias is not None:
         module.bias.data = b_.to(device=dev, dtype=b_dtype)

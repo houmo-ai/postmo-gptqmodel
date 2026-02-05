@@ -44,7 +44,6 @@ from ..nn_modules.qlinear.torch import TorchQuantLinear
 from ..quantization import QuantizeConfig
 from ..quantization.config import FORMAT, METHOD, QUANTIZE_BLACK_LIST, VRAMStrategy, dynamic_get
 from ..quantization.rotation.rotation import fuse_layer_norms, rotate_model, rotate_model_qwen3_vl, rotate_vision_model
-from ..quantization.rotation.model import get_rotation_entry
 from ..utils.backend import BACKEND
 from ..utils.calibration import prepare_calibration_dataset
 from ..utils.device import get_device
@@ -771,8 +770,10 @@ class BaseQModel(nn.Module):
         #         self.model, _ = rotate_model_qwen3_vl(model=self.model, rotate_mode=self.quantize_config.rotation,
         #                                         device=rotation_device, **module_name_args)
         if self.quantize_config.rotation:
+            from ..quantization.rotation.model import get_rotation_entry
             entry = get_rotation_entry(self)
             if entry is None:
+                from gptqmodel.quantization.rotation.model import MODEL_ROTATION_REGISTRY
                 raise ValueError(
                     f"rotation only supports: {[e['cls'].__name__ for e in MODEL_ROTATION_REGISTRY]}, "
                     f"current model is {self.__class__.__name__}"

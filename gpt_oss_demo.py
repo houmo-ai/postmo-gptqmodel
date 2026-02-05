@@ -2,8 +2,8 @@
 from datasets import load_dataset
 from gptqmodel import GPTQModel, QuantizeConfig
 
-model_id = "/data01/datasets/gpt-oss-20b"
-quant_path = "/data01/datasets/gpt-oss-20b-int4"
+model_id = "data/datasets/gpt-oss-20b"
+quant_path = "data/gpt-oss-20b-int4"
 
 dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 

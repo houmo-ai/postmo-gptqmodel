@@ -88,7 +88,7 @@ class GptOssExpertsNew(nn.Module):
                 d_b_src  = ori_experts.down_proj_bias[i].detach()
 
                 with torch.inference_mode():
-                    tgt_gu_w.copy_(gu_w_src)
+                    tgt_gu_w.copy_(gu_w_src)  # pyright: ignore[reportCallIssue]
                     tgt_gu_b.copy_(gu_b_src)
                     tgt_d_w.copy_(d_w_src)
                     tgt_d_b.copy_(d_b_src)

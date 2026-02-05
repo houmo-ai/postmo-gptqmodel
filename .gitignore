@@ -184,3 +184,5 @@ example.py
 /gptqmodel_offload/
 /gptqmodel_ext/machete/generated/
 AGENT.md
+output/
+data/datasets

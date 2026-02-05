@@ -25,7 +25,10 @@ else:
 
 from packaging.version import InvalidVersion, Version
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
-from transformers.modeling_utils import no_init_weights
+try:
+    from transformers.modeling_utils import no_init_weights
+except ImportError:
+    from transformers.initialization import no_init_weights
 from transformers.utils import is_flash_attn_2_available
 from transformers.utils.generic import ContextManagers
 

@@ -121,9 +121,13 @@ def fuse_layer_norms_moe(model: PreTrainedModel, pre_lm_head_norm_module_name: s
         fuse_ln_linear(
                 layer.post_attention_layernorm, [layer.mlp.gate]
             )
-        for i in range(128):
+        for i in range(layer.mlp.n_routed_experts):
             fuse_ln_linear(
                 layer.post_attention_layernorm, [layer.mlp.experts[i].gate_proj, layer.mlp.experts[i].up_proj]
+            )
+        if hasattr(layer.mlp, 'shared_experts'):
+            fuse_ln_linear(
+                layer.post_attention_layernorm, [layer.mlp.shared_experts.gate_proj, layer.mlp.shared_experts.up_proj]
             )
         fuse_ln_linear(
             layer.input_layernorm,
@@ -378,9 +382,12 @@ def rotate_mlp_input_qwen3_vl(layer, Q, device):
 def rotate_mlp_input_moe(layer, Q, device):
     # Rotate the MLP input weights.
     mlp_inputs = [layer.mlp.gate]
-    for i in range(128):
+    for i in range(layer.mlp.n_routed_experts):
         mlp_inputs.append(layer.mlp.experts[i].gate_proj)
         mlp_inputs.append(layer.mlp.experts[i].up_proj)
+    if hasattr(layer.mlp, 'shared_experts'):
+        mlp_inputs.append(layer.mlp.shared_experts.gate_proj)
+        mlp_inputs.append(layer.mlp.shared_experts.up_proj)
     for W in mlp_inputs:
         dtype = W.weight.dtype
         W_ = W.weight.data.to(device=device, dtype=torch.float64)
@@ -413,7 +420,7 @@ def rotate_mlp_output_qwen3_vl(layer, Q, device):
 
 def rotate_mlp_output_moe(layer, Q, device):
     # Rotate the MLP output weights and bias.
-    for i in range(128):
+    for i in range(layer.mlp.n_routed_experts):
         W = layer.mlp.experts[i].down_proj
         dtype = W.weight.data.dtype
         W_ = W.weight.data.to(device=device, dtype=torch.float64)
@@ -422,7 +429,15 @@ def rotate_mlp_output_moe(layer, Q, device):
         if W.bias is not None:
             b = W.bias.data.to(device=device, dtype=torch.float64)
             W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
-
+    if hasattr(layer.mlp, 'shared_experts'):
+        W = layer.mlp.shared_experts.down_proj
+        dtype = W.weight.data.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+        # apply_exact_had_to_linear(W, had_dim=-1, output=False) #apply exact (inverse) hadamard on the weights of mlp output
+        if W.bias is not None:
+            b = W.bias.data.to(device=device, dtype=torch.float64)
+            W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
 
 def rotate_head(model, Q, device, lm_head_name) -> None:
     # Rotate the head.
@@ -601,3 +616,256 @@ def rotate_vision_model_qwen3_vl(model: PreTrainedModel, rotate_mode: str, devic
         rotate_mlp_output_qwen3_vl(layer, Q, device)
     rotate_visual_merger_qwen3_vl(model, Q, device)
     return model, Q
+
+
+# ============================================================================
+# GLM4 MoE Lite (MLA attention) rotation functions
+# ============================================================================
+
+def fuse_layer_norms_mla_with_moe(model: PreTrainedModel, pre_lm_head_norm_module_name: str, layers_node: str, lm_head_name: str):
+    """
+    Fuse layer norms for GLM4 MoE Lite model.
+    
+    GLM4 MoE Lite uses MLA (Multi-head Latent Attention) with two-stage projections:
+    - First stage (takes hidden states): q_a_proj, kv_a_proj_with_mqa (or kv_a_proj_latent, kv_a_proj_rope after fusion)
+    - Second stage (takes intermediate): q_b_proj, kv_b_proj (or q_rope_proj, q_absorbed_proj after fusion)
+    
+    We only fuse layernorm into first-stage projections that take hidden states directly.
+    MoE: shared_experts (gate_proj, up_proj, down_proj) 
+    """
+    layers, _ = get_module_by_name_prefix(model, layers_node)
+    
+    for layer in layers:
+        if hasattr(layer.mlp, 'experts'):
+            # Fuse post_attention_layernorm into MLP inputs (shared_experts)
+            fuse_ln_linear(
+                    layer.post_attention_layernorm, [layer.mlp.gate]
+                )
+            for i in range(layer.mlp.n_routed_experts):
+                fuse_ln_linear(
+                    layer.post_attention_layernorm, [layer.mlp.experts.gate_proj[i], layer.mlp.experts.up_proj[i]]
+                )
+            if hasattr(layer.mlp, 'shared_experts'):
+                fuse_ln_linear(
+                    layer.post_attention_layernorm, [layer.mlp.shared_experts.gate_proj, layer.mlp.shared_experts.up_proj]
+                )
+        else:
+            # Fuse post_attention_layernorm into MLP inputs (shared_experts)
+            fuse_ln_linear(
+                    layer.post_attention_layernorm, [layer.mlp.up_proj, layer.mlp.gate_proj]
+                )
+        # Fuse input_layernorm into first-stage attention MLA projections ONLY
+        # These are the projections that take hidden_states (dim=2048) as input
+        attn = layer.self_attn
+        attn_inputs = []
+        
+        # First-stage Q projection (takes hidden_states -> q_lora_rank)
+        if hasattr(attn, 'q_a_proj'):
+            attn_inputs.append(attn.q_a_proj)
+        
+        # First-stage KV projections (takes hidden_states)
+        # if hasattr(attn, 'kv_a_proj_latent'):
+        #     attn_inputs.append(attn.kv_a_proj_latent)
+        # if hasattr(attn, 'kv_a_proj_rope'):
+        #     attn_inputs.append(attn.kv_a_proj_rope)
+        # Before MLA fusion: kv_a_proj_with_mqa takes hidden_states
+        if hasattr(attn, 'kv_a_proj_with_mqa'):
+            attn_inputs.append(attn.kv_a_proj_with_mqa)
+        
+        # NOTE: Do NOT include q_b_proj, q_rope_proj, q_absorbed_proj, kv_b_proj
+        # These take intermediate representations (from q_a_proj or kv_a_proj), not hidden_states
+            
+        if attn_inputs:
+            fuse_ln_linear(layer.input_layernorm, attn_inputs)
+
+        # Fuse q_a_layernorm into q_b_proj
+        if hasattr(attn, 'q_a_layernorm'):
+            fuse_ln_linear(attn.q_a_layernorm, [attn.q_b_proj])
+        
+        # Fuse kv_a_layernorm into kv_b_proj
+        if hasattr(attn, 'kv_a_layernorm'):
+            fuse_ln_linear(attn.kv_a_layernorm, [attn.kv_b_proj])
+        
+        reset_ln(layer.post_attention_layernorm)
+        reset_ln(layer.input_layernorm)
+        reset_ln(attn.q_a_layernorm)
+        reset_ln(attn.kv_a_layernorm)
+    
+    # Fuse pre-head layernorm into lm_head
+    pre_head_layernorm, _ = get_module_by_name_prefix(model, pre_lm_head_norm_module_name)
+    lm_head, _ = get_module_by_name_prefix(model, lm_head_name)
+    
+    fuse_ln_linear(pre_head_layernorm, [lm_head])
+    reset_ln(pre_head_layernorm)
+    return model
+
+
+def rotate_attention_inputs_mla(layer, Q, device) -> None:
+    """
+    Rotate MLA attention input projections.
+    
+    After MLA fusion, the attention has:
+    - q_a_proj: first stage Q projection (optional, if q_lora_rank is set)
+    - q_rope_proj: Q projection for RoPE part
+    - q_absorbed_proj: Q projection with absorbed K (for content attention)
+    - kv_a_proj_latent: KV first stage projection for latent
+    - kv_a_proj_rope: KV first stage projection for RoPE
+    """
+    attn = layer.self_attn
+    
+    # Collect all attention input projections that exist
+    projections = []
+    if hasattr(attn, 'q_a_proj'):
+        projections.append(attn.q_a_proj)
+    # if hasattr(attn, 'kv_a_proj_latent'):
+    #     projections.append(attn.kv_a_proj_latent)
+    # if hasattr(attn, 'kv_a_proj_rope'):
+    #     projections.append(attn.kv_a_proj_rope)
+    # Fallback for before fusion
+    if hasattr(attn, 'kv_a_proj_with_mqa'):
+        projections.append(attn.kv_a_proj_with_mqa)
+        
+    for W in projections:
+        dtype = W.weight.dtype
+        W_ = W.weight.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+
+def rotate_attention_output_mla(layer, Q, device) -> None:
+    """
+    Rotate MLA attention output projection (o_proj).
+    """
+    W = layer.self_attn.o_proj
+    dtype = W.weight.data.dtype
+    W_ = W.weight.data.to(device=device, dtype=torch.float64)
+    W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+    if W.bias is not None:
+        b = W.bias.data.to(device=device, dtype=torch.float64)
+        W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+def rotate_q_low_rank_mla(layer, Q, device) -> None:
+    """
+    Rotate MLA low rank projection (q_a_proj, q_b_proj).
+    """
+    q_a_proj = layer.self_attn.q_a_proj
+    q_b_proj = layer.self_attn.q_b_proj
+    apply_exact_had_to_linear(q_a_proj, had_dim=-1, output=True)
+    apply_exact_had_to_linear(q_b_proj, had_dim=-1, output=False)
+
+def rotate_kv_low_rank_mla(layer, Q, device) -> None:
+    # kv 部分的lowrank的旋转，需要将kv_a_proj_with_mqa的权重拆分成latent和rope两个部分，然后分别进行旋转
+    kv_a_proj_with_mqa = layer.self_attn.kv_a_proj_with_mqa
+    kv_b_proj = layer.self_attn.kv_b_proj
+    W_kv_a = kv_a_proj_with_mqa.weight.data
+    W_kv_b = kv_b_proj.weight.data
+    
+    # latent部分是前kv_lora_rank行，不是后kv_lora_rank行
+    # kv_a_proj_with_mqa输出: [kv_lora_rank + qk_rope_head_dim, hidden_size]
+    # split后: k_pass (latent) = [:kv_lora_rank], k_rot (rope) = [kv_lora_rank:]
+    kv_lora_rank = layer.self_attn.kv_lora_rank
+    W_kv_a_latent = W_kv_a[:kv_lora_rank, :]  # 修复索引：前kv_lora_rank行
+    dtype = W_kv_a_latent.dtype
+
+    # 对于输出维度的旋转，权重变换为 Q.T @ W (在输出维度上左乘)
+    # 但这里W是[out, in]，所以变换后 W_new = Q.T @ W
+    W_kv_a_latent = W_kv_a_latent.to(device=device, dtype=torch.float64)
+    W_kv_a_latent = torch.matmul(Q.T, W_kv_a_latent).to(device="cpu", dtype=dtype)
+    
+    # bias也需要在前kv_lora_rank维度上旋转（如果存在）
+    if kv_a_proj_with_mqa.bias is not None:
+        b = kv_a_proj_with_mqa.bias.data[:kv_lora_rank].to(device=device, dtype=torch.float64)
+        kv_a_proj_with_mqa.bias.data[:kv_lora_rank] = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+    # kv_b_proj输入维度旋转: W @ Q
+    dtype = W_kv_b.dtype
+    W_kv_b = W_kv_b.to(device=device, dtype=torch.float64)
+    W_kv_b = torch.matmul(W_kv_b, Q).to(device="cpu", dtype=dtype)
+
+    kv_a_proj_with_mqa.weight.data[:kv_lora_rank, :] = W_kv_a_latent  # 修复索引
+    kv_b_proj.weight.data = W_kv_b
+
+def rotate_glm4_moe_lite_mlp_input_moe(layer, Q, device):
+    # Rotate the MLP input weights.
+    mlp_inputs = [layer.mlp.gate]
+    for i in range(layer.mlp.n_routed_experts):
+        mlp_inputs.append(layer.mlp.experts.gate_proj[i])
+        mlp_inputs.append(layer.mlp.experts.up_proj[i])
+    if hasattr(layer.mlp, 'shared_experts'):
+        mlp_inputs.append(layer.mlp.shared_experts.gate_proj)
+        mlp_inputs.append(layer.mlp.shared_experts.up_proj)
+    for W in mlp_inputs:
+        dtype = W.weight.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+def rotate_glm4_moe_lite_mlp_output_moe(layer, Q, device):
+    # Rotate the MLP output weights and bias.
+    for i in range(layer.mlp.n_routed_experts):
+        W = layer.mlp.experts.down_proj[i]
+        dtype = W.weight.data.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+        # apply_exact_had_to_linear(W, had_dim=-1, output=False) #apply exact (inverse) hadamard on the weights of mlp output
+        if W.bias is not None:
+            b = W.bias.data.to(device=device, dtype=torch.float64)
+            W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+    if hasattr(layer.mlp, 'shared_experts'):
+        W = layer.mlp.shared_experts.down_proj
+        dtype = W.weight.data.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+        # apply_exact_had_to_linear(W, had_dim=-1, output=False) #apply exact (inverse) hadamard on the weights of mlp output
+        if W.bias is not None:
+            b = W.bias.data.to(device=device, dtype=torch.float64)
+            W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+@torch.inference_mode()
+def rotate_model_glm4_moe_lite(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
+                               layers_node: str, Q=None):
+    """
+    Rotate GLM4 MoE Lite model weights for improved quantization.
+    
+    This function handles the MLA attention structure and MoE architecture.
+    It calls the model's internal `_setup` method to perform fusion and rotation.
+    """
+    Q_block = (
+        get_orthogonal_matrix(
+            model.config.hidden_size, rotate_mode, device
+        )
+        if Q is None
+        else Q
+    )
+
+    # 修复：Q_q_lowrank应该是q_lora_rank维度，不是hidden_size
+    Q_q_lowrank = (
+        get_orthogonal_matrix(
+            model.config.q_lora_rank, rotate_mode, device  # 修复：使用q_lora_rank
+        )
+
+    )
+
+    Q_kv_lowrank = (
+        get_orthogonal_matrix(
+            model.config.kv_lora_rank, rotate_mode, device
+        )
+
+    )
+    
+    rotate_embeddings(model, Q_block, device)
+    rotate_head(model, Q_block, device, lm_head_name)
+    torch_empty_cache()
+    
+    layers, _ = get_module_by_name_prefix(model, layers_node)
+    for idx, layer in enumerate(log.pb(layers).title("Rotating GLM4 MoE Lite")):
+        rotate_attention_inputs_mla(layer, Q_block, device)
+        rotate_attention_output_mla(layer, Q_block, device)
+        rotate_q_low_rank_mla(layer, Q_q_lowrank, device)
+        rotate_kv_low_rank_mla(layer, Q_kv_lowrank, device)
+        if hasattr(layer.mlp, 'experts'):
+            rotate_glm4_moe_lite_mlp_input_moe(layer, Q_block, device)
+            rotate_glm4_moe_lite_mlp_output_moe(layer, Q_block, device)
+        else:
+            rotate_mlp_input(layer, Q_block, device)
+            rotate_mlp_output(layer, Q_block, device)
+    
+    return model, Q_block  # 修复：返回Q_block而不是Q
