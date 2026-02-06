@@ -479,7 +479,7 @@ def rotate_model(model: PreTrainedModel, rotate_mode: str, device: torch.device,
         rotate_attention_output(layer, Q, device)
         rotate_mlp_input(layer, Q, device)
         rotate_mlp_output(layer, Q, device)
-        # rotate_ov_proj(layer, num_heads, head_dim)
+        rotate_ov_proj(layer, num_heads, head_dim)
     return model, Q
 
 
@@ -547,6 +547,10 @@ def rotate_model_moe(model: PreTrainedModel, rotate_mode: str, device: torch.dev
         if Q is None
         else Q
     )
+    config = model.config
+    num_heads = config.num_attention_heads
+    model_dim = config.hidden_size
+    head_dim = model_dim // num_heads
 
     rotate_embeddings(model, Q, device)
     rotate_head(model, Q, device, lm_head_name)
@@ -557,7 +561,7 @@ def rotate_model_moe(model: PreTrainedModel, rotate_mode: str, device: torch.dev
         rotate_attention_output(layer, Q, device)
         rotate_mlp_input_moe(layer, Q, device)
         rotate_mlp_output_moe(layer, Q, device)
-        # rotate_ov_proj(layer, num_heads, head_dim)
+        rotate_ov_proj(layer, num_heads, head_dim)
     return model, Q
 
 

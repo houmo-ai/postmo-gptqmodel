@@ -318,45 +318,64 @@ class MLA(nn.Module):
         return self
 
 
-@use_kernel_forward_from_hub("MegaGlm4MoeLiteNaiveMoeNew")
+@use_kernel_forward_from_hub("MegaGlm4MoeLiteNaiveMoe")
 class Glm4MoeLiteNaiveMoeNew(nn.Module):
-    def __init__(self, config, ori_attention: Glm4MoeLiteNaiveMoe | None = None):
+    def __init__(self, config, ori_moe: Glm4MoeLiteNaiveMoe | None = None):
         super().__init__()
         self.config = config
 
-        # 从原始 attention 上拷贝必要属性
-        for attr in [
-            "num_experts",
-            "hidden_dim",
-            "intermediate_dim",
-        ]:
-            if hasattr(ori_attention, attr):
-                setattr(self, attr, getattr(ori_attention, attr))
+        # 从原始 attention 上拷贝必要属性，或从 config 中获取
+        if ori_moe is not None:
+            for attr in [
+                "num_experts",
+                "hidden_dim",
+                "intermediate_dim",
+            ]:
+                if hasattr(ori_moe, attr):
+                    setattr(self, attr, getattr(ori_moe, attr))
+        else:
+            # 从配置中获取属性（加载量化模型时）
+            self.num_experts = config.n_routed_experts
+            self.hidden_dim = config.hidden_size
+            self.intermediate_dim = config.moe_intermediate_size
 
-        self._setup(config, ori_attention)
+        self._setup(config, ori_moe)
 
     def _setup(self, cfg=None, ori_moe: Glm4MoeLiteNaiveMoe | None = None):
-        if ori_moe is None:
-            raise ValueError("ori_moe cannot be None")
+        if ori_moe is not None:
+            # 从原始 MoE 转换（量化时）
+            dtype = ori_moe.down_proj.dtype
+            device = ori_moe.down_proj.device
+            self.act_fn = ori_moe.act_fn
+        else:
+            # 从配置直接创建（加载量化模型时）
+            # 权重会在后续加载量化权重时被填充
+            dtype = torch.float32
+            device = "cpu"
+            self.act_fn = nn.SiLU()
         
-        dtype = ori_moe.down_proj.dtype
-        device = ori_moe.down_proj.device
-        self.act_fn = ori_moe.act_fn
         self.gate_proj = nn.ModuleList([])
         self.up_proj = nn.ModuleList([])
         self.down_proj = nn.ModuleList([])
         
         with torch.no_grad():
             for i in range(self.num_experts):
-                gate_up = ori_moe.gate_up_proj[i]  # [2*I, H]
-                mid_idx = gate_up.shape[0] // 2
-                
-                # gate_up_proj 拆分 (不转置)
-                gate_weight = gate_up[:mid_idx, :].contiguous()  # [I, H]
-                up_weight = gate_up[mid_idx:, :].contiguous()    # [I, H]
-                
-                # down_proj 也不转置! 原始就是 [H, I]
-                down_weight = ori_moe.down_proj[i].contiguous()  # [H, I] ✅ 保持原样
+                if ori_moe is not None:
+                    # 从原始 MoE 转换
+                    gate_up = ori_moe.gate_up_proj[i]  # [2*I, H]
+                    mid_idx = gate_up.shape[0] // 2
+                    
+                    # gate_up_proj 拆分 (不转置)
+                    gate_weight = gate_up[:mid_idx, :].contiguous()  # [I, H]
+                    up_weight = gate_up[mid_idx:, :].contiguous()    # [I, H]
+                    
+                    # down_proj 也不转置! 原始就是 [H, I]
+                    down_weight = ori_moe.down_proj[i].contiguous()  # [H, I] ✅ 保持原样
+                else:
+                    # 创建空的 Linear 层，权重会在加载量化权重时被填充
+                    gate_weight = torch.empty(self.intermediate_dim, self.hidden_dim, dtype=dtype, device=device)
+                    up_weight = torch.empty(self.intermediate_dim, self.hidden_dim, dtype=dtype, device=device)
+                    down_weight = torch.empty(self.hidden_dim, self.intermediate_dim, dtype=dtype, device=device)
                 
                 # 创建 Linear 层
                 self.gate_proj.append(nn.Linear(self.hidden_dim, self.intermediate_dim, bias=False))
@@ -423,7 +442,7 @@ def convert_glm4_moe_lite_convert(module, config):
     for name, sub_module in to_replace:
         parent_name, _, child_name = name.rpartition(".")
         parent = module.get_submodule(parent_name) if parent_name else module
-        new_module = Glm4MoeLiteNaiveMoeNew(config=config, ori_attention=sub_module)
+        new_module = Glm4MoeLiteNaiveMoeNew(config=config, ori_moe=sub_module)
         setattr(parent, child_name, new_module)
     torch.cuda.empty_cache()
     return module
@@ -479,6 +498,12 @@ class Glm4MoeLiteQModel(BaseQModel):
         }
     ]
     
+    def before_model_load(self, load_quantized_model=False):
+        if load_quantized_model:
+            import transformers.models.glm4_moe_lite.modeling_glm4_moe_lite as glm4_moe_lite_modeling
+
+            glm4_moe_lite_modeling.Glm4MoeLiteNaiveMoe = Glm4MoeLiteNaiveMoeNew
+
     def pre_quantize_generate_hook_start(self):
         """
         Before quantization, fuse MLA weights for efficient inference.
@@ -487,10 +512,18 @@ class Glm4MoeLiteQModel(BaseQModel):
         2. Absorbs kv_b_proj into q and o projections
         """
         super().pre_quantize_generate_hook_start()
-        
+
         pass
 
     def after_model_load(self, model, load_quantized_model):
         self.model = super().after_model_load(model, load_quantized_model)
-        self.model = convert_glm4_moe_lite_convert(self.model, self.config)
+        
+        # 只在首次加载未量化模型时执行MoE结构转换
+        # 加载量化模型时，由于 before_model_load 已经进行了 monkey patch，
+        # from_config 创建的模型已经是 Glm4MoeLiteNaiveMoeNew 结构
+        if not load_quantized_model:
+            self.model = convert_glm4_moe_lite_convert(self.model, self.config)
+        
         return self.model
+    
+    

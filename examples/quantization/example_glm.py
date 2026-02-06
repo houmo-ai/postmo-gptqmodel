@@ -24,7 +24,7 @@ def build_calib_dataset(tokenizer, nsamples: int = 128, seqlen: int = 2048):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="/data02/datasets/GLM-4.7-Flash", help="HF 模型 ID 或本地路径，例如 mistralai/GptOss-8x7B-v0.1")
-    parser.add_argument("--out", type=str, default="output/gpt-oss-20b-4bit-64g", help="量化模型的保存目录")
+    parser.add_argument("--out", type=str, default="output/GLM-4.7-Flash-4bit-64g", help="量化模型的保存目录")
     parser.add_argument("--bits", type=int, default=4)
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -60,7 +60,7 @@ def main():
 
     # 简单推理验证
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    model = GPTQModel.load(save_dir, device=device, trust_remote_code=True)
+    # model = GPTQModel.load(save_dir, device=device, trust_remote_code=True)
     prompt = "GLM-4.7-Flash is"
     print(tokenizer.decode(model.generate(**tokenizer(prompt, return_tensors="pt").to(device))[0]))
 

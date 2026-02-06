@@ -288,13 +288,14 @@ class MarlinQuantLinear(BaseQuantLinear):
             return torch.empty((0, self.out_features), dtype=x.dtype, device=x.device)
 
         # make sure scales is synced with x/input
-        if x.dtype != self.scales.dtype:
-            self.scales = self.scales.to(dtype=x.dtype)
+        scales = self.scales
+        if x.dtype != scales.dtype:
+            scales = scales.to(dtype=x.dtype)
 
         out = apply_gptq_marlin_linear(
             input=x.contiguous() if self.is_lm_head else x,
             weight=self.qweight,
-            weight_scale=self.scales,
+            weight_scale=scales,
             weight_zp=self.qzeros,
             g_idx=self.g_idx,
             g_idx_sort_indices=self.g_idx_sort_indices,
