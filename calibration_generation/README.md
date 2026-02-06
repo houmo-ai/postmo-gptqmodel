@@ -1,0 +1,152 @@
+# 校准集生成
+
+## 面向dense的校准集生成
+> 待补充
+
+## 面向MOE的校准集生成
+使用说明：以qwen3-30b-a3b为例：
+
+```
+python calibration_generation/qwen3_moe_gen.py \ 
+    --model_path /moe/model/path \  # 模型地址
+    --num_beams 4 \ # 束宽，一般4足够
+    --seqlen 512 \  # 句子长度
+    --nsamples 100 \  # 生成多少条句子 
+    --gen_dir gen_data # 生成目录名
+
+```
+当前qwen3-moe的一系列it模型都可以直接使用上述脚本生成
+
+### 开发方法
+
+以qwen3-30b-a3b为例，环境为transformers==4.57.0
+
+以monkey-patch的方式将原来库里的utils中beam search方法替换:
+
+```
+from custom_ebss import _beam_search_ebss
+GenerationMixin._beam_search = _beam_search_ebss
+```
+在生成时会自动进入_beam_search_ebss进行生成
+
+#### model改造，对moe模型加入专家统计的属性
+
+在EBSS_models中，将moe模型的sparseblock部分重新定制
+```
+class Qwen3MoeSparseMoeBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
+
+        # gating
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [Qwen3MoeMLP(config, intermediate_size=config.moe_intermediate_size) for _ in range(self.num_experts)]
+        )
+        # experts状态初始化
+        self.save_expert_cnt = False
+        self.top_cnt = torch.zeros(NUM_BEAMS,self.num_experts) 
+
+    # 清空当前专家统计
+    def clear_expert_cnt(self):
+        self.top_cnt = torch.zeros(NUM_BEAMS,self.num_experts)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """ """
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        # router_logits: (batch * sequence_length, n_experts)
+        router_logits = self.gate(hidden_states)
+
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        # 进行当前token的专家频次统计
+        if self.save_expert_cnt:
+            for m in range(selected_experts.shape[0]):
+                idx = m//sequence_length
+                for n in range(self.top_k):
+                    self.top_cnt[idx,selected_experts[m,n]] = self.top_cnt[idx,selected_experts[m,n]]+1
+        if self.norm_topk_prob:  # only diff with mixtral sparse moe block!
+            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        ...
+```
+#### beam search改造，生成过程加入专家得分影响
+
+在beam search进行前打开统计状态，在预测完一次后，立刻更新当前统计矩阵
+```
+# init expert cnt
+num_layers = self.model.config.num_hidden_layers
+num_experts = self.model.config.num_experts
+expert_cnt = torch.zeros(num_layers,num_beams,num_experts)
+for layer_num in range(0,num_layers):
+self.model.layers[layer_num].mlp.save_expert_cnt=True
+# 4. run the generation loop
+while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
+# a. Forward current tokens, obtain the logits
+flat_running_sequences = self._flatten_beam_dim(running_sequences[:, :, :cur_len])
+model_inputs = self.prepare_inputs_for_generation(flat_running_sequences, **model_kwargs)
+model_outputs = self(**model_inputs, return_dict=True)
+for layer_num in range(0,num_layers):
+    expert_dist = self.model.layers[layer_num].mlp.top_cnt
+    # expert_dist = top_cnt.sum(dim=0)#,keepdim=True)
+    expert_cnt[layer_num] += expert_dist
+layer_vars = torch.var(expert_cnt, dim=-1)
+expert_scores = torch.mean(layer_vars, dim=0)
+expert_scores = expert_scores/(expert_scores.sum())
+
+# synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
+model_kwargs = self._update_model_kwargs_for_generation(
+    model_outputs,
+    model_kwargs,
+    is_encoder_decoder=self.config.is_encoder_decoder,
+)
+if synced_gpus and this_peer_finished:
+    continue
+    ...
+```
+
+在专家得分确认后，融入当前beam的分中，同时记得清空当前模型中当前token对应的专家统计，保留总的专家统计expert_cnt
+```
+...
+log_probs = self._unflatten_beam_dim(log_probs, batch_size, num_beams)
+running_beam_scores[:, :, None] = running_beam_scores[:, :, None] * torch.exp(-expert_scores).unsqueeze(0).unsqueeze(-1).to(log_probs.device)
+log_probs = log_probs + running_beam_scores[:, :, None]
+# log_probs = log_probs * torch.exp(-expert_scores).unsqueeze(0).unsqueeze(-1).to(log_probs.device)
+log_probs = torch.reshape(log_probs, (batch_size, num_beams * vocab_size))
+
+for layer_num in range(0,num_layers):
+    self.model.layers[layer_num].mlp.clear_expert_cnt()
+...
+```
+
+在最后，因为beam search会进行句子重排，对应累积的expert_cnt也需要跟着kv cache一起根据beam_idx进行重排：
+```
+if model_kwargs.get("past_key_values", None) is not None:
+    beam_idx = self._flatten_beam_dim(running_beam_indices[..., cur_len - decoder_prompt_len])
+    if hasattr(self, "_reorder_cache"):
+        model_kwargs["past_key_values"] = self._reorder_cache(model_kwargs["past_key_values"], beam_idx)
+    else:
+        model_kwargs["past_key_values"].reorder_cache(beam_idx)
+    expert_cnt = expert_cnt.index_select(1, beam_idx.cpu())
+```
+整条句子预测后，关掉统计状态：
+```
+sequences = self._flatten_beam_dim(sequences[:, :num_return_sequences, :])
+beam_scores = self._flatten_beam_dim(beam_scores[:, :num_return_sequences])
+beam_indices = self._flatten_beam_dim(beam_indices[:, :num_return_sequences, :])
+# Crop the static-shaped tensors to the actual size.
+# `beam_indices` is initialized with -1s, and is updated with the beam index of the generated token at each
+# step. We can use it to detect the generated length, which may be != `cur_len`  (e.g. selected beam is from a
+# previous decoding iteration)
+for layer_num in range(0,num_layers):
+    self.model.layers[layer_num].mlp.save_expert_cnt=False
+max_generated_length = ((beam_indices + 1).bool()).sum(dim=1).max()
+output_length = decoder_prompt_len + max_generated_length
+sequences = sequences[:, :output_length]
+```
+
+
+
+
