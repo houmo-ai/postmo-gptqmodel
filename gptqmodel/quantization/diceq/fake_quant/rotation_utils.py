@@ -1,0 +1,662 @@
+import model_utils
+import torch
+import typing
+import utils
+import transformers
+import torch.nn as nn
+import tqdm
+import math
+import logging
+import quant_utils
+from hadamard_utils import random_hadamard_matrix, apply_exact_had_to_linear, is_pow2
+from fast_hadamard_transform import hadamard_transform
+
+
+def fuse_ln_linear(layernorm: torch.nn.Module, linear_layers: typing.Iterable[torch.nn.Linear]) -> None:
+    """
+    fuse the linear operations in Layernorm into the adjacent linear blocks.
+    """
+    for linear in linear_layers:
+        linear_dtype = linear.weight.dtype
+
+        # Calculating new weight and bias
+        W_ = linear.weight.data.double()
+        linear.weight.data = (W_ * layernorm.weight.double()).to(linear_dtype)
+
+        if hasattr(layernorm, 'bias'):
+            if linear.bias is None:
+                linear.bias = torch.nn.Parameter(torch.zeros(linear.out_features, dtype=torch.float64))
+            linear.bias.data = linear.bias.data.double() + torch.matmul(W_, layernorm.bias.double())
+            linear.bias.data = linear.bias.data.to(linear_dtype)
+
+
+def bake_mean_into_linear(linear: torch.nn.Linear) -> None:
+    """
+    This function takes a linear layer and subtracts the means from the
+    weights and biases. This will result in the linear layer performing
+    the mean substitution which is usually done inside layernorm.
+    """
+    linear_dtype = linear.weight.dtype
+    W_ = linear.weight.data.double()
+    linear.weight.data = W_ - W_.mean(dim=-2, keepdim=True)
+    linear.weight.data = linear.weight.data.to(linear_dtype)
+    if linear.bias is not None:
+        b_ = linear.bias.data.double()
+        linear.bias.data = b_ - b_.mean()
+        linear.bias.data = linear.bias.data.to(linear_dtype)
+
+
+def fuse_layer_norms(model):
+
+    model_type = model_utils.get_model_type(model)
+
+    kwargs = {'model': model, 'model_type': model_type}
+
+    # Embedding fusion
+    for W in model_utils.get_embeddings(**kwargs):
+        W_ = W.weight.data.double()
+        W.weight.data = (W_ - W_.mean(dim=-1, keepdim=True)).to(W.weight.data.dtype)
+
+    layers = model_utils.get_transformer_layers(**kwargs)
+
+    # Fuse the linear operations in Layernorm into the adjacent linear blocks.
+    for layer in layers:
+
+        # fuse the input layernorms into the linear layers
+        if model_type == model_utils.LLAMA_MODEL:
+            fuse_ln_linear(layer.post_attention_layernorm, [layer.mlp.up_proj, layer.mlp.gate_proj])
+            fuse_ln_linear(layer.input_layernorm, [layer.self_attn.q_proj,
+                           layer.self_attn.k_proj, layer.self_attn.v_proj])
+        elif model_type == model_utils.OPT_MODEL:
+            fuse_ln_linear(
+                layer.self_attn_layer_norm, [
+                    layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj])
+            fuse_ln_linear(layer.final_layer_norm, [layer.fc1])
+        else:
+            raise ValueError(f'Unknown model type {model_type}')
+
+        if model_type == model_utils.OPT_MODEL:
+            bake_mean_into_linear(layer.self_attn.out_proj)
+            bake_mean_into_linear(layer.fc2)
+
+    fuse_ln_linear(model_utils.get_pre_head_layernorm(**kwargs), [model_utils.get_lm_head(**kwargs)])
+
+    model_utils.replace_modules(
+        model,
+        transformers.models.llama.modeling_llama.LlamaRMSNorm if model_type == model_utils.LLAMA_MODEL else torch.nn.LayerNorm,
+        lambda _: model_utils.RMSN(model.config.hidden_size),
+        replace_layers=False,
+    )
+
+
+def random_orthogonal_matrix(size, device):
+    """
+    Generate a random orthogonal matrix of the specified size.
+    First, we generate a random matrix with entries from a standard distribution.
+    Then, we use QR decomposition to obtain an orthogonal matrix.
+    Finally, we multiply by a diagonal matrix with diag r to adjust the signs.
+
+    Args:
+    size (int): The size of the matrix (size x size).
+
+    Returns:
+    torch.Tensor: An orthogonal matrix of the specified size.
+    """
+    torch.cuda.empty_cache()
+    random_matrix = torch.randn(size, size, dtype=torch.float64).to(device)
+    q, r = torch.linalg.qr(random_matrix)
+    q *= torch.sign(torch.diag(r)).unsqueeze(0)
+    return q
+
+
+def get_orthogonal_matrix(size, mode, device=utils.DEV):
+    if mode == 'random':
+        return random_orthogonal_matrix(size, device)
+    elif mode == 'hadamard':
+        return random_hadamard_matrix(size, device)
+    elif mode == 'identity':
+        return torch.eye(size, dtype=torch.float64, device=device)
+    else:
+        raise ValueError(f'Unknown mode {mode}')
+
+
+def get_decompose_dim(n):
+    a = int(n ** 0.5)
+    if a * a < n:
+        a += 1
+    while True:
+        tmp = a * a - n
+        b = int(tmp ** 0.5)
+        if b * b == tmp:
+            break
+        a += 1
+    return a - b, a + b
+
+
+def apply_kron_right(x: torch.Tensor, r1: torch.Tensor, r2: torch.Tensor) -> torch.Tensor:
+    """
+    Right-multiply x by kron(r1, r2) without materializing the full matrix.
+    x is treated as (..., n1*n2) in row-major order.
+    """
+    n1 = r1.shape[0]
+    n2 = r2.shape[0]
+    if x.shape[-1] != n1 * n2:
+        raise ValueError(f'Invalid kron shape: x.shape[-1]={x.shape[-1]} but n1*n2={n1*n2}')
+    orig_shape = x.shape
+    orig_dtype = x.dtype
+    x = x.reshape(-1, n1, n2).float()
+    x = torch.einsum('ij,bjk->bik', r1.T.float(), x)
+    x = torch.einsum('bij,jk->bik', x, r2.float())
+    return x.reshape(orig_shape).to(orig_dtype)
+
+
+def inv_transpose(mat: torch.Tensor, eps: float = 0.0) -> torch.Tensor:
+    n = mat.shape[0]
+    eye = torch.eye(n, device=mat.device, dtype=mat.dtype)
+    if eps != 0.0:
+        mat = mat + eps * eye
+    # (mat.T)^{-1} = mat^{-T}
+    return torch.linalg.solve(mat.T, eye)
+
+
+def register_kron_buffers(module, r1: torch.Tensor, r2: torch.Tensor) -> None:
+    r1_cpu = r1.detach().to(device='cpu', dtype=torch.float32)
+    r2_cpu = r2.detach().to(device='cpu', dtype=torch.float32)
+    if not hasattr(module, 'kron_r1'):
+        module.register_buffer('kron_r1', r1_cpu)
+        module.register_buffer('kron_r2', r2_cpu)
+    else:
+        module.kron_r1 = r1_cpu
+        module.kron_r2 = r2_cpu
+
+
+def rotate_embeddings(model, Q: torch.Tensor) -> None:
+    # Rotate the embeddings.
+    model_type = model_utils.model_type_extractor(model)
+    for W in model_utils.get_embeddings(model, model_type):
+        dtype = W.weight.data.dtype
+        W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+
+def rotate_attention_inputs(layer, Q, model_type, local_kron=None) -> None:
+    # Rotate the WQ, WK and WV matrices of the self-attention layer.
+    for W in [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj]:
+        dtype = W.weight.dtype
+        W_ = W.weight.to(device=utils.DEV, dtype=torch.float64)
+        W_ = torch.matmul(W_, Q)
+        if local_kron is not None:
+            W_ = apply_kron_right(W_, local_kron[0], local_kron[1])
+        W.weight.data = W_.to(device="cpu", dtype=dtype)
+
+
+def rotate_attention_output(layer, Q, model_type) -> None:
+    # Rotate output matrix of the self-attention layer.
+    if model_type == model_utils.LLAMA_MODEL:
+        W = layer.self_attn.o_proj
+    elif model_type == model_utils.OPT_MODEL:
+        W = layer.self_attn.out_proj
+    else:
+        raise ValueError(f'Unknown model type {model_type}')
+
+    dtype = W.weight.data.dtype
+    W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
+    W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+    if W.bias is not None:
+        b = W.bias.data.to(device=utils.DEV, dtype=torch.float64)
+        W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+
+def rotate_mlp_input(layer, Q, model_type, l_id, smooth, local_kron=None):
+    # Rotate the MLP input weights.
+    if model_type == model_utils.LLAMA_MODEL:
+        mlp_inputs = [layer.mlp.up_proj, layer.mlp.gate_proj]
+    elif model_type == model_utils.OPT_MODEL:
+        mlp_inputs = [layer.fc1]
+    else:
+        raise ValueError(f'Unknown model type {model_type}')
+    for W in mlp_inputs:
+        dtype = W.weight.dtype
+        W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
+        W_ = torch.matmul(W_, Q)
+        if local_kron is not None:
+            W_ = apply_kron_right(W_, local_kron[0], local_kron[1])
+        W.weight.data = W_.to(device="cpu", dtype=dtype)
+
+    if smooth is not None:
+        up_proj = layer.mlp.up_proj.to(device=utils.DEV, dtype=torch.float64)
+        down_smooth = smooth[f'model.layers.{l_id}.mlp.down_smooth'].to(device=utils.DEV, dtype=torch.float64)
+        up_proj.weight.data = torch.div(up_proj.weight.data.t(
+        ), down_smooth).t().to(device="cpu", dtype=dtype)
+
+
+def rotate_mlp_output(layer, Q, model_type, use_r4, l_id, smooth, down_kron=None):
+    # Rotate the MLP output weights and bias.
+    if model_type == model_utils.LLAMA_MODEL:
+        W = layer.mlp.down_proj
+    elif model_type == model_utils.OPT_MODEL:
+        W = layer.fc2
+    else:
+        raise ValueError(f'Unknown model type {model_type}')
+    dtype = W.weight.data.dtype
+    W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
+    W.weight.data = torch.matmul(Q.T, W_)
+    if smooth is not None:
+        down_smooth = smooth[f'model.layers.{l_id}.mlp.down_smooth'].to(device=utils.DEV, dtype=torch.float64)
+        W.weight.data = torch.mul(W.weight.data,
+                                  down_smooth)
+    W.weight.data = W.weight.data.to(device="cpu", dtype=dtype)
+
+    if down_kron is not None:
+        W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
+        W_ = apply_kron_right(W_, down_kron[0], down_kron[1])
+        W.weight.data = W_.to(device="cpu", dtype=dtype)
+    elif use_r4:
+        # apply exact (inverse) hadamard on the weights of mlp output
+        apply_exact_had_to_linear(W, had_dim=-1, output=False)
+    if W.bias is not None:
+        b = W.bias.data.to(device=utils.DEV, dtype=torch.float64)
+        W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+
+def matmul_hadU_cuda_had(X, hadK, transpose=False):
+    '''
+    Apply hadamard transformation.
+    It reshapes X and applies Walsh-Hadamard transform to the last dimension.
+    Then, it will multiply the retult by another hadamard matrix.
+    '''
+    from fast_hadamard_transform import hadamard_transform
+    from hadamard_utils import get_had172
+    n = X.shape[-1]
+    K = hadK.shape[-1]
+
+    if transpose:
+        hadK = hadK.T.contiguous()
+    input = X.float().cuda().view(-1, K, n // K)
+    input = hadamard_transform(input.contiguous(), scale=1 / math.sqrt(n))
+    input = hadK.to(input.device).to(input.dtype) @ input
+    return input.to(X.device).to(X.dtype).reshape(
+        X.shape)
+
+
+def rotate_faster_down_proj(layer, model_type, hardK):
+    from fast_hadamard_transform import hadamard_transform
+    if model_type == model_utils.LLAMA_MODEL:
+        W = layer.mlp.down_proj
+    else:
+        raise ValueError(f'Faster MLP is onlu supported for LLaMa models!')
+
+    dtype = W.weight.data.dtype
+    W.weight.data = matmul_hadU_cuda_had(W.weight.data.float().cuda(), hardK)
+    W.weight.data = W.weight.data.to(device="cpu", dtype=dtype)
+
+
+def rotate_head(model, Q: torch.Tensor) -> None:
+    # Rotate the head.
+    W = model_utils.get_lm_head(model, model_type=model_utils.model_type_extractor(model))
+    dtype = W.weight.data.dtype
+    W_ = W.weight.data.to(device=utils.DEV, dtype=torch.float64)
+    W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+
+def rotate_ov_proj(layer, model_type, head_dim, kv_head,
+                   l_id, use_r2, r2_mode, r2_path=None,
+                   smooth=None):
+    v_proj = layer.self_attn.v_proj
+    if model_type == model_utils.LLAMA_MODEL:
+        o_proj = layer.self_attn.o_proj
+    elif model_type == model_utils.OPT_MODEL:
+        o_proj = layer.self_attn.out_proj
+    else:
+        raise ValueError(f'Unknown model type {model_type}')
+
+    if use_r2 == 'online':  # QuaRot 源码：
+        apply_exact_had_to_linear(v_proj, had_dim=head_dim, output=True)
+        apply_exact_had_to_linear(o_proj, had_dim=-1, output=False)
+
+    if 'offline' in use_r2:  # 获取 r2 并将其融入到模型中
+        if r2_path is not None:
+            r2s = torch.load(r2_path, map_location='cpu')
+            Q = r2s[f"model.layers.{l_id}.self_attn.R2"].to(device=utils.DEV,
+                                                            dtype=torch.float64)
+        else:
+            Q = get_orthogonal_matrix(head_dim, r2_mode)
+            if len(Q.shape) != 3:
+                Q = Q.repeat(kv_head, 1, 1)
+        apply_multi_head_rotate(v_proj, Q, head_dim, l_id,
+                                kv_head, output=True, smooth=smooth)
+        apply_multi_head_rotate(o_proj, Q, head_dim, l_id,
+                                kv_head, output=False, smooth=smooth)
+
+
+def apply_multi_head_rotate(module, Q, head_dim, l_id,
+                            kv_head, output=False,
+                            smooth=None):
+    assert isinstance(module, torch.nn.Linear)
+
+    W_ = module.weight.data
+    dtype = W_.dtype
+    dev = W_.device
+    init_shape = W_.shape
+    num_head = init_shape[1] // head_dim
+    n_rep = num_head // kv_head
+    W_ = W_.to(device=utils.DEV, dtype=torch.float64)
+
+    if output:
+        W_ = W_.t()
+        transposed_shape = W_.shape
+        W_ = W_.reshape(-1, kv_head, head_dim).transpose(0, 1)
+        if smooth is not None:
+            o_smooth = smooth['model.layers.{}.self_attn.o_smooth'.format(
+                l_id)].to(device=utils.DEV, dtype=torch.float64)
+            W_ = W_ / o_smooth.view(kv_head, 1, head_dim)
+        W_ = torch.matmul(W_, Q)
+        W_ = W_.transpose(0, 1).reshape(transposed_shape).t()
+    else:
+        W_ = W_.reshape(-1, init_shape[1] // head_dim,
+                        head_dim).transpose(0, 1)
+        if len(Q.shape) == 3:
+            Q = Q[:, None, :, :].expand(kv_head, n_rep, head_dim, head_dim)
+            Q = Q.reshape(num_head, head_dim, head_dim)
+        if smooth is not None:
+            o_smooth = smooth['model.layers.{}.self_attn.o_smooth'.format(l_id)]
+            o_smooth = o_smooth[:, None, :].expand(kv_head, n_rep, head_dim)
+            o_smooth = o_smooth.reshape(num_head, head_dim).to(device=utils.DEV, dtype=torch.float64)
+            W_ = W_ * o_smooth.view(kv_head, 1, head_dim)
+        W_ = torch.matmul(W_, Q)
+        W_ = W_.transpose(0, 1).reshape(init_shape)
+
+    module.weight.data = W_.to(device=dev, dtype=dtype)
+
+
+@torch.inference_mode()
+def rotate_model(model, args):
+    # Global rotation matrix Q (R1).
+    # Respect `--use_r1`: if disabled, use identity so we can still apply local rkron rotations.
+    if not bool(getattr(args, "use_r1", True)):
+        Q = torch.eye(model.config.hidden_size, device=utils.DEV, dtype=torch.float64)
+    elif args.r1_path is not None:  # Q: r1 获取 r1 并将其融入到模型中
+        Q = torch.load(args.r1_path, map_location=torch.device(utils.DEV))['R1'].to(dtype=torch.float64)
+    else:
+        Q = get_orthogonal_matrix(model.config.hidden_size, args.rotate_mode)
+
+    smooth_scale = torch.load(args.smooth) if args.smooth is not None else None
+    if smooth_scale is not None:
+        logging.info(f'Use smooth scale load from: {args.smooth}')
+    config = model.config
+    num_heads = config.num_attention_heads
+    model_dim = config.hidden_size
+    head_dim = model_dim // num_heads
+    kv_head = config.num_key_value_heads
+    use_rkron = getattr(args, 'use_rkron', False)
+    rkron_state = None
+    rkron_shape = None
+    rkron_mode = getattr(args, 'rkron_mode', None)
+    if rkron_mode is None:
+        rkron_mode = args.rotate_mode
+    if use_rkron and getattr(args, 'rkron_path', None) is not None:
+        rkron_state = torch.load(args.rkron_path, map_location='cpu')
+        rkron_shape = rkron_state.get('rkron_shape', None)
+        if isinstance(rkron_shape, (list, tuple)) and len(rkron_shape) == 2:
+            rkron_shape = (int(rkron_shape[0]), int(rkron_shape[1]))
+    rkron_inv_eps = float(getattr(args, 'rkron_inv_eps', 0.0) or 0.0)
+
+    if use_rkron:
+        rkron_arg_n1 = getattr(args, 'rkron_n1', None)
+        rkron_arg_n2 = getattr(args, 'rkron_n2', None)
+        if rkron_arg_n1 is not None or rkron_arg_n2 is not None:
+            rkron_n1 = int(rkron_arg_n1) if rkron_arg_n1 is not None else None
+            rkron_n2 = int(rkron_arg_n2) if rkron_arg_n2 is not None else None
+            if rkron_n1 is None:
+                if model_dim % rkron_n2 != 0:
+                    raise ValueError(f'Invalid rkron_n2: {rkron_n2} does not divide {model_dim}')
+                rkron_n1 = model_dim // rkron_n2
+            if rkron_n2 is None:
+                if model_dim % rkron_n1 != 0:
+                    raise ValueError(f'Invalid rkron_n1: {rkron_n1} does not divide {model_dim}')
+                rkron_n2 = model_dim // rkron_n1
+        elif rkron_shape is not None:
+            rkron_n1, rkron_n2 = rkron_shape
+        else:
+            rkron_n1, rkron_n2 = get_decompose_dim(model_dim)
+        if rkron_n1 * rkron_n2 != model_dim:
+            raise ValueError(f'Invalid rkron shape: {rkron_n1}*{rkron_n2} != {model_dim}')
+
+    use_rkron_o = getattr(args, 'use_rkron_o', False)
+    rkron_o_state = None
+    rkron_o_shape = None
+    if use_rkron_o and getattr(args, 'rkron_o_path', None) is not None:
+        rkron_o_state = torch.load(args.rkron_o_path, map_location='cpu')
+        rkron_o_shape = rkron_o_state.get('rkron_o_shape', None)
+        if isinstance(rkron_o_shape, (list, tuple)) and len(rkron_o_shape) == 2:
+            rkron_o_shape = (int(rkron_o_shape[0]), int(rkron_o_shape[1]))
+
+    use_rkron_down = getattr(args, 'use_rkron_down', False)
+    rkron_down_state = None
+    rkron_down_shape = None
+    if use_rkron_down and getattr(args, 'rkron_down_path', None) is not None:
+        rkron_down_state = torch.load(args.rkron_down_path, map_location='cpu')
+        rkron_down_shape = rkron_down_state.get('rkron_down_shape', None)
+        if isinstance(rkron_down_shape, (list, tuple)) and len(rkron_down_shape) == 2:
+            rkron_down_shape = (int(rkron_down_shape[0]), int(rkron_down_shape[1]))
+
+    if use_rkron_o:
+        rkron_o_arg_n1 = getattr(args, 'rkron_o_n1', None)
+        rkron_o_arg_n2 = getattr(args, 'rkron_o_n2', None)
+        if rkron_o_arg_n1 is not None or rkron_o_arg_n2 is not None:
+            rkron_o_n1 = int(rkron_o_arg_n1) if rkron_o_arg_n1 is not None else None
+            rkron_o_n2 = int(rkron_o_arg_n2) if rkron_o_arg_n2 is not None else None
+            if rkron_o_n1 is None:
+                if model_dim % rkron_o_n2 != 0:
+                    raise ValueError(f'Invalid rkron_o_n2: {rkron_o_n2} does not divide {model_dim}')
+                rkron_o_n1 = model_dim // rkron_o_n2
+            if rkron_o_n2 is None:
+                if model_dim % rkron_o_n1 != 0:
+                    raise ValueError(f'Invalid rkron_o_n1: {rkron_o_n1} does not divide {model_dim}')
+                rkron_o_n2 = model_dim // rkron_o_n1
+        elif rkron_o_shape is not None:
+            rkron_o_n1, rkron_o_n2 = rkron_o_shape
+        else:
+            rkron_o_n1, rkron_o_n2 = get_decompose_dim(model_dim)
+        if rkron_o_n1 * rkron_o_n2 != model_dim:
+            raise ValueError(f'Invalid rkron_o shape: {rkron_o_n1}*{rkron_o_n2} != {model_dim}')
+
+    if use_rkron_down:
+        down_dim = model_utils.get_mlp_bottleneck_size(model)
+        rkron_down_arg_n1 = getattr(args, 'rkron_down_n1', None)
+        rkron_down_arg_n2 = getattr(args, 'rkron_down_n2', None)
+        if rkron_down_arg_n1 is not None or rkron_down_arg_n2 is not None:
+            rkron_down_n1 = int(rkron_down_arg_n1) if rkron_down_arg_n1 is not None else None
+            rkron_down_n2 = int(rkron_down_arg_n2) if rkron_down_arg_n2 is not None else None
+            if rkron_down_n1 is None:
+                if down_dim % rkron_down_n2 != 0:
+                    raise ValueError(f'Invalid rkron_down_n2: {rkron_down_n2} does not divide {down_dim}')
+                rkron_down_n1 = down_dim // rkron_down_n2
+            if rkron_down_n2 is None:
+                if down_dim % rkron_down_n1 != 0:
+                    raise ValueError(f'Invalid rkron_down_n1: {rkron_down_n1} does not divide {down_dim}')
+                rkron_down_n2 = down_dim // rkron_down_n1
+        elif rkron_down_shape is not None:
+            rkron_down_n1, rkron_down_n2 = rkron_down_shape
+        else:
+            rkron_down_n1, rkron_down_n2 = get_decompose_dim(down_dim)
+        if rkron_down_n1 * rkron_down_n2 != down_dim:
+            raise ValueError(f'Invalid rkron_down shape: {rkron_down_n1}*{rkron_down_n2} != {down_dim}')
+
+    model_type = model_utils.model_type_extractor(model)
+    rotate_embeddings(model, Q)
+    rotate_head(model, Q)
+    utils.cleanup_memory()
+    layers = model_utils.get_transformer_layers(model,
+                                                model_type=model_type)
+    for idx, layer in enumerate(tqdm.tqdm(layers, unit="layer", desc="Rotating")):
+        attn_kron = None
+        mlp_kron = None
+        attn_kron_fuse = None
+        mlp_kron_fuse = None
+        if use_rkron:
+            attn_r1 = None
+            attn_r2 = None
+            mlp_r1 = None
+            mlp_r2 = None
+            if rkron_state is not None:
+                attn_r1 = rkron_state.get(f"model.layers.{idx}.rkron_attn1", None)
+                attn_r2 = rkron_state.get(f"model.layers.{idx}.rkron_attn2", None)
+                mlp_r1 = rkron_state.get(f"model.layers.{idx}.rkron_mlp1", None)
+                mlp_r2 = rkron_state.get(f"model.layers.{idx}.rkron_mlp2", None)
+                if attn_r1 is None or attn_r2 is None:
+                    attn_r1 = rkron_state.get(f"model.layers.{idx}.rkron1", None)
+                    attn_r2 = rkron_state.get(f"model.layers.{idx}.rkron2", None)
+                if mlp_r1 is None or mlp_r2 is None:
+                    mlp_r1 = rkron_state.get(f"model.layers.{idx}.rkron1", None)
+                    mlp_r2 = rkron_state.get(f"model.layers.{idx}.rkron2", None)
+
+            if attn_r1 is None or attn_r2 is None:
+                attn_r1 = get_orthogonal_matrix(rkron_n1, rkron_mode)
+                attn_r2 = get_orthogonal_matrix(rkron_n2, rkron_mode)
+            if mlp_r1 is None or mlp_r2 is None:
+                mlp_r1 = get_orthogonal_matrix(rkron_n1, rkron_mode)
+                mlp_r2 = get_orthogonal_matrix(rkron_n2, rkron_mode)
+
+            attn_kron = (attn_r1.to(device=utils.DEV, dtype=torch.float64),
+                         attn_r2.to(device=utils.DEV, dtype=torch.float64))
+            mlp_kron = (mlp_r1.to(device=utils.DEV, dtype=torch.float64),
+                        mlp_r2.to(device=utils.DEV, dtype=torch.float64))
+            attn_kron_fuse = (inv_transpose(attn_kron[0], rkron_inv_eps),
+                              inv_transpose(attn_kron[1], rkron_inv_eps))
+            mlp_kron_fuse = (inv_transpose(mlp_kron[0], rkron_inv_eps),
+                             inv_transpose(mlp_kron[1], rkron_inv_eps))
+            for mod in [layers[idx].self_attn.q_proj, layers[idx].self_attn.k_proj,
+                        layers[idx].self_attn.v_proj]:
+                register_kron_buffers(mod, attn_kron[0], attn_kron[1])
+            if model_type == model_utils.LLAMA_MODEL:
+                mlp_inputs = [layers[idx].mlp.up_proj, layers[idx].mlp.gate_proj]
+            elif model_type == model_utils.OPT_MODEL:
+                mlp_inputs = [layers[idx].fc1]
+            else:
+                raise ValueError(f'Unknown model type {model_type}')
+            for mod in mlp_inputs:
+                register_kron_buffers(mod, mlp_kron[0], mlp_kron[1])
+        rotate_attention_inputs(layers[idx], Q, model_type, local_kron=attn_kron_fuse)
+        rotate_attention_output(layers[idx], Q, model_type)
+        rotate_mlp_input(layers[idx], Q, model_type, idx, smooth_scale, local_kron=mlp_kron_fuse)
+        down_kron = None
+        down_kron_fuse = None
+        if use_rkron_down:
+            d1 = None
+            d2 = None
+            if rkron_down_state is not None:
+                d1 = rkron_down_state.get(f"model.layers.{idx}.rkron_down1", None)
+                d2 = rkron_down_state.get(f"model.layers.{idx}.rkron_down2", None)
+            if d1 is None or d2 is None:
+                d1 = get_orthogonal_matrix(rkron_down_n1, rkron_mode)
+                d2 = get_orthogonal_matrix(rkron_down_n2, rkron_mode)
+            down_kron = (d1.to(device=utils.DEV, dtype=torch.float64),
+                         d2.to(device=utils.DEV, dtype=torch.float64))
+            down_kron_fuse = (inv_transpose(down_kron[0], rkron_inv_eps),
+                              inv_transpose(down_kron[1], rkron_inv_eps))
+        rotate_mlp_output(layers[idx], Q, model_type, args.use_r4, idx, smooth_scale, down_kron=down_kron_fuse)
+        if down_kron is not None:
+            down_proj = layers[idx].mlp.down_proj if model_type == model_utils.LLAMA_MODEL else layers[idx].fc2
+            register_kron_buffers(down_proj, down_kron[0], down_kron[1])
+        if args.use_r2 != 'none':
+            rotate_ov_proj(layers[idx], model_type, head_dim, kv_head, idx, args.use_r2,
+                           args.rotate_mode, args.r2_path, smooth_scale)
+        if use_rkron_o:
+            o1 = None
+            o2 = None
+            if rkron_o_state is not None:
+                o1 = rkron_o_state.get(f"model.layers.{idx}.rkron_o1", None)
+                o2 = rkron_o_state.get(f"model.layers.{idx}.rkron_o2", None)
+            if o1 is None or o2 is None:
+                o1 = get_orthogonal_matrix(rkron_o_n1, rkron_mode)
+                o2 = get_orthogonal_matrix(rkron_o_n2, rkron_mode)
+            o_kron = (o1.to(device=utils.DEV, dtype=torch.float64),
+                      o2.to(device=utils.DEV, dtype=torch.float64))
+            o_kron_fuse = (inv_transpose(o_kron[0], rkron_inv_eps),
+                           inv_transpose(o_kron[1], rkron_inv_eps))
+            if model_type == model_utils.LLAMA_MODEL:
+                o_proj = layers[idx].self_attn.o_proj
+            elif model_type == model_utils.OPT_MODEL:
+                o_proj = layers[idx].self_attn.out_proj
+            else:
+                raise ValueError(f'Unknown model type {model_type}')
+            W_ = o_proj.weight.data.to(device=utils.DEV, dtype=torch.float64)
+            W_ = apply_kron_right(W_, o_kron_fuse[0], o_kron_fuse[1])
+            o_proj.weight.data = W_.to(device="cpu", dtype=o_proj.weight.data.dtype)
+            register_kron_buffers(o_proj, o_kron[0], o_kron[1])
+
+
+@torch.inference_mode
+def online_rotate(module, inp):
+    x = torch.nn.functional.linear(inp[0], module.Q)
+    return (x,) + inp[1:]
+
+
+def register_online_rotation(module, Q: torch.Tensor):
+    assert not hasattr(module, 'Q')
+    module.register_buffer('Q', Q.T.to(module.weight.data))  # Note F.linear(x, A) performs x@A.T
+
+    # We use forward_pre_hook because we capture the input using forward_hook, which could then capture the rotated input.
+    # If we implement in the forward() the un-rotated original input will be captured.
+    module.rotate_handle = module.register_forward_pre_hook(online_rotate)
+
+
+class QKRotationWrapper(torch.nn.Module):
+
+    def __init__(self, func, config, *args, **kwargs):
+        super().__init__()
+        self.config = config
+        num_heads = config.num_attention_heads
+        model_dim = config.hidden_size
+        head_dim = model_dim // num_heads
+        assert is_pow2(head_dim), f'Only power of 2 head_dim is supported for K-cache Quantization!'
+        self.func = func
+        self.k_quantizer = quant_utils.ActQuantizer()
+        self.k_bits = 16
+        if kwargs is not None:
+            assert kwargs['k_groupsize'] in [-1,
+                                             head_dim], f'Only token-wise/{head_dim}g quantization is supported for K-cache'
+            self.k_bits = kwargs['k_bits']
+            self.k_groupsize = kwargs['k_groupsize']
+            self.k_sym = kwargs['k_sym']
+            self.k_clip_ratio = kwargs['k_clip_ratio']
+            self.k_lac = kwargs.get('k_lac', False)
+            self.use_r3 = kwargs['use_r3']
+            self.k_quantizer.configure(bits=self.k_bits, groupsize=-1,  # we put -1 to be toke-wise quantization and handle head-wise quantization by ourself
+                                       sym=self.k_sym, clip_ratio=self.k_clip_ratio, lac=self.k_lac)
+
+    def forward(self, *args, **kwargs):
+        q, k = self.func(*args, **kwargs)
+        dtype = q.dtype
+        if self.use_r3:
+            q = hadamard_transform(q.float(), scale=1 / math.sqrt(q.shape[-1])).to(dtype)
+            k = hadamard_transform(k.float(), scale=1 / math.sqrt(k.shape[-1])).to(dtype)
+        (bsz, num_heads, seq_len, head_dim) = k.shape
+
+        if self.k_groupsize == -1:  # token-wise quantization
+            token_wise_k = k.transpose(1, 2).reshape(-1, num_heads * head_dim)  # 源码：(-1, self.config.hidden_size)报错
+            self.k_quantizer.find_params(token_wise_k)
+            k = self.k_quantizer(token_wise_k).reshape((bsz, seq_len, num_heads, head_dim)).transpose(1, 2).to(q)
+        else:  # head-wise quantization
+            per_head_k = k.reshape(-1, head_dim)  # 源码：per_head_k = k.view(-1, head_dim)报错
+            self.k_quantizer.find_params(per_head_k)
+            k = self.k_quantizer(per_head_k).reshape((bsz, num_heads, seq_len, head_dim)).to(q)
+
+        self.k_quantizer.free()
+
+        return q, k
+
+
+def add_qk_rotation_wrapper_after_function_call_in_forward(module, function_name, *args, **kwargs):
+    '''
+    This function adds a rotation wrapper after the output of a function call in forward.
+    Only calls directly in the forward function are affected. calls by other functions called in forward are not affected.
+    '''
+    import monkeypatch
+    import functools
+    attr_name = f"{function_name}_qk_rotation_wrapper"
+    assert not hasattr(module, attr_name)
+    wrapper = monkeypatch.add_wrapper_after_function_call_in_method(module, "forward",
+                                                                    function_name, functools.partial(QKRotationWrapper, *args, **kwargs))
+    setattr(module, attr_name, wrapper)
