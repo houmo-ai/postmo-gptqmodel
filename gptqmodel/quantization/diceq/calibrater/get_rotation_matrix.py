@@ -156,7 +156,7 @@ class ActivationReferenceDataset(Dataset):
         return tensor
 
 
-class R1QR(nn.Module):
+class R_QR(nn.Module):
     """Global/layer-wise orthogonal rotation module (same core as r1_base_qr.py)."""
 
     def __init__(self, hidden_size: int, use_geoopt: bool = False):
@@ -782,7 +782,7 @@ def train_one_rotation(
     """Train one rotation module and return trained matrix + metrics."""
     use_geoopt = train_args["optimizer"] in {"RSGD", "RAdam"}
     if head_num is None:
-        model = R1QR(hidden_size=hidden_size, use_geoopt=use_geoopt).to(device)
+        model = R_QR(hidden_size=hidden_size, use_geoopt=use_geoopt).to(device)
         init_r = get_orthogonal_matrix(
             hidden_size,
             train_args["init_mode"],
