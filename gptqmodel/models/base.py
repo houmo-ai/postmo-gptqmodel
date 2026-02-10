@@ -610,6 +610,60 @@ class BaseQModel(nn.Module):
             return None
         return cfg
 
+    def _check_rotation_cache(
+        self,
+        artifacts_root: Path,
+        layer_config: Dict[str, Any],
+        selected_targets: list,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        检查是否存在有效的旋转矩阵缓存。
+
+        遍历每个 target 的 artifacts 目录，寻找最新的 .pt 文件，
+        加载其中的 rotation_matrices 字段并提取可用的旋转矩阵。
+
+        Returns:
+            如果所有 target 都有有效缓存，返回与 train_rotation_for_targets 相同格式的字典；
+            否则返回 None。
+        """
+        if not artifacts_root.exists():
+            return None
+
+        result: Dict[str, Any] = {}
+        for target_name in selected_targets:
+            target_dir = artifacts_root / target_name
+            if not target_dir.exists():
+                log.info(f"DiceQ: 旋转矩阵缓存目录不存在: {target_dir}")
+                return None
+
+            # 找到该 target 下最新的 .pt 文件（按文件名排序，时间戳在文件名末尾）
+            pt_files = sorted(target_dir.glob("*.pt"))
+            if not pt_files:
+                log.info(f"DiceQ: target '{target_name}' 无缓存的旋转矩阵文件")
+                return None
+
+            latest_pt = pt_files[-1]  # 最新文件
+            try:
+                payload = torch.load(latest_pt, map_location="cpu", weights_only=False)
+                rotation_dict = payload.get("rotation_matrices")
+                if not isinstance(rotation_dict, dict) or not rotation_dict:
+                    log.warn(f"DiceQ: 缓存文件 '{latest_pt}' 中无有效的 rotation_matrices")
+                    return None
+
+                # 使用与 train_rotation_for_target 相同的提取逻辑
+                if target_name in rotation_dict and len(rotation_dict) == 1:
+                    extracted = rotation_dict[target_name]
+                else:
+                    extracted = rotation_dict
+
+                result[target_name] = extracted
+                log.info(f"DiceQ: 从缓存加载 target '{target_name}' 的旋转矩阵: {latest_pt.name}")
+            except Exception as exc:
+                log.warn(f"DiceQ: 加载缓存文件 '{latest_pt}' 失败: {exc}")
+                return None
+
+        return result
+
     def _check_activation_cache(
         self,
         data_root: Path,
@@ -754,6 +808,15 @@ class BaseQModel(nn.Module):
                     device=device_arg,
                 )
                 log.info("DiceQ: 激活数据搜集完成")
+
+            # 检查旋转矩阵缓存
+            selected_targets = targets if targets else [k for k, v in layer_config.items() if isinstance(v, dict)]
+            rotation_cache = self._check_rotation_cache(
+                train_root / "artifacts", layer_config, selected_targets
+            )
+            if rotation_cache is not None:
+                log.info("DiceQ: 发现有效的旋转矩阵缓存，跳过训练步骤")
+                return rotation_cache
 
             try:
                 # device / train_nsamples 已移入各 target 的 train_args，无需顶层传入
