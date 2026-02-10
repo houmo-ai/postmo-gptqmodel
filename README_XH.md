@@ -20,6 +20,6 @@ pip install SoundFile
 
 3. 特定模型需要特定版本的仓库
 ```bash
-deepseekv2/deepseekocrv1结构： transformers==4.46.3
-deepseekv3结构/glm4_moe_lite： transformers==5.0.0rc3
+deepseekocrv1结构： transformers==4.46.3
+deepseekv2/v3结构/glm4_moe_lite： transformers==5.0.0rc3
 ```

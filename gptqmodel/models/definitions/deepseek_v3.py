@@ -37,12 +37,23 @@ class DeepSeekV3QModel(BaseQModel):
             "input_layernorm": ("input_layernorm:!",),
             "self_attn": ("q_a_proj:0", "kv_a_proj_with_mqa:0", "q_b_proj:1", "kv_b_proj:1", "o_proj:2"),
             "post_attention_layernorm": ("post_attention_layernorm:!",),
-            "mlp": {
-                "": ("gate_proj:0", "up_proj:0", "down_proj:1"),
-                "experts": {
-                    "#": ("gate_proj:0", "up_proj:0", "down_proj:1"),
-                },
+            "mlp:?": {
+                # MoE structure - shared_experts uses standard MLP
                 "shared_experts": ("gate_proj:0", "up_proj:0", "down_proj:1"),
+                # Router should not be quantized (it's a nn.Linear with weight as router)
+                "gate": ("gate:!",),
+                # experts 转换后结构是: experts.gate_proj[i], experts.up_proj[i], experts.down_proj[i]
+                # 路径直接是 experts.gate_proj.0, experts.gate_proj.1 等
+                # 使用 {expert_index} 占位符，由 build_moe_modules_if_need 展开
+                "experts": (
+                    "gate_proj.{expert_index}:0",
+                    "up_proj.{expert_index}:0",
+                    "down_proj.{expert_index}:1",
+                ),
+                # Standard MLP for dense layers (non-MoE)
+                "gate_proj": ("gate_proj:0",),
+                "up_proj": ("up_proj:0",),
+                "down_proj": ("down_proj:1",),
             },
         }
     ]

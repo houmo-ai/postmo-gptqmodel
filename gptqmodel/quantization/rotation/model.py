@@ -7,6 +7,7 @@ from gptqmodel.models.definitions.qwen2_5_vl import Qwen2_5_VLQModel
 from gptqmodel.models.definitions.qwen3_moe import Qwen3MoeQModel
 from gptqmodel.models.definitions.glm4_moe_lite import Glm4MoeLiteQModel
 from gptqmodel.models.definitions.deepseek_v2 import DeepSeekV2QModel
+from gptqmodel.models.definitions.deepseek_v2_ocr import DeepSeekV2OCRQModel
 from gptqmodel.models.definitions.deepseek_v3 import DeepSeekV3QModel
 
 MODEL_ROTATION_REGISTRY = [
@@ -55,6 +56,12 @@ MODEL_ROTATION_REGISTRY = [
         "vision": False,
         "fuse_norm": fuse_layer_norms_deepseekv2_mla_moe,
         "rotate_fn": rotate_model_deepseekv2_mla_moe,
+    },
+    {
+        "cls": DeepSeekV2OCRQModel,
+        "vision": False,
+        "fuse_norm": fuse_layer_norms_deepseekv2_ocr,
+        "rotate_fn": rotate_model_deepseekv2_ocr,
     },
     {
         "cls": DeepSeekV3QModel,

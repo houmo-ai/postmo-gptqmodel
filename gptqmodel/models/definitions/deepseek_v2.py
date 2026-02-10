@@ -9,28 +9,38 @@ from typing import Any, Dict
 from ..base import BaseQModel
 
 
-# Both DeepSeek-v2 and DeepSeek-v2-lite are supported in this model def
+"""
+DeepSeek V2 MLA+MoE QText model definition（标准 DeepSeek-V2 文本结构）.
+
+说明：
+- 对应 `hf_models/hf_deepseekv2/modeling_deepseek_v2.py` / `configuration_deepseek_v2.py`，
+  使用 MLA 注意力（q_a_proj / kv_a_proj_with_mqa / kv_b_proj 等）+ MoE MLP 结构。
+- 与 OCR 版 `DeepSeekV2OCRQModel` 区分开：OCR 使用的是 MHA（LlamaAttention）。
+"""
+
+
 class DeepSeekV2QModel(BaseQModel):
-    # deepseek_v2 requires custom model code
+    # 标准 deepseek_v2 需要自定义 HF model 实现（hf_deepseekv2）
     require_trust_remote_code = True
 
-    # allow dynamic expert index for layer_modules so we don't need to write out 64 layers here
-    # config.num_experts contains the actual expert count used for index
+    # 允许动态 expert 数量：配置里 `n_routed_experts` 控制
     dynamic_expert_index = "n_routed_experts"
 
     pre_lm_head_norm_module = "model.norm"
 
-    # DeepSeek V2-Lite uses dynamic modules based on lora(rank):
-    # https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/blob/main/modeling_deepseek.py#L712
+    # DeepSeek V2-Lite / V2 使用基于 rank 的动态模块（如 q_lora_rank/kv_lora_rank）
     layer_modules_strict = False
 
+    # MLA 结构下的 module tree：
+    # - attention: q_a_proj / q_b_proj / kv_a_proj_with_mqa / kv_b_proj / o_proj
+    # - mlp: 支持 dense / experts / shared_experts 三种路径
     module_tree = [
         "model",
         "layers",
         "#",
         {
             "input_layernorm": ("input_layernorm:!",),
-            "self_attn": ("q_a_proj:0", "q_b_proj:0", "q_proj:0", "kv_a_proj_with_mqa:0", "kv_b_proj:0", "o_proj:1"),
+            "self_attn": ("q_a_proj:0", "q_b_proj:0", "kv_a_proj_with_mqa:0", "kv_b_proj:0", "o_proj:1"),
             "post_attention_layernorm": ("post_attention_layernorm:!",),
             "mlp": {
                 "": ("gate_proj:0", "up_proj:0", "down_proj:1"),
@@ -39,14 +49,20 @@ class DeepSeekV2QModel(BaseQModel):
                 },
                 "shared_experts": ("gate_proj:0", "up_proj:0", "down_proj:1"),
             },
-        }
+        },
     ]
 
     @classmethod
     def diceq_config_template(cls) -> Dict[str, Any]:
+        """
+        DiceQ 旋转训练配置（标准 DeepSeek-V2 MLA）：
+        - Q_block: 对 block 级 hidden 表示做正交旋转（作用在 q_a_proj / mlp.gate 上）
+        - Q_q_lowrank: 针对 q_a_proj / q_b_proj 的低秩空间
+        - Q_kv_lowrank: 针对 kv_a_proj_with_mqa / kv_b_proj 的低秩空间
+        """
         layer_config = {
             "Q_block": {
-                "description": "block之间的旋转矩阵",
+                "description": "block 之间的旋转矩阵（作用在 hidden 维度）",
                 "folder": "Q_block",
                 "layers": ["self_attn.q_a_proj", "mlp.gate"],
                 "save_mode": "separate",
@@ -71,7 +87,7 @@ class DeepSeekV2QModel(BaseQModel):
                 },
             },
             "Q_q_lowrank": {
-                "description": "q 低秩投影层",
+                "description": "q 低秩投影旋转矩阵（q_a_proj / q_b_proj）",
                 "folder": "Q_q_lowrank",
                 "layers": ["self_attn.q_b_proj"],
                 "save_mode": "combined",
@@ -97,7 +113,7 @@ class DeepSeekV2QModel(BaseQModel):
                 },
             },
             "Q_kv_lowrank": {
-                "description": "KV 低秩投影层",
+                "description": "KV 低秩投影旋转矩阵（kv_a_proj_with_mqa / kv_b_proj）",
                 "folder": "Q_kv_lowrank",
                 "layers": ["self_attn.kv_b_proj"],
                 "save_mode": "combined",
@@ -152,7 +168,7 @@ class DeepSeekV2QModel(BaseQModel):
             cfg["layer_config"] = copy.deepcopy(self.diceq_config_template()["layer_config"])
             layer_config = cfg["layer_config"]
 
-        # Optional global override: apply one subset size to all DiceQ targets.
+        # 可选：全局 subset_size 覆盖
         global_subset_size = cfg.get("subset_size", None)
         if global_subset_size is not None:
             if isinstance(global_subset_size, bool):
@@ -180,7 +196,7 @@ class DeepSeekV2QModel(BaseQModel):
                         f"diceq.subset_size must be int or float, got {type(global_subset_size).__name__}"
                     )
 
-        # Optional global override: apply one layer/head-wise parallel workers to all targets.
+        # 可选：全局 parallel_workers 覆盖
         global_parallel_workers = cfg.get("parallel_workers", None)
         if global_parallel_workers is not None:
             global_parallel_workers = int(global_parallel_workers)
@@ -198,4 +214,5 @@ class DeepSeekV2QModel(BaseQModel):
         if not cfg.get("targets"):
             cfg["targets"] = [k for k, v in layer_config.items() if isinstance(v, dict)]
         return cfg
+
 

@@ -739,19 +739,25 @@ def fuse_layer_norms_deepseekv3_mla_moe(
         lm_head_name=lm_head_name,
     )
 
-def fuse_layer_norms_deepseekv2_mla_moe(
+def fuse_layer_norms_deepseekv2_ocr(
     model: PreTrainedModel,
     pre_lm_head_norm_module_name: str,
     layers_node: str,
     lm_head_name: str,
 ):
     """
-    Fuse layer norms for DeepSeek V2 (MLA + MoE) model.
+    Fuse layer norms for DeepSeek V2 OCR (MHA + MoE) model.
 
-    DeepSeek V2 uses:
-      - MLA attention with q_a_proj / kv_a_proj_with_mqa as first-stage projections
-      - MoE MLP where each expert is a DeepseekV2MLP(gate_proj, up_proj, down_proj)
-        and optional shared_experts with the same structure.
+    当前 gptqmodel 中的 DeepSeekV2 实现基于 DeepSeek-OCR 文本模型：
+      - 注意力部分是标准 MHA（LlamaAttention），只有 q_proj/k_proj/v_proj/o_proj，
+        没有 MLA 的 q_a_proj/kv_a_proj_with_mqa 等低秩结构。
+      - MLP 仍然是 DeepseekV2 风格的 MoE：experts 为 DeepseekV2MLP(gate_proj, up_proj, down_proj)，
+        可选 shared_experts 结构相同。
+
+    因此这里只对：
+      - MLP（dense 或 MoE）的 gate_proj / up_proj 融合 post_attention_layernorm
+      - MHA 的 q_proj / k_proj / v_proj 融合 input_layernorm
+      - pre_lm_head_norm 融合到 lm_head
     """
     layers, _ = get_module_by_name_prefix(model, layers_node)
 
@@ -786,7 +792,80 @@ def fuse_layer_norms_deepseekv2_mla_moe(
                 [mlp.up_proj, mlp.gate_proj],
             )
 
-        # Fuse input_layernorm into first-stage attention MLA projections
+        # Fuse input_layernorm into MHA attention input projections
+        attn = layer.self_attn
+        attn_inputs = []
+        # DeepSeek-OCR 文本模型使用 LlamaAttention（MHA），只有 q_proj/k_proj/v_proj
+        if hasattr(attn, "q_proj"):
+            attn_inputs.append(attn.q_proj)
+        if hasattr(attn, "k_proj"):
+            attn_inputs.append(attn.k_proj)
+        if hasattr(attn, "v_proj"):
+            attn_inputs.append(attn.v_proj)
+
+        if attn_inputs:
+            fuse_ln_linear(layer.input_layernorm, attn_inputs)
+
+        reset_ln(layer.post_attention_layernorm)
+        reset_ln(layer.input_layernorm)
+
+    # Fuse pre-head layernorm into lm_head
+    pre_head_layernorm, _ = get_module_by_name_prefix(model, pre_lm_head_norm_module_name)
+    lm_head, _ = get_module_by_name_prefix(model, lm_head_name)
+
+    fuse_ln_linear(pre_head_layernorm, [lm_head])
+    reset_ln(pre_head_layernorm)
+    return model
+
+
+def fuse_layer_norms_deepseekv2_mla_moe(
+    model: PreTrainedModel,
+    pre_lm_head_norm_module_name: str,
+    layers_node: str,
+    lm_head_name: str,
+):
+    """
+    Fuse layer norms for DeepSeek V2 (MLA + MoE) model.
+
+    DeepSeek V2 使用：
+      - MLA 注意力：q_a_proj / kv_a_proj_with_mqa 为第一阶段投影；
+      - MoE MLP：每个 expert 为 DeepseekV2MLP(gate_proj, up_proj, down_proj)，
+        以及可选 shared_experts，结构相同。
+    """
+    layers, _ = get_module_by_name_prefix(model, layers_node)
+
+    for layer in layers:
+        mlp = layer.mlp
+        # Fuse post_attention_layernorm into MLP inputs
+        if hasattr(mlp, "experts"):
+            # MoE layers: experts is a ModuleList of DeepseekV2MLP
+            for expert in mlp.experts:
+                if expert is None:
+                    continue
+                expert_linears = []
+                if hasattr(expert, "gate_proj"):
+                    expert_linears.append(expert.gate_proj)
+                if hasattr(expert, "up_proj"):
+                    expert_linears.append(expert.up_proj)
+                if expert_linears:
+                    fuse_ln_linear(layer.post_attention_layernorm, expert_linears)
+
+            if hasattr(mlp, "shared_experts"):
+                shared_linears = []
+                if hasattr(mlp.shared_experts, "gate_proj"):
+                    shared_linears.append(mlp.shared_experts.gate_proj)
+                if hasattr(mlp.shared_experts, "up_proj"):
+                    shared_linears.append(mlp.shared_experts.up_proj)
+                if shared_linears:
+                    fuse_ln_linear(layer.post_attention_layernorm, shared_linears)
+        else:
+            # Dense MLP layers
+            fuse_ln_linear(
+                layer.post_attention_layernorm,
+                [mlp.up_proj, mlp.gate_proj],
+            )
+
+        # Fuse input_layernorm into first-stage MLA attention projections
         attn = layer.self_attn
         attn_inputs = []
         if hasattr(attn, "q_a_proj"):
@@ -1107,6 +1186,67 @@ def rotate_model_deepseekv3_mla_moe(
         Q=Q,
     )
 
+
+
+@torch.inference_mode()
+def rotate_model_deepseekv2_ocr(
+    model: PreTrainedModel,
+    rotate_mode: str,
+    device: torch.device,
+    lm_head_name: str,
+    layers_node: str,
+    Q=None,
+):
+    """
+    Rotate DeepSeek V2 OCR (MHA + MoE) model weights for improved quantization.
+
+    注意：
+    - 这里的 DeepSeekV2 指的是当前工程中接入的 DeepSeek-OCR 文本模型实现，
+      其注意力为标准 MHA（LlamaAttention），没有 MLA 的 q_a_proj/kv_a_proj_with_mqa 等结构。
+    - MoE 结构与 DeepSeekV2 MLA 版本兼容：experts 为 DeepseekV2MLP(gate_proj, up_proj, down_proj)，
+      可选 shared_experts 结构相同。
+
+    本函数仅对：
+      - embedding 与 lm_head 做块级旋转（Q_block）
+      - MHA 的 q_proj/k_proj/v_proj 以及 o_proj 做块级旋转
+      - MoE / dense MLP 的 up_proj/gate_proj/down_proj 做块级旋转
+
+    DiceQ 可能会提供包含 Q_q_lowrank / Q_kv_lowrank 的 Q 字典，这里会安全忽略低秩部分，仅使用 Q_block。
+    """
+    q_block_spec = Q
+    if isinstance(Q, dict):
+        # 仅关心块级旋转矩阵；低秩部分在 OCR MHA 结构中不存在
+        q_block_spec = Q.get("Q_block", Q.get("Q"))
+
+    Q_block = _resolve_rotation_matrix(q_block_spec, 0, "Q_block")
+    if Q_block is None:
+        Q_block = get_orthogonal_matrix(model.config.hidden_size, rotate_mode, device)
+
+    # 旋转 embedding 与 lm_head
+    rotate_embeddings(model, Q_block.to(device=device, dtype=torch.float64), device)
+    rotate_head(model, Q_block.to(device=device, dtype=torch.float64), device, lm_head_name)
+    torch_empty_cache()
+
+    layers, _ = get_module_by_name_prefix(model, layers_node)
+    for idx, layer in enumerate(log.pb(layers).title("Rotating DeepSeek V2 MLA-MoE")):
+        q_block_layer = _resolve_rotation_matrix(q_block_spec, idx, "Q_block")
+        if q_block_layer is None:
+            q_block_layer = Q_block
+        q_block_layer = q_block_layer.to(device=device, dtype=torch.float64)
+
+        # MHA attention: 使用通用的 q_proj/k_proj/v_proj / o_proj 旋转逻辑
+        rotate_attention_inputs(layer, q_block_layer, device)
+        rotate_attention_output(layer, q_block_layer, device)
+
+        # MLP：根据是否为 MoE 选择 DeepSeekV2 专用或通用旋转逻辑
+        if hasattr(layer.mlp, "experts"):
+            rotate_deepseekv2_mlp_input_moe(layer, q_block_layer, device)
+            rotate_deepseekv2_mlp_output_moe(layer, q_block_layer, device)
+        else:
+            rotate_mlp_input(layer, q_block_layer, device)
+            rotate_mlp_output(layer, q_block_layer, device)
+
+    return model, Q_block
 
 
 @torch.inference_mode()

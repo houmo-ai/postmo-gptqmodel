@@ -25,7 +25,7 @@ def build_calib_dataset(tokenizer, nsamples: int = 128, seqlen: int = 2048):
     return dataset
 
 
-def main():
+def quantize_deepseekv2():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="/data02/datasets/DeepSeek-OCR", help="HF 模型 ID 或本地路径，例如 mistralai/GptOss-8x7B-v0.1")
     parser.add_argument("--out", type=str, default="output/DeepSeek-OCR-4bit-64g", help="量化模型的保存目录")
@@ -62,7 +62,7 @@ def main():
     config = DeepseekV2Config(**DeepseekV2Config.from_pretrained(model_id).language_config)
     model = DeepseekV2ForCausalLM.from_pretrained(model_id, config=config, trust_remote_code=True)
     cfg = model.config
-    model_type = cfg.model_type.lower()
+    model_type = "deepseek_v2_ocr"
     QModelClass = MODEL_MAP.get(model_type, BaseQModel)
     qmodel = QModelClass(
         model=model,           # 你已经加载好的 transformers 模型
@@ -105,4 +105,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    quantize_deepseekv2()
+    ## vision部分暂时不用支持gptqmodel优化，直接W8A8/W8A16就行
+
+

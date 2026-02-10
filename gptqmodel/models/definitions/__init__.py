@@ -77,6 +77,7 @@ from .dbrx import DbrxQModel
 from .dbrx_converted import DbrxConvertedQModel
 from .decilm import DeciLMQModel
 from .deepseek_v2 import DeepSeekV2QModel
+from .deepseek_v2_ocr import DeepSeekV2OCRQModel
 from .deepseek_v3 import DeepSeekV3QModel
 from .dots1 import Dots1QModel
 from .dream import DreamQModel

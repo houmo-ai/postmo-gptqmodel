@@ -81,6 +81,7 @@ from .definitions.dbrx import DbrxQModel  # noqa: E402
 from .definitions.dbrx_converted import DbrxConvertedQModel  # noqa: E402
 from .definitions.decilm import DeciLMQModel  # noqa: E402
 from .definitions.deepseek_v2 import DeepSeekV2QModel  # noqa: E402
+from .definitions.deepseek_v2_ocr import DeepSeekV2OCRQModel  # noqa: E402
 from .definitions.deepseek_v3 import DeepSeekV3QModel  # noqa: E402
 from .definitions.dots1 import Dots1QModel  # noqa: E402
 from .definitions.dream import DreamQModel  # noqa: E402
@@ -239,7 +240,7 @@ MODEL_MAP = {
     "qwen3_vl": Qwen3_VLQModel,
     "dbrx": DbrxQModel,
     "dbrx_converted": DbrxConvertedQModel,
-    "deepseek_v2": DeepSeekV2QModel,
+    "deepseek_v2_ocr": DeepSeekV2OCRQModel,
     "deepseek_v3": DeepSeekV3QModel,
     "dots1": Dots1QModel,
     "exaone": ExaOneQModel,
@@ -267,6 +268,8 @@ MODEL_MAP = {
     "nemotron_h": NemotronHQModel,
     "bailing_moe": BailingMoeQModel,
     "lfm2_moe": LFM2MoeQModel,
+    "deepseek_v2": DeepSeekV2QModel,
+    "deepseek_v2_ocr": DeepSeekV2OCRQModel,
 }
 
 SUPPORTED_MODELS = list(MODEL_MAP.keys())
