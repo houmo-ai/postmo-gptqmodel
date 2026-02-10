@@ -753,8 +753,21 @@ def rotate_q_low_rank_mla(layer, Q, device) -> None:
     """
     q_a_proj = layer.self_attn.q_a_proj
     q_b_proj = layer.self_attn.q_b_proj
-    apply_exact_had_to_linear(q_a_proj, had_dim=-1, output=True)
-    apply_exact_had_to_linear(q_b_proj, had_dim=-1, output=False)
+    if Q is None:
+        apply_exact_had_to_linear(q_a_proj, had_dim=-1, output=True)
+        apply_exact_had_to_linear(q_b_proj, had_dim=-1, output=False)
+        return
+
+    dtype = q_a_proj.weight.dtype
+    w_q_a = q_a_proj.weight.data.to(device=device, dtype=torch.float64)
+    q_a_proj.weight.data = torch.matmul(Q.T, w_q_a).to(device="cpu", dtype=dtype)
+    if q_a_proj.bias is not None:
+        b = q_a_proj.bias.data.to(device=device, dtype=torch.float64)
+        q_a_proj.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+    dtype = q_b_proj.weight.dtype
+    w_q_b = q_b_proj.weight.data.to(device=device, dtype=torch.float64)
+    q_b_proj.weight.data = torch.matmul(w_q_b, Q).to(device="cpu", dtype=dtype)
 
 def rotate_kv_low_rank_mla(layer, Q, device) -> None:
     # kv 部分的lowrank的旋转，需要将kv_a_proj_with_mqa的权重拆分成latent和rope两个部分，然后分别进行旋转
@@ -823,6 +836,33 @@ def rotate_glm4_moe_lite_mlp_output_moe(layer, Q, device):
             b = W.bias.data.to(device=device, dtype=torch.float64)
             W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
 
+
+def _resolve_rotation_matrix(spec, layer_idx: int, target_name: str):
+    if spec is None:
+        return None
+    if torch.is_tensor(spec):
+        return spec
+    if isinstance(spec, list):
+        if layer_idx < len(spec) and torch.is_tensor(spec[layer_idx]):
+            return spec[layer_idx]
+        return None
+    if isinstance(spec, dict):
+        direct_key = f"{target_name}_layer_{layer_idx}"
+        if direct_key in spec and torch.is_tensor(spec[direct_key]):
+            return spec[direct_key]
+        if target_name in spec and torch.is_tensor(spec[target_name]):
+            return spec[target_name]
+        candidate_keys = [k for k in spec if k.startswith(f"{target_name}_layer_")]
+        if candidate_keys:
+            for key in sorted(candidate_keys):
+                if torch.is_tensor(spec[key]):
+                    return spec[key]
+        for value in spec.values():
+            if torch.is_tensor(value):
+                return value
+    return None
+
+
 @torch.inference_mode()
 def rotate_model_glm4_moe_lite(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
                                layers_node: str, Q=None):
@@ -832,44 +872,46 @@ def rotate_model_glm4_moe_lite(model: PreTrainedModel, rotate_mode: str, device:
     This function handles the MLA attention structure and MoE architecture.
     It calls the model's internal `_setup` method to perform fusion and rotation.
     """
-    Q_block = (
-        get_orthogonal_matrix(
-            model.config.hidden_size, rotate_mode, device
-        )
-        if Q is None
-        else Q
-    )
+    q_block_spec = Q
+    q_q_lowrank_spec = None
+    q_kv_lowrank_spec = None
+    if isinstance(Q, dict):
+        q_block_spec = Q.get("Q_block", Q.get("Q"))
+        q_q_lowrank_spec = Q.get("Q_q_lowrank")
+        q_kv_lowrank_spec = Q.get("Q_kv_lowrank")
 
-    # 修复：Q_q_lowrank应该是q_lora_rank维度，不是hidden_size
-    Q_q_lowrank = (
-        get_orthogonal_matrix(
-            model.config.q_lora_rank, rotate_mode, device  # 修复：使用q_lora_rank
-        )
+    Q_block = _resolve_rotation_matrix(q_block_spec, 0, "Q_block")
+    if Q_block is None:
+        Q_block = get_orthogonal_matrix(model.config.hidden_size, rotate_mode, device)
 
-    )
-
-    Q_kv_lowrank = (
-        get_orthogonal_matrix(
-            model.config.kv_lora_rank, rotate_mode, device
-        )
-
-    )
+    Q_q_lowrank_default = get_orthogonal_matrix(model.config.q_lora_rank, rotate_mode, device)
+    Q_kv_lowrank_default = get_orthogonal_matrix(model.config.kv_lora_rank, rotate_mode, device)
     
-    rotate_embeddings(model, Q_block, device)
-    rotate_head(model, Q_block, device, lm_head_name)
+    rotate_embeddings(model, Q_block.to(device=device, dtype=torch.float64), device)
+    rotate_head(model, Q_block.to(device=device, dtype=torch.float64), device, lm_head_name)
     torch_empty_cache()
     
     layers, _ = get_module_by_name_prefix(model, layers_node)
     for idx, layer in enumerate(log.pb(layers).title("Rotating GLM4 MoE Lite")):
-        rotate_attention_inputs_mla(layer, Q_block, device)
-        rotate_attention_output_mla(layer, Q_block, device)
-        rotate_q_low_rank_mla(layer, Q_q_lowrank, device)
-        rotate_kv_low_rank_mla(layer, Q_kv_lowrank, device)
+        q_block_layer = _resolve_rotation_matrix(q_block_spec, idx, "Q_block")
+        if q_block_layer is None:
+            q_block_layer = Q_block
+        q_q_lowrank_layer = _resolve_rotation_matrix(q_q_lowrank_spec, idx, "Q_q_lowrank")
+        if q_q_lowrank_layer is None:
+            q_q_lowrank_layer = Q_q_lowrank_default
+        q_kv_lowrank_layer = _resolve_rotation_matrix(q_kv_lowrank_spec, idx, "Q_kv_lowrank")
+        if q_kv_lowrank_layer is None:
+            q_kv_lowrank_layer = Q_kv_lowrank_default
+
+        rotate_attention_inputs_mla(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
+        rotate_attention_output_mla(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
+        rotate_q_low_rank_mla(layer, q_q_lowrank_layer.to(device=device, dtype=torch.float64), device)
+        rotate_kv_low_rank_mla(layer, q_kv_lowrank_layer.to(device=device, dtype=torch.float64), device)
         if hasattr(layer.mlp, 'experts'):
-            rotate_glm4_moe_lite_mlp_input_moe(layer, Q_block, device)
-            rotate_glm4_moe_lite_mlp_output_moe(layer, Q_block, device)
+            rotate_glm4_moe_lite_mlp_input_moe(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
+            rotate_glm4_moe_lite_mlp_output_moe(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
         else:
-            rotate_mlp_input(layer, Q_block, device)
-            rotate_mlp_output(layer, Q_block, device)
+            rotate_mlp_input(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
+            rotate_mlp_output(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
     
     return model, Q_block  # 修复：返回Q_block而不是Q

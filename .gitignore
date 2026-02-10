@@ -184,6 +184,11 @@ example.py
 /gptqmodel_offload/
 /gptqmodel_ext/machete/generated/
 AGENT.md
+AGENTS.md
+agent
 output/
 data/datasets
 gptqmodel/quantization/diceq/data
+diceq_tmp
+gptqmodel/quantization/diceq/DICEQuant
+.trae

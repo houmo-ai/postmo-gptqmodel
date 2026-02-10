@@ -10,3 +10,5 @@ pip install setuptools==79.0.1
 pip uninstall SoundFile
 pip install SoundFile
 ```
+2. 自研算法加持
+

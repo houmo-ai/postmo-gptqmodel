@@ -8,11 +8,14 @@ import copy
 import json
 import os
 import re
+import shutil
 import threading
+import tempfile
 import time
 from collections import defaultdict
 from contextlib import nullcontext
 from itertools import count
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Type, Union
 
 import torch
@@ -341,7 +344,7 @@ class BaseQModel(nn.Module):
 
     modality: List[MODALITY] = [MODALITY.TEXT]
 
-    quant_override_files: Dict[str, Union[str | Dict[str, Any]]] = {}
+    quant_override_files: Dict[str, Union[str, Dict[str, Any]]] = {}
 
     server = None
 
@@ -576,8 +579,8 @@ class BaseQModel(nn.Module):
             List[Dict[str, Union[List[int], torch.LongTensor]]],
             List[str],
             List[List[int]],
-            "HFDatasetType",
-            "HFIterableDatasetType",
+            HFDatasetType,
+            HFIterableDatasetType,
         ],
         calibration_dataset_concat_size: Optional[int] = None,
         calibration_dataset_sort: Optional[str] = None,
@@ -595,6 +598,187 @@ class BaseQModel(nn.Module):
             calibration_concat_separator=calibration_concat_separator,
             logger=log,
         )
+
+    def _resolve_diceq_pipeline_config(self) -> Optional[Dict[str, Any]]:
+        resolver = getattr(self, "get_diceq_pipeline_config", None)
+        if not callable(resolver):
+            return None
+        cfg = resolver()
+        if not isinstance(cfg, dict):
+            return None
+        if not bool(cfg.get("enabled", False)):
+            return None
+        return cfg
+
+    def _check_activation_cache(
+        self,
+        data_root: Path,
+        layer_config: Dict[str, Any],
+        expected_nsamples: int,
+    ) -> bool:
+        """
+        检查是否存在有效的激活数据缓存。
+
+        检查逻辑：
+        1. 检查 data_root 目录是否存在
+        2. 检查每个 r_type 对应的文件夹是否存在且非空
+        3. 检查每个文件夹中的样本数量是否满足要求
+
+        Args:
+            data_root: 激活数据根目录
+            layer_config: 层配置字典
+            expected_nsamples: 期望的样本数量
+
+        Returns:
+            bool: 缓存是否有效
+        """
+        if not data_root.exists():
+            log.debug(f"激活数据缓存目录不存在: {data_root}")
+            return False
+
+        for r_type, cfg in layer_config.items():
+            if not isinstance(cfg, dict):
+                continue
+
+            folder = cfg.get("folder", r_type)
+            r_type_path = data_root / folder
+
+            if not r_type_path.exists():
+                log.debug(f"r_type '{r_type}' 的缓存目录不存在: {r_type_path}")
+                return False
+
+            # 检查目录是否为空
+            files = list(r_type_path.iterdir())
+            if not files:
+                log.debug(f"r_type '{r_type}' 的缓存目录为空: {r_type_path}")
+                return False
+
+            # 检查样本数量（根据保存模式判断）
+            save_mode = cfg.get("save_mode", "separate")
+            if save_mode == "separate":
+                # 逐个样本保存模式：检查文件数量
+                # 每个样本可能有多个文件（多个层），所以文件数应该 >= expected_nsamples
+                if len(files) < expected_nsamples:
+                    log.debug(f"r_type '{r_type}' 的缓存样本数量不足: {len(files)} < {expected_nsamples}")
+                    return False
+            elif save_mode == "combined":
+                # 合并保存模式：检查是否存在合并后的文件
+                # 合并模式通常只有一个文件，包含所有样本
+                if len(files) < 1:
+                    log.debug(f"r_type '{r_type}' 的合并缓存文件不存在")
+                    return False
+
+        log.info(f"激活数据缓存检查通过，所有 {len([k for k in layer_config.keys() if isinstance(layer_config[k], dict)])} 个 r_type 的缓存均有效")
+        return True
+
+    def _run_diceq_pipeline(
+        self,
+        *,
+        rotation_device: Union[str, torch.device],
+    ) -> Optional[Dict[str, Any]]:
+        diceq_cfg = self._resolve_diceq_pipeline_config()
+        if diceq_cfg is None:
+            return None
+
+        log.info("DiceQ: enabled, preparing data and training rotation matrices.")
+
+        from ..quantization.diceq.get_rotation_matrix import train_rotation_for_targets
+        from ..quantization.diceq.get_train_data_hook import collect_training_data_for_diceq
+        from ..quantization.diceq.data_utils import get_loaders
+
+        try:
+            layer_config = diceq_cfg.get("layer_config")
+            if not isinstance(layer_config, dict) or not layer_config:
+                raise ValueError("DiceQ config must provide non-empty `layer_config` dict.")
+
+            seqlen = int(diceq_cfg.get("seqlen", 2048))
+            collect_nsamples = int(diceq_cfg.get("nsamples", 128))
+            seed = int(diceq_cfg.get("seed", 0))
+            calib_dataset = diceq_cfg.get("calib_dataset", "wikitext2")
+            targets = diceq_cfg.get("targets")
+            if isinstance(targets, str):
+                targets = [targets]
+            elif targets is not None:
+                targets = list(targets)
+
+            # device 用于激活数据采集，从 rotation_device 自动推导
+            if isinstance(rotation_device, torch.device):
+                device_arg = rotation_device.type
+            else:
+                device_arg = str(rotation_device).lower()
+                if device_arg in {"device.cpu", "cpu"}:
+                    device_arg = "cpu"
+                elif "cuda" in device_arg:
+                    device_arg = "cuda"
+                else:
+                    device_arg = "auto"
+
+            # 获取临时数据目录配置，默认为 ./diceq_tmp
+            tmp_data_dir = diceq_cfg.get("tmp_data_dir", "./diceq_tmp")
+            tmp_root = Path(tmp_data_dir)
+            tmp_root.mkdir(parents=True, exist_ok=True)
+            data_root = tmp_root / "data"
+            train_root = tmp_root / "rotation"
+            log.info(f"DiceQ: 使用临时数据目录: {tmp_root.absolute()}")
+
+            # 检查是否已存在激活数据缓存
+            cache_valid = self._check_activation_cache(data_root, layer_config, collect_nsamples)
+            if cache_valid:
+                log.info("DiceQ: 发现有效的激活数据缓存，跳过激活搜集步骤")
+                # 直接使用缓存的数据路径
+                target_data_path = {}
+                for r_type, cfg in layer_config.items():
+                    if isinstance(cfg, dict):
+                        folder = cfg.get("folder", r_type)
+                        target_data_path[r_type] = str(data_root / folder)
+            else:
+                log.info("DiceQ: 未找到有效的激活数据缓存，开始搜集激活数据")
+                # 使用 get_loaders 内部获取校准数据集
+                diceq_calibration = get_loaders(
+                    calib_dataset,
+                    nsamples=collect_nsamples,
+                    seed=seed,
+                    model=self.model.name_or_path if hasattr(self.model, 'name_or_path') else self.model.config._name_or_path,
+                    seqlen=seqlen,
+                    eval_mode=False
+                )
+
+                target_data_path = collect_training_data_for_diceq(
+                    model=self.model,
+                    dataloader=diceq_calibration,
+                    output_root=data_root,
+                    r_config=layer_config,
+                    nsamples=collect_nsamples,
+                    seqlen=seqlen,
+                    seed=seed,
+                    device=device_arg,
+                )
+                log.info("DiceQ: 激活数据搜集完成")
+
+            try:
+                # device / train_nsamples 已移入各 target 的 train_args，无需顶层传入
+                target_rotations = train_rotation_for_targets(
+                    target_to_data_path=target_data_path,
+                    config_dict=layer_config,
+                    targets=targets,
+                    seed=seed,
+                    model=diceq_cfg.get("model"),
+                    hf_token=diceq_cfg.get("hf_token"),
+                    head_num=diceq_cfg.get("head_num"),
+                    log_dir=train_root / "logs",
+                    log_level=str(diceq_cfg.get("log_level", "INFO")),
+                    output_dir=train_root / "artifacts",
+                )
+                log.info("DiceQ: rotation matrices ready.")
+                return target_rotations
+            except Exception as exc:
+                log.error(f"DiceQ: 训练旋转矩阵失败: {exc}")
+                raise
+        except Exception as exc:
+            if bool(diceq_cfg.get("strict", False)):
+                raise
+            log.warn("DiceQ: failed (%s), fallback to built-in rotation.", exc)
+            return None
 
     def quantize(
         self,
@@ -800,13 +984,19 @@ class BaseQModel(nn.Module):
                                           **module_name_args)
             # MPS does not support float64.
             rotation_device = self.quantize_config.device if self.quantize_config.device != DEVICE.MPS else DEVICE.CPU
+
+            diceq_q = None
+            if hasattr(self, '_run_diceq_pipeline'):
+                diceq_q = self._run_diceq_pipeline(
+                    rotation_device=rotation_device,
+                )
             # self.model, _ = rotate_model(model=self.model, rotate_mode=self.quantize_config.rotation,
             #                                 device=rotation_device, **module_name_args)
             if self.quantize_config.rotation_vision:
                 self.model, _ = entry['rotate_vision_fn'](model=self.model, rotate_mode=self.quantize_config.rotation_vision,
                                                 device=rotation_device, **module_name_args)
             self.model, _ = entry["rotate_fn"](model=self.model, rotate_mode=self.quantize_config.rotation,
-                                            device=rotation_device, **module_name_args)
+                                            device=rotation_device, Q=diceq_q, **module_name_args)
         # init processor with default GPTQ processor
         from ..looper.tensorparallel_weight_processor import TensorParallelWeightProcessor
 
