@@ -33,11 +33,12 @@ def main():
     parser.add_argument("--rotation", type=str, default='hadamard', help="可选旋转优化 (GLM4 MoE Lite暂不支持，留空)")
     parser.add_argument("--sym", default=True, help="对称量化")
     parser.add_argument("--mse", default=True, help="开启 MSE 辅助优化")
+    parser.add_argument("--hessian-mse", default=True, help="开启 Hessian MSE 辅助优化")
     args = parser.parse_args()
 
     model_id = os.path.normpath(args.model)
     model_name = Path(model_id).name
-    save_dir = args.out or f"{model_name}-{args.bits}bit-{args.group_size}g"
+    save_dir = args.out or f"{model_name}-{args.bits}bit-{args.group_size}g-hessian_mse"
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=True)
     calib_dataset = build_calib_dataset(tokenizer, nsamples=args.nsamples, seqlen=args.seqlen)
@@ -48,6 +49,7 @@ def main():
         sym=bool(args.sym),
         mse=bool(args.mse),
         rotation=args.rotation,
+        hessian_mse=bool(args.hessian_mse),
     )
 
     # gpt-oss 需要 remote code（模型定义），这里务必开启
