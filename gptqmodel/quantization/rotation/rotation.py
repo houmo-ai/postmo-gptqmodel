@@ -720,6 +720,106 @@ def fuse_layer_norms_mla_with_moe(model: PreTrainedModel, pre_lm_head_norm_modul
     return model
 
 
+def fuse_layer_norms_deepseekv3_mla_moe(
+    model: PreTrainedModel,
+    pre_lm_head_norm_module_name: str,
+    layers_node: str,
+    lm_head_name: str,
+):
+    """
+    Alias for DeepSeek V3 MLA+MoE layer-norm fusion.
+
+    DeepSeek V3 的文本部分结构与 GLM4 MoE Lite 的 MLA+MoE 结构一致，这里直接复用
+    `fuse_layer_norms_mla_with_moe` 的实现，仅在命名上区分，便于阅读和注册。
+    """
+    return fuse_layer_norms_mla_with_moe(
+        model=model,
+        pre_lm_head_norm_module_name=pre_lm_head_norm_module_name,
+        layers_node=layers_node,
+        lm_head_name=lm_head_name,
+    )
+
+def fuse_layer_norms_deepseekv2_mla_moe(
+    model: PreTrainedModel,
+    pre_lm_head_norm_module_name: str,
+    layers_node: str,
+    lm_head_name: str,
+):
+    """
+    Fuse layer norms for DeepSeek V2 (MLA + MoE) model.
+
+    DeepSeek V2 uses:
+      - MLA attention with q_a_proj / kv_a_proj_with_mqa as first-stage projections
+      - MoE MLP where each expert is a DeepseekV2MLP(gate_proj, up_proj, down_proj)
+        and optional shared_experts with the same structure.
+    """
+    layers, _ = get_module_by_name_prefix(model, layers_node)
+
+    for layer in layers:
+        mlp = layer.mlp
+        # Fuse post_attention_layernorm into MLP inputs
+        if hasattr(mlp, "experts"):
+            # MoE layers: experts is a ModuleList of DeepseekV2MLP
+            for expert in mlp.experts:
+                if expert is None:
+                    continue
+                expert_linears = []
+                if hasattr(expert, "gate_proj"):
+                    expert_linears.append(expert.gate_proj)
+                if hasattr(expert, "up_proj"):
+                    expert_linears.append(expert.up_proj)
+                if expert_linears:
+                    fuse_ln_linear(layer.post_attention_layernorm, expert_linears)
+
+            if hasattr(mlp, "shared_experts"):
+                shared_linears = []
+                if hasattr(mlp.shared_experts, "gate_proj"):
+                    shared_linears.append(mlp.shared_experts.gate_proj)
+                if hasattr(mlp.shared_experts, "up_proj"):
+                    shared_linears.append(mlp.shared_experts.up_proj)
+                if shared_linears:
+                    fuse_ln_linear(layer.post_attention_layernorm, shared_linears)
+        else:
+            # Dense MLP layers
+            fuse_ln_linear(
+                layer.post_attention_layernorm,
+                [mlp.up_proj, mlp.gate_proj],
+            )
+
+        # Fuse input_layernorm into first-stage attention MLA projections
+        attn = layer.self_attn
+        attn_inputs = []
+        if hasattr(attn, "q_a_proj"):
+            attn_inputs.append(attn.q_a_proj)
+        if hasattr(attn, "kv_a_proj_with_mqa"):
+            attn_inputs.append(attn.kv_a_proj_with_mqa)
+
+        if attn_inputs:
+            fuse_ln_linear(layer.input_layernorm, attn_inputs)
+
+        # Fuse q_a_layernorm into q_b_proj
+        if hasattr(attn, "q_a_layernorm") and hasattr(attn, "q_b_proj"):
+            fuse_ln_linear(attn.q_a_layernorm, [attn.q_b_proj])
+
+        # Fuse kv_a_layernorm into kv_b_proj
+        if hasattr(attn, "kv_a_layernorm") and hasattr(attn, "kv_b_proj"):
+            fuse_ln_linear(attn.kv_a_layernorm, [attn.kv_b_proj])
+
+        reset_ln(layer.post_attention_layernorm)
+        reset_ln(layer.input_layernorm)
+        if hasattr(attn, "q_a_layernorm"):
+            reset_ln(attn.q_a_layernorm)
+        if hasattr(attn, "kv_a_layernorm"):
+            reset_ln(attn.kv_a_layernorm)
+
+    # Fuse pre-head layernorm into lm_head
+    pre_head_layernorm, _ = get_module_by_name_prefix(model, pre_lm_head_norm_module_name)
+    lm_head, _ = get_module_by_name_prefix(model, lm_head_name)
+
+    fuse_ln_linear(pre_head_layernorm, [lm_head])
+    reset_ln(pre_head_layernorm)
+    return model
+
 def rotate_attention_inputs_mla(layer, Q, device) -> None:
     """
     Rotate MLA attention input projections.
@@ -853,6 +953,55 @@ def rotate_glm4_moe_lite_mlp_output_moe(layer, Q, device):
             W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
 
 
+def rotate_deepseekv2_mlp_input_moe(layer, Q, device):
+    # Rotate the MoE MLP input weights for DeepSeek V2.
+    mlp = layer.mlp
+    mlp_inputs = []
+    if hasattr(mlp, "experts"):
+        for expert in mlp.experts:
+            if expert is None:
+                continue
+            if hasattr(expert, "gate_proj"):
+                mlp_inputs.append(expert.gate_proj)
+            if hasattr(expert, "up_proj"):
+                mlp_inputs.append(expert.up_proj)
+    if hasattr(mlp, "shared_experts"):
+        shared = mlp.shared_experts
+        if hasattr(shared, "gate_proj"):
+            mlp_inputs.append(shared.gate_proj)
+        if hasattr(shared, "up_proj"):
+            mlp_inputs.append(shared.up_proj)
+    for W in mlp_inputs:
+        dtype = W.weight.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+
+def rotate_deepseekv2_mlp_output_moe(layer, Q, device):
+    # Rotate the MoE MLP output weights and bias for DeepSeek V2.
+    mlp = layer.mlp
+    if hasattr(mlp, "experts"):
+        for expert in mlp.experts:
+            if expert is None:
+                continue
+            if hasattr(expert, "down_proj"):
+                W = expert.down_proj
+                dtype = W.weight.data.dtype
+                W_ = W.weight.data.to(device=device, dtype=torch.float64)
+                W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+                if W.bias is not None:
+                    b = W.bias.data.to(device=device, dtype=torch.float64)
+                    W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+    if hasattr(mlp, "shared_experts") and hasattr(mlp.shared_experts, "down_proj"):
+        W = mlp.shared_experts.down_proj
+        dtype = W.weight.data.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+        if W.bias is not None:
+            b = W.bias.data.to(device=device, dtype=torch.float64)
+            W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+
 def _resolve_rotation_matrix(spec, layer_idx: int, target_name: str):
     if spec is None:
         return None
@@ -931,3 +1080,88 @@ def rotate_model_glm4_moe_lite(model: PreTrainedModel, rotate_mode: str, device:
             rotate_mlp_output(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
     
     return model, Q_block  # 修复：返回Q_block而不是Q
+
+
+@torch.inference_mode()
+def rotate_model_deepseekv3_mla_moe(
+    model: PreTrainedModel,
+    rotate_mode: str,
+    device: torch.device,
+    lm_head_name: str,
+    layers_node: str,
+    Q=None,
+):
+    """
+    Alias for DeepSeek V3 MLA+MoE rotation.
+
+    DeepSeek V3 的 MLA+MoE 结构与 GLM4 MoE Lite 一致，因此这里直接复用
+    `rotate_model_glm4_moe_lite` 的实现，仅在命名上区分，便于在注册表中对
+    DeepSeekV3QModel 和 Glm4MoeLiteQModel 做不同映射。
+    """
+    return rotate_model_glm4_moe_lite(
+        model=model,
+        rotate_mode=rotate_mode,
+        device=device,
+        lm_head_name=lm_head_name,
+        layers_node=layers_node,
+        Q=Q,
+    )
+
+
+
+@torch.inference_mode()
+def rotate_model_deepseekv2_mla_moe(
+    model: PreTrainedModel,
+    rotate_mode: str,
+    device: torch.device,
+    lm_head_name: str,
+    layers_node: str,
+    Q=None,
+):
+    """
+    Rotate DeepSeek V2 (MLA + MoE) model weights for improved quantization.
+    """
+    q_block_spec = Q
+    q_q_lowrank_spec = None
+    q_kv_lowrank_spec = None
+    if isinstance(Q, dict):
+        q_block_spec = Q.get("Q_block", Q.get("Q"))
+        q_q_lowrank_spec = Q.get("Q_q_lowrank")
+        q_kv_lowrank_spec = Q.get("Q_kv_lowrank")
+
+    Q_block = _resolve_rotation_matrix(q_block_spec, 0, "Q_block")
+    if Q_block is None:
+        Q_block = get_orthogonal_matrix(model.config.hidden_size, rotate_mode, device)
+
+    Q_q_lowrank_default = get_orthogonal_matrix(model.config.q_lora_rank, rotate_mode, device)
+    Q_kv_lowrank_default = get_orthogonal_matrix(model.config.kv_lora_rank, rotate_mode, device)
+
+    rotate_embeddings(model, Q_block.to(device=device, dtype=torch.float64), device)
+    rotate_head(model, Q_block.to(device=device, dtype=torch.float64), device, lm_head_name)
+    torch_empty_cache()
+
+    layers, _ = get_module_by_name_prefix(model, layers_node)
+    for idx, layer in enumerate(log.pb(layers).title("Rotating DeepSeek V2 MLA-MoE")):
+        q_block_layer = _resolve_rotation_matrix(q_block_spec, idx, "Q_block")
+        if q_block_layer is None:
+            q_block_layer = Q_block
+        q_q_lowrank_layer = _resolve_rotation_matrix(q_q_lowrank_spec, idx, "Q_q_lowrank")
+        if q_q_lowrank_layer is None:
+            q_q_lowrank_layer = Q_q_lowrank_default
+        q_kv_lowrank_layer = _resolve_rotation_matrix(q_kv_lowrank_spec, idx, "Q_kv_lowrank")
+        if q_kv_lowrank_layer is None:
+            q_kv_lowrank_layer = Q_kv_lowrank_default
+
+        rotate_attention_inputs_mla(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
+        rotate_attention_output_mla(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
+        rotate_q_low_rank_mla(layer, q_q_lowrank_layer.to(device=device, dtype=torch.float64), device)
+        rotate_kv_low_rank_mla(layer, q_kv_lowrank_layer.to(device=device, dtype=torch.float64), device)
+        if hasattr(layer.mlp, "experts"):
+            rotate_deepseekv2_mlp_input_moe(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
+            rotate_deepseekv2_mlp_output_moe(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
+        else:
+            rotate_mlp_input(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
+            rotate_mlp_output(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
+
+    return model, Q_block
+
