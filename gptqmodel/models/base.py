@@ -769,11 +769,12 @@ class BaseQModel(nn.Module):
 
             # 获取临时数据目录配置，默认为 ./diceq_tmp
             tmp_data_dir = diceq_cfg.get("tmp_data_dir", "./diceq_tmp")
-            tmp_root = Path(tmp_data_dir)
+            model_type = getattr(self.model.config, "model_type", "unknown_model")
+            tmp_root = Path(tmp_data_dir) / model_type
             tmp_root.mkdir(parents=True, exist_ok=True)
             data_root = tmp_root / "data"
             train_root = tmp_root / "rotation"
-            log.info(f"DiceQ: 使用临时数据目录: {tmp_root.absolute()}")
+            log.info(f"DiceQ: 使用模型专属临时数据目录: {tmp_root.absolute()}")
 
             # 检查是否已存在激活数据缓存
             cache_valid = self._check_activation_cache(data_root, layer_config, collect_nsamples)

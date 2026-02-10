@@ -458,111 +458,127 @@ def rotate_ov_proj(layer, head_num, head_dim):
 @torch.inference_mode()
 def rotate_model(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
                  layers_node: str, Q=None):
-    Q = (
-        get_orthogonal_matrix(
-            model.config.hidden_size, rotate_mode, device
-        )
-        if Q is None
-        else Q
-    )
+    q_block_spec = Q
+    if isinstance(Q, dict):
+        q_block_spec = Q.get("Q_block", Q.get("Q"))
+
+    Q_block = _resolve_rotation_matrix(q_block_spec, 0, "Q_block")
+    if Q_block is None:
+        Q_block = get_orthogonal_matrix(model.config.hidden_size, rotate_mode, device)
+
     config = model.config
     num_heads = config.num_attention_heads
     model_dim = config.hidden_size
     head_dim = model_dim // num_heads
 
-    rotate_embeddings(model, Q, device)
-    rotate_head(model, Q, device, lm_head_name)
+    rotate_embeddings(model, Q_block, device)
+    rotate_head(model, Q_block, device, lm_head_name)
     torch_empty_cache()
     layers , _ = get_module_by_name_prefix(model, layers_node)
     for idx, layer in enumerate(log.pb(layers).title("Rotating")):
-        rotate_attention_inputs(layer, Q, device)
-        rotate_attention_output(layer, Q, device)
-        rotate_mlp_input(layer, Q, device)
-        rotate_mlp_output(layer, Q, device)
+        q_layer = _resolve_rotation_matrix(q_block_spec, idx, "Q_block")
+        if q_layer is None:
+            q_layer = Q_block
+        rotate_attention_inputs(layer, q_layer, device)
+        rotate_attention_output(layer, q_layer, device)
+        rotate_mlp_input(layer, q_layer, device)
+        rotate_mlp_output(layer, q_layer, device)
         rotate_ov_proj(layer, num_heads, head_dim)
-    return model, Q
+    return model, Q_block
 
 
 @torch.inference_mode()
 def rotate_model_qwen2_5_vl(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
                           layers_node: str, Q=None):
-    Q = (
-        get_orthogonal_matrix(
-            model.config.text_config.hidden_size, rotate_mode, device
-        )
-        if Q is None
-        else Q
-    )
+    q_block_spec = Q
+    if isinstance(Q, dict):
+        q_block_spec = Q.get("Q_block", Q.get("Q"))
+
+    Q_block = _resolve_rotation_matrix(q_block_spec, 0, "Q_block")
+    if Q_block is None:
+        Q_block = get_orthogonal_matrix(model.config.text_config.hidden_size, rotate_mode, device)
+
     config = model.config
     num_heads = config.text_config.num_attention_heads
     model_dim = config.text_config.hidden_size
     head_dim = model_dim // num_heads
 
-    rotate_qwen2_5_vl_embeddings(model, Q, device)
-    rotate_head(model, Q, device, lm_head_name)
+    rotate_qwen2_5_vl_embeddings(model, Q_block, device)
+    rotate_head(model, Q_block, device, lm_head_name)
     torch_empty_cache()
     layers , _ = get_module_by_name_prefix(model, layers_node)
     for idx, layer in enumerate(log.pb(layers).title("Rotating")):
-        rotate_attention_inputs(layer, Q, device)
-        rotate_attention_output(layer, Q, device)
-        rotate_mlp_input(layer, Q, device)
-        rotate_mlp_output(layer, Q, device)
-    return model, Q
+        q_layer = _resolve_rotation_matrix(q_block_spec, idx, "Q_block")
+        if q_layer is None:
+            q_layer = Q_block
+        rotate_attention_inputs(layer, q_layer, device)
+        rotate_attention_output(layer, q_layer, device)
+        rotate_mlp_input(layer, q_layer, device)
+        rotate_mlp_output(layer, q_layer, device)
+    return model, Q_block
 
 
 @torch.inference_mode()
 def rotate_model_qwen3_vl(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
                           layers_node: str, Q=None):
-    Q = (
-        get_orthogonal_matrix(
-            model.config.text_config.hidden_size, rotate_mode, device
-        )
-        if Q is None
-        else Q
-    )
+    q_block_spec = Q
+    if isinstance(Q, dict):
+        q_block_spec = Q.get("Q_block", Q.get("Q"))
+
+    Q_block = _resolve_rotation_matrix(q_block_spec, 0, "Q_block")
+    if Q_block is None:
+        Q_block = get_orthogonal_matrix(model.config.text_config.hidden_size, rotate_mode, device)
+
     config = model.config
     num_heads = config.text_config.num_attention_heads
     model_dim = config.text_config.hidden_size
     head_dim = model_dim // num_heads
 
-    rotate_qwen3_vl_embeddings(model, Q, device)
-    rotate_head(model, Q, device, lm_head_name)
+    rotate_qwen3_vl_embeddings(model, Q_block, device)
+    rotate_head(model, Q_block, device, lm_head_name)
     torch_empty_cache()
     layers , _ = get_module_by_name_prefix(model, layers_node)
     for idx, layer in enumerate(log.pb(layers).title("Rotating")):
-        rotate_attention_inputs(layer, Q, device)
-        rotate_attention_output(layer, Q, device)
-        rotate_mlp_input(layer, Q, device)
-        rotate_mlp_output(layer, Q, device)
-    return model, Q
+        q_layer = _resolve_rotation_matrix(q_block_spec, idx, "Q_block")
+        if q_layer is None:
+            q_layer = Q_block
+        rotate_attention_inputs(layer, q_layer, device)
+        rotate_attention_output(layer, q_layer, device)
+        rotate_mlp_input(layer, q_layer, device)
+        rotate_mlp_output(layer, q_layer, device)
+    return model, Q_block
 
 
 @torch.inference_mode()
 def rotate_model_moe(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
                           layers_node: str, Q=None):
-    Q = (
-        get_orthogonal_matrix(
-            model.config.hidden_size, rotate_mode, device
-        )
-        if Q is None
-        else Q
-    )
+    q_block_spec = Q
+    if isinstance(Q, dict):
+        q_block_spec = Q.get("Q_block", Q.get("Q"))
+
+    Q_block = _resolve_rotation_matrix(q_block_spec, 0, "Q_block")
+    if Q_block is None:
+        Q_block = get_orthogonal_matrix(model.config.hidden_size, rotate_mode, device)
+
     config = model.config
     num_heads = config.num_attention_heads
     model_dim = config.hidden_size
     head_dim = model_dim // num_heads
 
-    rotate_embeddings(model, Q, device)
-    rotate_head(model, Q, device, lm_head_name)
+    rotate_embeddings(model, Q_block, device)
+    rotate_head(model, Q_block, device, lm_head_name)
     torch_empty_cache()
     layers , _ = get_module_by_name_prefix(model, layers_node)
     for idx, layer in enumerate(log.pb(layers).title("Rotating")):
-        rotate_attention_inputs(layer, Q, device)
-        rotate_attention_output(layer, Q, device)
-        rotate_mlp_input_moe(layer, Q, device)
-        rotate_mlp_output_moe(layer, Q, device)
+        q_layer = _resolve_rotation_matrix(q_block_spec, idx, "Q_block")
+        if q_layer is None:
+            q_layer = Q_block
+        rotate_attention_inputs(layer, q_layer, device)
+        rotate_attention_output(layer, q_layer, device)
+        rotate_mlp_input_moe(layer, q_layer, device)
+        rotate_mlp_output_moe(layer, q_layer, device)
         rotate_ov_proj(layer, num_heads, head_dim)
-    return model, Q
+    return model, Q_block
 
 
 @torch.inference_mode()
