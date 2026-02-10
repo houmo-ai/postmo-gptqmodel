@@ -192,3 +192,4 @@ gptqmodel/quantization/diceq/data
 diceq_tmp
 gptqmodel/quantization/diceq/DICEQuant
 .trae
+workdirs
