@@ -64,7 +64,7 @@ graph LR
     Activation --- A5[A5/A4]
     A5 --> A_Easy[易量化]
     A_Easy --- Quaro1[quarot: 易量化LLM模型]
-    A_Easy --- BR1(Block rotation):::unfinished
+    A_Easy --- BR1(Block rotation)
     
     A5 --> A_Hard[难量化]
     A_Hard --- Diceq1(diceq: 针对激活训练)
@@ -84,7 +84,7 @@ graph LR
     W_Easy --- Hessian[hessian mse]
     W_Easy --- Rot2[rotation]
     Rot2 --- Quaro2[quarot: 易量化LLM模型]
-    Rot2 --- BR2(Block rotation):::unfinished
+    Rot2 --- BR2(Block rotation)
     
     W5 --> W_Hard[难量化]
     W_Hard --- Diceq2(diceq: 针对权重训练)
@@ -103,7 +103,6 @@ graph LR
 ```
 
 ## 5. TODO List
-- [ ]  block rotation：可以只支持个block_hadamard就行
 - [ ]  diceq算法：
     - [ ] 对于ov_rotate,需要支持head_wise的旋转，这块目前还没支持，还没验证
 - [ ]  校准集生成：
