@@ -64,7 +64,7 @@ def main():
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     # model = GPTQModel.load(save_dir, device=device, trust_remote_code=True)
     prompt = "GLM-4.7-Flash is"
-    print(tokenizer.decode(model.generate(**tokenizer(prompt, return_tensors="pt").to(device))[0]))
+    print(tokenizer.decode(model.generate(**tokenizer(prompt, return_tensors="pt"))[0]))
 
 
 if __name__ == "__main__":
