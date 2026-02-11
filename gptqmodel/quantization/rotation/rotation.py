@@ -336,6 +336,9 @@ def rotate_embeddings(model, Q, device) -> None:
 
 def rotate_attention_inputs(layer, Q, device) -> None:
     # Rotate the WQ, WK and WV matrices of the self-attention layer.
+    # Matrix multiplication order: W@R (W[oc,ic] @ R[ic,ic] -> W_new[oc,ic])
+    # This matches weight training mode where we train R using W@R.
+    # For activation training: A@R is equivalent to W@R when applied to weights.
     try:
         for W in [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj]:
             dtype = W.weight.dtype
@@ -349,6 +352,9 @@ def rotate_attention_inputs(layer, Q, device) -> None:
 
 def rotate_attention_output(layer, Q, device) -> None:
     # Rotate output matrix of the self-attention layer.
+    # Matrix multiplication order: R.T@W (R.T[ic,ic] @ W[ic,oc] -> W_new[ic,oc])
+    # Note: For output layers, we use R.T@W instead of W@R.
+    # If using weight training for output layers, need special handling.
     try:
         W = layer.self_attn.o_proj
     except:
@@ -363,6 +369,8 @@ def rotate_attention_output(layer, Q, device) -> None:
 
 def rotate_mlp_input(layer, Q, device):
     # Rotate the MLP input weights.
+    # Matrix multiplication order: W@R (W[oc,ic] @ R[ic,ic] -> W_new[oc,ic])
+    # This matches weight training mode where we train R using W@R.
     mlp_inputs = [layer.mlp.up_proj, layer.mlp.gate_proj]
     for W in mlp_inputs:
         dtype = W.weight.dtype
@@ -396,6 +404,9 @@ def rotate_mlp_input_moe(layer, Q, device):
 
 def rotate_mlp_output(layer, Q, device):
     # Rotate the MLP output weights and bias.
+    # Matrix multiplication order: R.T@W (R.T[ic,ic] @ W[ic,oc] -> W_new[ic,oc])
+    # Note: For output layers, we use R.T@W instead of W@R.
+    # If using weight training for output layers, need special handling.
     W = layer.mlp.down_proj
     dtype = W.weight.data.dtype
     W_ = W.weight.data.to(device=device, dtype=torch.float64)

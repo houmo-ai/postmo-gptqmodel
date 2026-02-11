@@ -69,6 +69,47 @@ class ActivationReferenceDataset(Dataset):
         return tensor
 
 
+class WeightReferenceDataset(Dataset):
+    """Lazy dataset for loading weight tensors by reference with lightweight caching.
+    
+    Similar to ActivationReferenceDataset but designed for weight data.
+    Weight tensors are expected to be 2D with shape [oc, ic] (output_channels, input_channels).
+    """
+
+    def __init__(self, refs: List[SampleRef]):
+        self.refs = refs
+        self._cached_path: Optional[Path] = None
+        self._cached_tensor: Optional[torch.Tensor] = None
+
+    def __len__(self) -> int:
+        return len(self.refs)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        ref = self.refs[idx]
+        tensor = self._load_tensor(ref.path)
+        sample = tensor if ref.inner_idx is None else tensor[ref.inner_idx]
+
+        # Weight tensors should be 2D [oc, ic]
+        if sample.ndim == 3 and sample.shape[0] == 1:
+            sample = sample.squeeze(0)
+        if sample.ndim != 2:
+            raise ValueError(
+                f"Weight sample must be 2D [oc, ic], got {tuple(sample.shape)} "
+                f"from file {ref.path}"
+            )
+        return sample
+
+    def _load_tensor(self, path: Path) -> torch.Tensor:
+        if self._cached_path == path and self._cached_tensor is not None:
+            return self._cached_tensor
+        tensor = safe_torch_load(path)
+        if not torch.is_tensor(tensor):
+            raise ValueError(f"Expected tensor in {path}, got {type(tensor)}")
+        self._cached_path = path
+        self._cached_tensor = tensor
+        return tensor
+
+
 def safe_torch_load(path: Path) -> torch.Tensor:
     """Load tensor from disk in a PyTorch-version compatible way."""
     try:

@@ -7,6 +7,7 @@ import copy
 from typing import Any, Dict
 
 from ..base import BaseQModel
+from ...quantization.diceq.config import DiceQConfigBase
 
 
 """
@@ -53,48 +54,31 @@ class DeepSeekV2OCRQModel(BaseQModel):
 
     @classmethod
     def diceq_config_template(cls) -> Dict[str, Any]:
-        layer_config = {
-            "Q_block": {
-                "description": "block之间的旋转矩阵",
-                "folder": "Q_block",
-                "layers": ["self_attn.q_proj", "mlp.gate"],
-                "save_mode": "separate",
-                "filename_template": "sample_{idx}_layer_{layer_idx}_Q_block.pt",
-                "train_args": {
-                    "train_data": "all",
-                    "train_batch_size": 64,
-                    "num_epochs": 10,
-                    "learning_rate": 1e-3,
-                    "weight_decay": 0.01,
-                    "optimizer": "RAdam",
-                    "cos_lr": True,
-                    "init_mode": "hadamard",
-                    "num_workers": 8,
-                    "prefetch_factor": 3,
-                    "subset_size": 0.1,
-                    "skip_eval": False,
-                    "eval_max_batches": 2,
-                    "device": "auto",
-                    "train_nsamples": 1024,
-                    "parallel_workers": 1,
-                },
-            },
-        }
-        targets = [k for k, v in layer_config.items() if isinstance(v, dict)]
+        class DeepSeekV2OCRDiceQConfig(DiceQConfigBase):
+            def build_layer_config(self) -> Dict[str, Any]:
+                base_weight = {"data_type": "weight", "debug": True}
+                return {
+                    "Q_block": self.target(
+                        description="block之间的旋转矩阵",
+                        folder="Q_block",
+                        layers=["self_attn.q_proj", "mlp.gate"],
+                        save_mode="separate",
+                        filename_template="sample_{idx}_layer_{layer_idx}_Q_block.pt",
+                        data_type=base_weight["data_type"],
+                        debug=base_weight["debug"],
+                        train_args_overrides={
+                            "train_data": "all",
+                            "weight_decay": 0.01,
+                            "subset_size": 0.1,
+                            "eval_max_batches": 2,
+                            "device": "auto",
+                            "train_nsamples": 1024,
+                            "parallel_workers": 1,
+                        },
+                    ),
+                }
 
-        return {
-            "enabled": True,
-            "layer_config": layer_config,
-            "targets": targets,
-            "calib_dataset": "wikitext2",
-            "nsamples": 128,
-            "seqlen": 2048,
-            "seed": 0,
-            "subset_size": None,
-            "parallel_workers": None,
-            "log_level": "INFO",
-            "tmp_data_dir": "./diceq_tmp",
-        }
+        return DeepSeekV2OCRDiceQConfig().build()
 
     def get_diceq_pipeline_config(self) -> Dict[str, Any]:
         cfg = self.diceq_config_template()

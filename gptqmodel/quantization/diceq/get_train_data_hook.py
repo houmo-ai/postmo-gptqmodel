@@ -315,12 +315,20 @@ class ActivationDataCollector:
         self.save_mapping = {}  # 动态配置，不设置默认值
         self.sampling_config = {}  # 采样配置
         self.r_types = []  # 动态R类型列表
+        # data_type: activation | weight
+        # 默认保持历史行为（activation）
+        self.data_type = "activation"
         
     def _apply_config(self, config: Dict[str, Any], source_name: str = "dict") -> None:
         self.layer_config = {}
         self.save_mapping = {}
         self.sampling_config = {}
         self.r_types = []
+
+        data_type = str(config.get("data_type", "activation"))
+        if data_type not in {"activation", "weight"}:
+            raise ValueError(f"配置错误: data_type 必须为 'activation' 或 'weight'，实际为: {data_type}")
+        self.data_type = data_type
 
         for r_type, r_config in config.items():
             self.r_types.append(r_type)
@@ -364,6 +372,7 @@ class ActivationDataCollector:
         logger.info(f"  - 层配置: {self.layer_config}")
         logger.info(f"  - 保存映射: {self.save_mapping}")
         logger.info(f"  - 采样配置: {self.sampling_config}")
+        logger.info(f"  - 数据类型: {self.data_type}")
 
     def configure_from_file(self, config_path: str) -> None:
         """
@@ -483,6 +492,94 @@ class ActivationDataCollector:
             return tensor.squeeze(0)
         return tensor
 
+    def collect_layer_weights(self,
+                              decoder_layer: nn.Module,
+                              layer_idx: int,
+                              save_paths: Dict[str, str]) -> None:
+        """
+        直接从指定层中搜集 Linear 权重参数并保存，格式为 W[oc, ic]。
+
+        与激活不同，权重数据不依赖校准集前向传播，因此无需使用 nsamples。
+
+        Args:
+            decoder_layer: 解码器层模块
+            layer_idx: 层索引
+            save_paths: 保存路径字典
+        """
+        r_type_patterns: Dict[str, Dict[str, Any]] = {}
+        all_patterns: List[str] = []
+
+        for r_type in self.r_types:
+            mapping = self.save_mapping.get(r_type, {})
+            layer_patterns = mapping.get('layers', [])
+            if not layer_patterns:
+                continue
+            r_type_patterns[r_type] = {
+                'patterns': layer_patterns,
+                'mapping': mapping
+            }
+            all_patterns.extend(layer_patterns)
+
+        if not all_patterns:
+            logger.warning(f"层 {layer_idx} 在权重模式下未配置任何 layers，跳过权重搜集")
+            return
+
+        # Group weights by r_type
+        r_type_module_tensors: Dict[str, Dict[str, torch.Tensor]] = {}
+        for r_type, cfg in r_type_patterns.items():
+            patterns = cfg['patterns']
+            r_type_module_tensors[r_type] = {}
+            
+            for name, module in decoder_layer.named_modules():
+                if not isinstance(module, nn.Linear):
+                    continue
+                full_name = name
+                # Check if this module matches any pattern for this r_type
+                for pattern in patterns:
+                    if pattern in full_name:
+                        weight = module.weight.data.detach().cpu()
+                        r_type_module_tensors[r_type][full_name] = weight
+                        break
+
+        if not any(r_type_module_tensors.values()):
+            logger.warning(f"层 {layer_idx} 在权重模式下未匹配到任何 Linear 模块")
+            return
+
+        # Save weights grouped by r_type
+        for r_type, module_tensors in r_type_module_tensors.items():
+            if not module_tensors:
+                logger.warning(f"层 {layer_idx} 的 r_type '{r_type}' 未匹配到任何 Linear 模块")
+                continue
+                
+            mapping = r_type_patterns[r_type]['mapping']
+            filename_template = mapping.get('filename_template', 'sample_{idx}_layer_{layer_idx}_{name}.pt')
+
+            if r_type not in self.save_mapping:
+                logger.warning(f"数据类型 '{r_type}' 没有配置保存映射，跳过保存")
+                continue
+
+            path_key = mapping['path_key']
+            if path_key not in save_paths:
+                logger.warning(f"保存路径键 '{path_key}' 不存在于 save_paths 中，跳过 '{r_type}'")
+                continue
+
+            path = save_paths[path_key]
+            os.makedirs(path, exist_ok=True)
+
+            for module_name, tensor in module_tensors.items():
+                save_name = module_name.replace('.', '_')
+                filename = filename_template.format(
+                    idx=0,
+                    layer_idx=layer_idx,
+                    name=save_name
+                )
+                full_path = os.path.join(path, filename)
+                torch.save(tensor, full_path)
+                logger.info(
+                    f"层 {layer_idx} 的 r_type '{r_type}' 模块 '{module_name}' "
+                    f"权重已保存到 {full_path}，形状={tuple(tensor.shape)}"
+                )
+
     def _save_r_type_data(self,
                           r_type: str,
                           all_tensors: List[torch.Tensor],
@@ -564,6 +661,13 @@ class ActivationDataCollector:
         Returns:
             torch.Tensor: 更新后的 input_data
         """
+        if self.data_type == "weight":
+            self.collect_layer_weights(
+                decoder_layer=decoder_layer,
+                layer_idx=layer_idx,
+                save_paths=save_paths,
+            )
+            return input_data
         # 直接使用传入的 kwargs 作为前向传播参数
         forward_kwargs = kwargs
 
@@ -728,31 +832,35 @@ class ActivationDataCollector:
 
 def get_Rs_training_data(model, dataloader, save_path, args):
     """
-    使用基于钩子的激活收集方式收集训练数据。
+    使用基于钩子的激活收集方式或直接权重提取方式收集训练数据。
     
-    此函数从神经网络模型的指定层收集激活数据，用于量化校准。
+    此函数从神经网络模型的指定层收集激活数据或权重数据，用于量化校准。
     使用灵活的基于钩子的机制，支持动态配置的R类型。
+    支持两种数据收集模式：
+    - activation: 需要校准数据集和前向传播，收集激活数据
+    - weight: 无需校准数据集，直接从模型权重中提取
     
     函数执行流程：
-    1. 使用Catcher模块捕获第一层输入
-    2. 遍历每个解码器层
-    3. 使用ActivationDataCollector从配置的层收集激活
-    4. 将收集的数据保存到指定路径
+    1. 根据配置的data_type决定收集模式
+    2. 如果是激活模式：使用Catcher模块捕获第一层输入，执行前向传播
+    3. 如果是权重模式：跳过前向传播，直接提取权重
+    4. 遍历每个解码器层，使用ActivationDataCollector收集数据
+    5. 将收集的数据保存到指定路径
     
     Args:
         model: 要收集数据的神经网络模型
-        dataloader: 提供校准数据的DataLoader
+        dataloader: 提供校准数据的DataLoader（激活模式必需，权重模式可为None）
         save_path: 将R类型映射到保存路径的字典
         args: 配置参数，包括：
-            - nsamples: 要收集的样本数
-            - seqlen: 序列长度
+            - nsamples: 要收集的样本数（激活模式使用）
+            - seqlen: 序列长度（激活模式使用）
             - r_config_file: R类型配置文件路径
             
     Returns:
         恢复use_cache配置的模型
         
     Raises:
-        ValueError: 如果模型类型不受支持或激活收集失败
+        ValueError: 如果模型类型不受支持或数据收集失败
     """
     model.eval()
     use_cache = model.config.use_cache
@@ -772,60 +880,85 @@ def get_Rs_training_data(model, dataloader, save_path, args):
             model.model.rotary_emb = model.model.rotary_emb.to(dev)
         layers = model.model.layers
 
-        layers[0] = layers[0].to(dev)
-        inps = torch.zeros((nsamples, seqlen, model.config.hidden_size), dtype=dtype, device=dev)
-        cache = {"i": 0}
+        # Check if we need activation collection (requires forward pass)
+        r_config_dict = getattr(args, "r_config", None)
+        if r_config_dict is None:
+            if hasattr(args, 'r_config_file') and args.r_config_file:
+                with open(args.r_config_file, 'r', encoding='utf-8') as f:
+                    r_config_dict = json.load(f)
+        
+        needs_activation = False
+        if isinstance(r_config_dict, dict):
+            for r_type, cfg in r_config_dict.items():
+                if isinstance(cfg, dict):
+                    data_type = cfg.get("data_type", "activation")
+                    if data_type == "activation":
+                        needs_activation = True
+                        break
 
-        # 捕获第一层输入
-        class Catcher(nn.Module):
-            def __init__(self, module):
-                super().__init__()
-                self.module = module
+        fp_inps = None
+        forward_kwargs = {}
+        
+        if needs_activation:
+            layers[0] = layers[0].to(dev)
+            inps = torch.zeros((nsamples, seqlen, model.config.hidden_size), dtype=dtype, device=dev)
+            cache = {"i": 0}
 
-            def forward(self, *margs, **kwargs):
-                if len(margs) > 0 and cache["i"] < nsamples:
-                    captured = margs[0]
-                    if captured.ndim == 3 and captured.shape[0] == 1:
-                        captured = captured.squeeze(0)
-                    if captured.shape[0] != seqlen:
-                        if captured.shape[0] > seqlen:
-                            captured = captured[:seqlen, :]
-                        else:
-                            padded = torch.zeros((seqlen, captured.shape[-1]), dtype=captured.dtype, device=captured.device)
-                            padded[:captured.shape[0], :] = captured
-                            captured = padded
-                    inps[cache["i"]] = captured
-                    cache["i"] += 1
-                if cache["i"] == 1 and "kwargs" not in cache:
-                    cache["kwargs"] = dict(kwargs)
-                raise ValueError
+            # 捕获第一层输入
+            class Catcher(nn.Module):
+                def __init__(self, module):
+                    super().__init__()
+                    self.module = module
 
-        layers[0] = Catcher(layers[0])
-        with torch.no_grad():
-            for batch in dataloader:
-                if cache["i"] >= nsamples:
-                    break
-                try:
-                    input_ids, batch_kwargs = _extract_input_from_batch(batch, dev)
-                    model(input_ids, **batch_kwargs)
-                except ValueError:
-                    pass
+                def forward(self, *margs, **kwargs):
+                    if len(margs) > 0 and cache["i"] < nsamples:
+                        captured = margs[0]
+                        if captured.ndim == 3 and captured.shape[0] == 1:
+                            captured = captured.squeeze(0)
+                        if captured.shape[0] != seqlen:
+                            if captured.shape[0] > seqlen:
+                                captured = captured[:seqlen, :]
+                            else:
+                                padded = torch.zeros((seqlen, captured.shape[-1]), dtype=captured.dtype, device=captured.device)
+                                padded[:captured.shape[0], :] = captured
+                                captured = padded
+                        inps[cache["i"]] = captured
+                        cache["i"] += 1
+                    if cache["i"] == 1 and "kwargs" not in cache:
+                        cache["kwargs"] = dict(kwargs)
+                    raise ValueError
 
-        # 将嵌入层和第一层移到CPU
-        layers[0] = layers[0].module
-        layers[0] = layers[0].cpu()
-        if hasattr(model.model, "embed_tokens"):
-            model.model.embed_tokens = model.model.embed_tokens.cpu()
-        if hasattr(model.model, "norm"):
-            model.model.norm = model.model.norm.cpu()
+            if dataloader is None:
+                raise ValueError("激活模式需要dataloader，但dataloader为None")
+            layers[0] = Catcher(layers[0])
+            with torch.no_grad():
+                for batch in dataloader:
+                    if cache["i"] >= nsamples:
+                        break
+                    try:
+                        input_ids, batch_kwargs = _extract_input_from_batch(batch, dev)
+                        model(input_ids, **batch_kwargs)
+                    except ValueError:
+                        pass
 
-        actual_samples = cache["i"]
-        if actual_samples == 0:
-            raise ValueError("未捕获到任何可用样本，无法进行 DiceQ 训练数据收集。")
+            # 将嵌入层和第一层移到CPU
+            layers[0] = layers[0].module
+            layers[0] = layers[0].cpu()
+            if hasattr(model.model, "embed_tokens"):
+                model.model.embed_tokens = model.model.embed_tokens.cpu()
+            if hasattr(model.model, "norm"):
+                model.model.norm = model.model.norm.cpu()
 
-        fp_inps = inps[:actual_samples]
-        forward_kwargs = dict(cache.get("kwargs", {}))
-        del inps, cache
+            actual_samples = cache["i"]
+            if actual_samples == 0:
+                raise ValueError("未捕获到任何可用样本，无法进行 DiceQ 训练数据收集。")
+
+            fp_inps = inps[:actual_samples]
+            forward_kwargs = dict(cache.get("kwargs", {}))
+            del inps, cache
+        else:
+            # Weight-only mode: no forward pass needed
+            logger.info("权重模式：跳过前向传播，直接搜集权重")
 
         data_collector = ActivationDataCollector(model, args)
 
@@ -837,6 +970,20 @@ def get_Rs_training_data(model, dataloader, save_path, args):
                 raise ValueError("必须通过 --r_config_file 指定配置文件或通过 r_config 传入配置对象！")
             data_collector.configure_from_file(args.r_config_file)
 
+        # Determine data types for each r_type
+        r_type_data_types = {}
+        for r_type in data_collector.r_types:
+            # Check if data_type is specified in the config entry
+            r_config_entry = r_config_dict.get(r_type, {}) if isinstance(r_config_dict, dict) else {}
+            data_type = r_config_entry.get("data_type", "activation")
+            r_type_data_types[r_type] = data_type
+
+        # Check if any r_type needs activation collection (requires forward pass)
+        needs_activation = any(dt == "activation" for dt in r_type_data_types.values())
+        # Check if any r_type needs weight collection (no forward pass needed)
+        needs_weight = any(dt == "weight" for dt in r_type_data_types.values())
+
+        # Validate layer config for both activation and weight modes
         try:
             validation_results = data_collector.validate_layer_config(layers[0])
             logger.info(f"层配置验证通过，匹配结果: {validation_results}")
@@ -846,21 +993,34 @@ def get_Rs_training_data(model, dataloader, save_path, args):
         for idx, decoder_layer in tqdm(enumerate(layers), total=len(layers), desc="处理层"):
             decoder_layer = decoder_layer.to(dev)
 
-            try:
-                # 流式收集和保存：每个 r_type 收集完立即保存，不缓存所有数据
-                fp_inps = data_collector.collect_layer_activations(
-                    decoder_layer=decoder_layer,
-                    layer_idx=idx,
-                    input_data=fp_inps,
-                    save_paths=save_path,
-                    **forward_kwargs
-                )
-            except ValueError as e:
-                raise ValueError(f"收集层 {idx} 的激活时出错: {str(e)}")
+            if needs_activation:
+                try:
+                    # 流式收集和保存：每个 r_type 收集完立即保存，不缓存所有数据
+                    fp_inps = data_collector.collect_layer_activations(
+                        decoder_layer=decoder_layer,
+                        layer_idx=idx,
+                        input_data=fp_inps,
+                        save_paths=save_path,
+                        **forward_kwargs
+                    )
+                except ValueError as e:
+                    raise ValueError(f"收集层 {idx} 的激活时出错: {str(e)}")
+
+            if needs_weight:
+                try:
+                    # 权重搜集：直接从模型权重中提取，无需前向传播
+                    data_collector.collect_layer_weights(
+                        decoder_layer=decoder_layer,
+                        layer_idx=idx,
+                        save_paths=save_path
+                    )
+                except ValueError as e:
+                    raise ValueError(f"收集层 {idx} 的权重时出错: {str(e)}")
 
             decoder_layer = decoder_layer.to('cpu')
 
-        del fp_inps
+        if fp_inps is not None:
+            del fp_inps
         torch.cuda.empty_cache()
         gc.collect()
         return model

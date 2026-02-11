@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from ..base import BaseQModel
+from ...quantization.diceq.config import DiceQConfigBase
 from .deepseek_v3 import MLA, Glm4MoeLiteNaiveMoeNew
 
 
@@ -95,106 +96,82 @@ class Glm4MoeLiteQModel(BaseQModel):
 
     @classmethod
     def diceq_config_template(cls) -> Dict[str, Any]:
-        layer_config = {
-            "Q_block": {
-                "description": "block之间的旋转矩阵",  # 当前 target 的说明文字
-                "folder": "Q_block",  # 激活缓存与训练数据的子目录名
-                "layers": ["self_attn.q_a_proj", "mlp.gate"],  # 通过子串匹配要挂 hook 的模块名
-                "save_mode": "separate",  # 数据保存方式: combined=每层合并保存, separate=逐样本保存
-                "filename_template": "sample_{idx}_layer_{layer_idx}_Q_block.pt",  # 训练数据文件名模板
-                "train_args": {
-                    "train_data": "all",  # 训练模式: all/layer_wise/head_wise
-                    "train_batch_size": 64,  # 实测更快: Q_block 在本机上 bsz=16/32 明显快于 bsz=8
-                    "num_epochs": 10,  # 训练轮数
-                    "learning_rate": 1e-3,  # 学习率
-                    "weight_decay": 0.01,  # 权重衰减
-                    "optimizer": "RAdam",  # 优化器: sgd/adam/adamw/RSGD/RAdam
-                    "cos_lr": True,  # 是否使用 CosineAnnealing 学习率调度
-                    "init_mode": "hadamard",  # 旋转矩阵初始化: hadamard/random/identity
-                    "num_workers": 8,  # 实测更快: Q_block 在本机上 num_workers=2 显著快于 0
-                    "prefetch_factor": 3,  # 每个 worker 预取批次数(num_workers>0 时生效)
-                    "subset_size":0.1,  # all 模式每个 epoch 抽样样本数（提高稳定性）
-                    # "sampling_policy": "outlier_mix",  # 抽样策略: random/outlier_mix
-                    # "outlier_mix_ratio": 0.35,  # 每个 epoch 中 outlier 样本占比
-                    # "outlier_topk_ratio": 0.2,  # 从分数 Top-K 池中抽取 outlier（按比例）
-                    # "outlier_score_metric": "p99",  # outlier 分数: absmax/p99/p99_over_median
-                    "skip_eval": False,  # 开启轻量评估，避免全程不可观测
-                    "eval_max_batches": 2,  # 轻量评估时最多评估的 batch 数
-                    "device": "auto",  # 训练设备: auto/cuda/cpu
-                    "train_nsamples": 1024,  # 训练旋转矩阵时最多使用的样本数（每个pt文件抽取的样本数）
-                    "parallel_workers": 1,  # all 模式不按层并行，保持 1
-                },
-            },
-            "Q_q_lowrank": {
-                "description": "q 低秩投影层",  # 当前 target 的说明文字
-                "folder": "Q_q_lowrank",  # 激活缓存与训练数据的子目录名
-                "layers": ["self_attn.q_b_proj"],  # 通过子串匹配要挂 hook 的模块名
-                "save_mode": "combined",  # 数据保存方式
-                "filename_template": "layer_{layer_idx}_Q_q_lowrank.pt",  # 训练数据文件名模板
-                "sampling": {"max_tokens": 2048},  # 可选采样限制: 每条样本最多 token 数
-                "train_args": {
-                    "train_data": "layer_wise",  # 按层分别训练旋转矩阵
-                    "train_batch_size": 4,  # 实测更快: Q_q_lowrank 在本机上 bsz=4 吞吐最高
-                    "num_epochs": 10,  # 训练轮数
-                    "learning_rate": 1e-3,  # 学习率
-                    "weight_decay": 0,  # 权重衰减
-                    "optimizer": "RAdam",  # 优化器 #RSGD/RAdam + geoopt（use_geoopt=True），前向时不走 QR，而是依赖流形参数化来保持正交约束
-                    "cos_lr": True,  # 是否使用余弦退火学习率
-                    "init_mode": "hadamard",  # 旋转矩阵初始化方式
-                    "num_workers": 0,  # 在线训练默认关闭多进程 DataLoader，减少调度开销
-                    "prefetch_factor": 2,  # 预取批次数(num_workers>0 时生效)
-                    "subset_size": 1.0,  # 提高每个 epoch 的有效样本数（原先 4 过小）
-                    "sampling_policy": "random",  # 抽样策略: random/outlier_mix
-                    "skip_eval": False,  # 开启轻量评估，避免全程不可观测
-                    # "eval_max_batches": 2,  # 轻量评估时最多评估的 batch 数
-                    "device": "cuda",  # 训练设备: auto/cuda/cpu
-                    "train_nsamples": 128,  # 训练旋转矩阵时最多使用的样本数
-                    "parallel_workers": 1,  # 单卡在线训练默认关闭多进程层并行
-                },
-            },
-            "Q_kv_lowrank": {
-                "description": "KV 低秩投影层",  # 当前 target 的说明文字
-                "folder": "Q_kv_lowrank",  # 激活缓存与训练数据的子目录名
-                "layers": ["self_attn.kv_b_proj"],  # 通过子串匹配要挂 hook 的模块名
-                "save_mode": "combined",  # 数据保存方式
-                "train_data": "layer_wise",  # 兼容字段，实际训练以 train_args.train_data 为准
-                "filename_template": "layer_{layer_idx}_Q_kv_lowrank.pt",  # 训练数据文件名模板
-                "train_args": {
-                    "train_data": "layer_wise",  # 按层分别训练旋转矩阵
-                    "train_batch_size": 4,  # 实测更快: Q_q_lowrank 在本机上 bsz=4 吞吐最高
-                    "num_epochs": 10,  # 训练轮数
-                    "learning_rate": 1e-3,  # 学习率
-                    "weight_decay": 0,  # 权重衰减
-                    "optimizer": "RAdam",  # 优化器 #RSGD/RAdam + geoopt（use_geoopt=True），前向时不走 QR，而是依赖流形参数化来保持正交约束
-                    "cos_lr": True,  # 是否使用余弦退火学习率
-                    "init_mode": "hadamard",  # 旋转矩阵初始化方式
-                    "num_workers": 0,  # 在线训练默认关闭多进程 DataLoader，减少调度开销
-                    "prefetch_factor": 2,  # 预取批次数(num_workers>0 时生效)
-                    "subset_size": 1.0,  # 提高每个 epoch 的有效样本数（原先 4 过小）
-                    "sampling_policy": "random",  # 抽样策略: random/outlier_mix
-                    "skip_eval": False,  # 开启轻量评估，避免全程不可观测
-                    # "eval_max_batches": 2,  # 轻量评估时最多评估的 batch 数
-                    "device": "cuda",  # 训练设备: auto/cuda/cpu
-                    "train_nsamples": 128,  # 训练旋转矩阵时最多使用的样本数
-                    "parallel_workers": 1,  # 单卡在线训练默认关闭多进程层并行
-                },
-            },
-        }
-        targets = [k for k, v in layer_config.items() if isinstance(v, dict)]
+        class Glm4MoeLiteDiceQConfig(DiceQConfigBase):
+            def build_layer_config(self) -> Dict[str, Any]:
+                # Weight-training mode by default for this model config.
+                base_weight = {"data_type": "weight", "debug": True}
 
-        return {
-            "enabled": True,  # 是否开启 DiceQ 旋转矩阵训练流程
-            "layer_config": layer_config,  # 每个 target 的层匹配、存储、训练参数配置
-            "targets": targets,  # 本次要训练的 target 列表(默认 layer_config 的全部 key)
-            "calib_dataset": "wikitext2",  # 校准数据集名称: wikitext2/ptb/c4
-            "nsamples": 128,  # 激活采集时使用的样本数
-            "seqlen": 2048,  # 每条样本截断/采样长度
-            "seed": 0,  # 随机种子(采样与训练复现)
-            "subset_size": None,  # 可选: 统一覆盖所有 target 的每个 epoch 样本数(int)或比例(float)
-            "parallel_workers": None,  # 可选: 统一覆盖所有 target 的 layer/head-wise 并行进程数
-            "log_level": "INFO",  # DiceQ 日志等级
-            "tmp_data_dir": "./diceq_tmp",  # 激活缓存与旋转训练产物的临时目录
-        }
+                q_block = self.target(
+                    description="block之间的旋转矩阵",
+                    folder="Q_block",
+                    layers=["self_attn.q_a_proj", "mlp.gate"],
+                    save_mode="separate",
+                    filename_template="sample_{idx}_layer_{layer_idx}_Q_block.pt",
+                    data_type=base_weight["data_type"],
+                    debug=base_weight["debug"],
+                    train_args_overrides={
+                        "train_data": "all",
+                        "weight_decay": 0.01,
+                        "subset_size": 0.1,
+                        "eval_max_batches": 2,
+                        "device": "auto",
+                        "train_nsamples": 1024,
+                        "parallel_workers": 1,
+                    },
+                )
+
+                q_q_lowrank = self.target(
+                    description="q 低秩投影层",
+                    folder="Q_q_lowrank",
+                    layers=["self_attn.q_b_proj"],
+                    save_mode="combined",
+                    filename_template="layer_{layer_idx}_Q_q_lowrank.pt",
+                    sampling={"max_tokens": 2048},
+                    data_type=base_weight["data_type"],
+                    debug=base_weight["debug"],
+                    train_args_overrides={
+                        "train_data": "layer_wise",
+                        "train_batch_size": 4,
+                        "weight_decay": 0,
+                        "num_workers": 0,
+                        "prefetch_factor": 2,
+                        "subset_size": 1.0,
+                        "sampling_policy": "random",
+                        "device": "cuda",
+                        "train_nsamples": 128,
+                        "parallel_workers": 1,
+                    },
+                )
+
+                q_kv_lowrank = self.target(
+                    description="KV 低秩投影层",
+                    folder="Q_kv_lowrank",
+                    layers=["self_attn.kv_b_proj"],
+                    save_mode="combined",
+                    filename_template="layer_{layer_idx}_Q_kv_lowrank.pt",
+                    data_type=base_weight["data_type"],
+                    debug=base_weight["debug"],
+                    train_args_overrides={
+                        "train_data": "layer_wise",
+                        "train_batch_size": 4,
+                        "weight_decay": 0,
+                        "num_workers": 0,
+                        "prefetch_factor": 2,
+                        "subset_size": 1.0,
+                        "sampling_policy": "random",
+                        "device": "cuda",
+                        "train_nsamples": 128,
+                        "parallel_workers": 1,
+                    },
+                )
+
+                return {
+                    "Q_block": q_block,
+                    "Q_q_lowrank": q_q_lowrank,
+                    "Q_kv_lowrank": q_kv_lowrank,
+                }
+
+        return Glm4MoeLiteDiceQConfig().build()
 
     def get_diceq_pipeline_config(self) -> Dict[str, Any]:
         cfg = self.diceq_config_template()

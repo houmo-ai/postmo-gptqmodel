@@ -28,7 +28,7 @@ try:
 except ImportError:  # pragma: no cover
     geoopt = None
 
-from .rotation_data import ActivationReferenceDataset, SampleRef
+from .rotation_data import ActivationReferenceDataset, SampleRef, WeightReferenceDataset
 from ..rotation.hadamard_utils import random_hadamard_matrix
 
 
@@ -54,7 +54,18 @@ def get_orthogonal_matrix(size: int, mode: str, device) -> torch.Tensor:
 
 
 class R_QR(nn.Module):
-    """Global/layer-wise orthogonal rotation module (same core as r1_base_qr.py)."""
+    """Global/layer-wise orthogonal rotation module (same core as r1_base_qr.py).
+    
+    This module implements A@R transformation for activation training:
+    - A: activation tensor [batch*seq_len, hidden_size] or [seq_len, hidden_size]
+    - R: rotation matrix [hidden_size, hidden_size]
+    - Output: A@R
+    
+    Consistency Note:
+    - Training: A@R (activation right-multiplied by rotation matrix)
+    - Application: Input layers use W@R, Output layers use R.T@W
+    - Mathematical equivalence: (A@R)@W = A@(R@W), but application uses A@(W@R)
+    """
 
     def __init__(self, hidden_size: int, use_geoopt: bool = False):
         super().__init__()
@@ -122,6 +133,56 @@ class HeadWiseQR(nn.Module):
         return x.transpose(0, 1).reshape(x_shape)
 
 
+class R_QR_Weight(nn.Module):
+    """Weight-based orthogonal rotation module for training rotation matrices from weights.
+    
+    This module implements W@R transformation where:
+    - W: weight tensor [oc, ic] (output_channels, input_channels)
+    - R: rotation matrix [ic, ic]
+    - Output: W@R [oc, ic]
+    
+    Consistency Note:
+    - Training: W@R (matches input channel layer application: W@R)
+    - Application: Input layers use W@R, Output layers use R.T@W
+    - For output layers trained with weights, ensure consistency with R.T@W application
+    """
+
+    def __init__(self, input_size: int, use_geoopt: bool = False):
+        super().__init__()
+        self.input_size = input_size
+        self.use_geoopt = use_geoopt
+        if use_geoopt:
+            if geoopt is None:
+                raise ImportError(
+                    "geoopt is required for optimizer RSGD/RAdam, "
+                    "but it is not installed in the current environment."
+                )
+            self.matrix = geoopt.ManifoldParameter(
+                torch.eye(input_size),
+                manifold=geoopt.manifolds.Stiefel(),
+            )
+        else:
+            self.matrix = nn.Parameter(torch.eye(input_size))
+        self.rotate = None
+
+    def forward(self, W: torch.Tensor) -> torch.Tensor:
+        """
+        Apply rotation to weight tensor.
+        
+        Args:
+            W: Weight tensor of shape [batch, oc, ic] or [oc, ic]
+            
+        Returns:
+            Rotated weight tensor W@R with same shape as input
+        """
+        if self.use_geoopt:
+            self.rotate = self.matrix
+        else:
+            self.rotate, _ = torch.linalg.qr(self.matrix, mode="complete")
+        # W@R: [oc, ic] @ [ic, ic] -> [oc, ic]
+        return torch.matmul(W, self.rotate)
+
+
 def set_random_seed(seed: int) -> None:
     """Set random seed for reproducibility."""
     random.seed(seed)
@@ -131,8 +192,15 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def infer_hidden_size_from_dataset(dataset: Dataset) -> int:
-    """Infer hidden size from the first sample."""
+def infer_hidden_size_from_dataset(dataset: Dataset, data_type: str = "activation") -> int:
+    """Infer hidden size from the first sample.
+    
+    Args:
+        dataset: Dataset to infer from
+        data_type: "activation" or "weight"
+            - activation: sample shape is [seq_len, hidden_size], infer from last dim
+            - weight: sample shape is [oc, ic], infer from last dim (ic)
+    """
     if len(dataset) == 0:
         raise ValueError("Dataset is empty; cannot infer hidden size.")
     sample = dataset[0]
@@ -290,14 +358,23 @@ def evaluate_rotation_loss(
     train_args: Dict[str, Any],
     device: torch.device,
     max_batches: int = 20,
+    data_type: str = "activation",
 ) -> float:
     """Evaluate trained rotation matrix on held-out pass over training data."""
     model.eval()
     dataloader = create_train_dataloader(dataset, train_args, sampler=None)
     losses: List[float] = []
     for batch_idx, batch_samples in enumerate(dataloader):
-        batch_samples = batch_samples.to(device).float().reshape(-1, hidden_size)
-        outputs = model(batch_samples)
+        batch_samples = batch_samples.to(device).float()
+        
+        if data_type == "weight":
+            # Weight data: keep shape as-is; torch.matmul supports batched matmul.
+            outputs = model(batch_samples)
+        else:
+            # Activation data: reshape to [batch*seq_len, hidden_size]
+            batch_samples = batch_samples.reshape(-1, hidden_size)
+            outputs = model(batch_samples)
+        
         losses.append(float(compute_qsr_loss(outputs, train_args).item()))
         if max_batches > 0 and batch_idx + 1 >= max_batches:
             break
@@ -408,43 +485,86 @@ def train_one_rotation(
     head_num: Optional[int] = None,
     wandb_run: Any = None,
     show_progress: bool = True,
+    data_type: str = "activation",
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Train one rotation module and return trained matrix + metrics."""
+    """Train one rotation module and return trained matrix + metrics.
+    
+    Args:
+        dataset: Dataset containing training samples
+        hidden_size: Hidden size (for activation) or input channel size (for weight)
+        train_args: Training arguments dictionary
+        device: Device to train on
+        logger: Logger instance
+        train_name: Name for logging
+        head_num: Optional head number for head-wise training
+        wandb_run: Optional wandb run
+        show_progress: Whether to show progress bars
+        data_type: "activation" or "weight" - determines training mode
+    """
     use_geoopt = train_args["optimizer"] in {"RSGD", "RAdam"}
-    if head_num is None:
-        model = R_QR(hidden_size=hidden_size, use_geoopt=use_geoopt).to(device)
+    effective_train_args: Dict[str, Any] = dict(train_args)
+    
+    if data_type == "weight":
+        # Weight training: use R_QR_Weight which applies W@R
+        if head_num is not None:
+            raise ValueError("head_num is not supported for weight training mode")
+        model = R_QR_Weight(input_size=hidden_size, use_geoopt=use_geoopt).to(device)
         init_r = get_orthogonal_matrix(
             hidden_size,
             train_args["init_mode"],
             device=device,
         ).float()
+        model.matrix.data.copy_(init_r)
+        # Weight samples are 2D matrices [oc, ic]. Different modules can have different oc,
+        # which breaks DataLoader stacking when batch_size > 1.
+        # To keep behavior robust with minimal config changes, force batch_size=1 in weight mode.
+        if int(effective_train_args.get("train_batch_size", 1)) != 1:
+            logger.warning(
+                "[%s] weight training forces train_batch_size=1 (was %s) to avoid stacking variable [oc, ic] tensors.",
+                train_name,
+                effective_train_args.get("train_batch_size"),
+            )
+            effective_train_args["train_batch_size"] = 1
+        # Also avoid spawning workers for tiny batch=1 weight matrices.
+        effective_train_args["num_workers"] = 0
+        effective_train_args["prefetch_factor"] = None
+        effective_train_args["pin_memory"] = False
     else:
-        model = HeadWiseQR(
-            hidden_size=hidden_size,
-            head_num=head_num,
-            use_geoopt=use_geoopt,
-        ).to(device)
-        head_dim = hidden_size // head_num
-        init_head = get_orthogonal_matrix(
-            head_dim,
-            train_args["init_mode"],
-            device=device,
-        ).float()
-        init_r = init_head.unsqueeze(0).repeat(head_num, 1, 1)
-    model.matrix.data.copy_(init_r)
+        # Activation training: use R_QR or HeadWiseQR
+        if head_num is None:
+            model = R_QR(hidden_size=hidden_size, use_geoopt=use_geoopt).to(device)
+            init_r = get_orthogonal_matrix(
+                hidden_size,
+                train_args["init_mode"],
+                device=device,
+            ).float()
+        else:
+            model = HeadWiseQR(
+                hidden_size=hidden_size,
+                head_num=head_num,
+                use_geoopt=use_geoopt,
+            ).to(device)
+            head_dim = hidden_size // head_num
+            init_head = get_orthogonal_matrix(
+                head_dim,
+                train_args["init_mode"],
+                device=device,
+            ).float()
+            init_r = init_head.unsqueeze(0).repeat(head_num, 1, 1)
+        model.matrix.data.copy_(init_r)
 
-    optimizer = build_optimizer(model, train_args)
+    optimizer = build_optimizer(model, effective_train_args)
     scheduler = None
-    if train_args["cos_lr"]:
+    if effective_train_args["cos_lr"]:
         scheduler = CosineAnnealingLR(
             optimizer,
-            T_max=int(train_args["num_epochs"]),
+            T_max=int(effective_train_args["num_epochs"]),
             eta_min=0.0,
         )
 
-    num_epochs = int(train_args["num_epochs"])
-    accumulation_steps = int(train_args["accumulation_steps"])
-    subset_size_cfg = train_args.get("subset_size")
+    num_epochs = int(effective_train_args["num_epochs"])
+    accumulation_steps = int(effective_train_args["accumulation_steps"])
+    subset_size_cfg = effective_train_args.get("subset_size")
     if subset_size_cfg is not None:
         if isinstance(subset_size_cfg, float):
             # subset_size is a ratio (like train_subset_size)
@@ -453,9 +573,9 @@ def train_one_rotation(
             # subset_size is an integer count
             subset_size = max(1, min(int(subset_size_cfg), len(dataset)))
     else:
-        subset_ratio = float(train_args["train_subset_size"])
+        subset_ratio = float(effective_train_args["train_subset_size"])
         subset_size = max(1, int(len(dataset) * subset_ratio))
-    sampling_policy = str(train_args.get("sampling_policy", "random"))
+    sampling_policy = str(effective_train_args.get("sampling_policy", "random"))
     score_array = _collect_dataset_scores(dataset) if sampling_policy == "outlier_mix" else None
     if sampling_policy == "outlier_mix" and score_array is None:
         logger.warning(
@@ -476,7 +596,7 @@ def train_one_rotation(
         len(dataset),
         subset_size,
         num_epochs,
-        int(train_args["train_batch_size"]),
+        int(effective_train_args["train_batch_size"]),
         sampling_policy,
     )
 
@@ -492,11 +612,11 @@ def train_one_rotation(
         indices = _sample_epoch_indices(
             dataset_size=len(dataset),
             subset_size=subset_size,
-            train_args=train_args,
+            train_args=effective_train_args,
             score_array=score_array,
         )
         sampler = SubsetRandomSampler(indices.tolist())
-        dataloader = create_train_dataloader(dataset, train_args, sampler=sampler)
+        dataloader = create_train_dataloader(dataset, effective_train_args, sampler=sampler)
 
         loss_log: List[torch.Tensor] = []
         pending_batches = 0
@@ -508,9 +628,18 @@ def train_one_rotation(
             disable=not show_progress,
         )
         for batch_idx, batch_samples in enumerate(batch_bar):
-            batch_samples = batch_samples.to(device).float().reshape(-1, hidden_size)
-            outputs = model(batch_samples)
-            loss = compute_qsr_loss(outputs, train_args)
+            batch_samples = batch_samples.to(device).float()
+            
+            if data_type == "weight":
+                # Weight data: keep shape as-is; torch.matmul supports batched matmul.
+                # batch_samples is typically [1, oc, ic] when train_batch_size=1.
+                outputs = model(batch_samples)
+            else:
+                # Activation data: reshape to [batch*seq_len, hidden_size]
+                batch_samples = batch_samples.reshape(-1, hidden_size)
+                outputs = model(batch_samples)
+            
+            loss = compute_qsr_loss(outputs, effective_train_args)
             loss = loss / accumulation_steps
             loss.backward()
             pending_batches += 1
@@ -556,19 +685,20 @@ def train_one_rotation(
                 }
             )
 
-    skip_eval = bool(train_args.get("skip_eval", False))
+    skip_eval = bool(effective_train_args.get("skip_eval", False))
     if skip_eval:
         eval_loss = float("nan")
         logger.info("[%s] evaluation skipped (skip_eval=True)", train_name)
     else:
-        eval_max_batches = int(train_args.get("eval_max_batches", 4))
+        eval_max_batches = int(effective_train_args.get("eval_max_batches", 4))
         eval_loss = evaluate_rotation_loss(
             model=model,
             dataset=dataset,
             hidden_size=hidden_size,
-            train_args=train_args,
+            train_args=effective_train_args,
             device=device,
             max_batches=eval_max_batches,
+            data_type=data_type,
         )
         logger.info("[%s] evaluation loss=%.8f (max_batches=%d)", train_name, eval_loss, eval_max_batches)
         if wandb_run is not None:
@@ -604,9 +734,13 @@ def _train_single_layer_task(
     device_arg: str,
     head_num: Optional[int],
     seed: int,
+    data_type: str = "activation",
 ) -> Tuple[int, torch.Tensor, Dict[str, float]]:
     set_random_seed(int(seed) + int(layer_idx))
-    dataset = ActivationReferenceDataset(refs)
+    if data_type == "weight":
+        dataset = WeightReferenceDataset(refs)
+    else:
+        dataset = ActivationReferenceDataset(refs)
     worker_logger = _build_worker_logger(f"{target_name}_layer_{layer_idx}")
     device_obj = resolve_device(device_arg)
     rotation, metrics = train_one_rotation(
@@ -619,6 +753,7 @@ def _train_single_layer_task(
         head_num=head_num,
         wandb_run=None,
         show_progress=False,
+        data_type=data_type,
     )
     return int(layer_idx), rotation, metrics
 
@@ -630,13 +765,19 @@ def train_all_mode(
     device: torch.device,
     logger: logging.Logger,
     wandb_run: Any = None,
+    data_type: str = "activation",
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Dict[str, float]], int]:
-    """Train one shared rotation matrix over all layers' activations."""
+    """Train one shared rotation matrix over all layers' activations or weights."""
     all_refs: List[SampleRef] = []
     for layer_idx in sorted(refs_by_layer):
         all_refs.extend(refs_by_layer[layer_idx])
-    dataset = ActivationReferenceDataset(all_refs)
-    hidden_size = infer_hidden_size_from_dataset(dataset)
+    
+    if data_type == "weight":
+        dataset = WeightReferenceDataset(all_refs)
+    else:
+        dataset = ActivationReferenceDataset(all_refs)
+    
+    hidden_size = infer_hidden_size_from_dataset(dataset, data_type=data_type)
     rotation, metrics = train_one_rotation(
         dataset=dataset,
         hidden_size=hidden_size,
@@ -646,6 +787,7 @@ def train_all_mode(
         train_name=target_name,
         head_num=None,
         wandb_run=wandb_run,
+        data_type=data_type,
     )
     return {target_name: rotation}, {target_name: metrics}, hidden_size
 
@@ -658,6 +800,7 @@ def train_layer_or_head_wise_mode(
     logger: logging.Logger,
     args: argparse.Namespace,
     wandb_run: Any = None,
+    data_type: str = "activation",
 ) -> Tuple[Dict[str, Any], Dict[str, Dict[str, float]], int]:
     """Train per-layer matrices in layer-wise or head-wise mode."""
     train_mode = train_args["train_data"]
@@ -669,8 +812,11 @@ def train_layer_or_head_wise_mode(
     if not sorted_layers:
         raise ValueError("No layers found for layer/head-wise training.")
 
-    first_dataset = ActivationReferenceDataset(refs_by_layer[sorted_layers[0]])
-    hidden_size = infer_hidden_size_from_dataset(first_dataset)
+    if data_type == "weight":
+        first_dataset = WeightReferenceDataset(refs_by_layer[sorted_layers[0]])
+    else:
+        first_dataset = ActivationReferenceDataset(refs_by_layer[sorted_layers[0]])
+    hidden_size = infer_hidden_size_from_dataset(first_dataset, data_type=data_type)
     head_num = infer_head_num(args, train_args, hidden_size) if is_head_wise else None
     parallel_workers = int(train_args.get("parallel_workers", 1))
     effective_train_args = dict(train_args)
@@ -686,7 +832,10 @@ def train_layer_or_head_wise_mode(
                 logger.warning("Layer %d has no refs, skipped.", layer_idx)
                 continue
 
-            dataset = ActivationReferenceDataset(refs)
+            if data_type == "weight":
+                dataset = WeightReferenceDataset(refs)
+            else:
+                dataset = ActivationReferenceDataset(refs)
             key = f"{target_name}_layer_{layer_idx}"
             rotation, metrics = train_one_rotation(
                 dataset=dataset,
@@ -697,6 +846,7 @@ def train_layer_or_head_wise_mode(
                 train_name=key,
                 head_num=head_num,
                 wandb_run=wandb_run,
+                data_type=data_type,
             )
 
             if is_head_wise:
@@ -763,6 +913,7 @@ def train_layer_or_head_wise_mode(
                     device_arg=str(device),
                     head_num=head_num,
                     seed=base_seed,
+                    data_type=data_type,
                 )
                 futures[future] = int(layer_idx)
 

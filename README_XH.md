@@ -1,8 +1,6 @@
 # XH2a的GPTQ
 
-## 安装依赖
-
-1. 环境配置
+## 1. 安装依赖
 
 ```bash
 #setuptools 80之后的版本采用 /opt/extdata/.conda/envs/torch2_7/bin/python -m pip install -e . --use-pep517， 多了--use-pep517参数会导致找不到torch
@@ -11,20 +9,23 @@ pip uninstall SoundFile
 pip install SoundFile
 ```
 
-2. 自研算法加持
+
+## 2. 自研算法加持
 
 ```bash
 1. 支持自研算法**MoeQuant**：用于moe模型校准数据集的生成，使得moe专家都能获得合适的校准数据去做gptq，example在gptqmodel/quantization/ebss
 2. 支持自研算法**dicequant**：搜集对应位置激活，激活进行训练获取旋转矩阵，算法实现在gptqmodel/quantization/diceq，example在gptqmodel/models/definitions/glm4_moe_lite.py中的diceq_config_template里的配置
 ```
 
-3. 特定模型需要特定版本的仓库
+## 3. 特定模型需要特定版本的仓库
+
 ```bash
 deepseekocrv1结构： transformers==4.46.3
 deepseekv2/v3结构/glm4_moe_lite： transformers==5.0.0rc3
 ```
 
-4. 算法流程图
+## 4. 算法流程图
+
 ```Mermaid
 graph LR
     %% 定义样式
@@ -66,7 +67,7 @@ graph LR
     A_Easy --- BR1(Block rotation):::unfinished
     
     A5 --> A_Hard[难量化]
-    A_Hard --- Diceq1(diceq: 针对激活训练):::unfinished
+    A_Hard --- Diceq1(diceq: 针对激活训练)
     A_Hard --- Mixed1(混合精度 v1: 基于quarot/diceq<br/>只针对moe/mlp合并的暴力搜索):::unfinished
     Mixed1 --- SQ1[singlequant: 只做克罗克小矩阵的16bit matmul]:::unfinished
     Mixed1 --- Bit1[提升bit, 导出config给xhmodelzoo]:::unfinished
@@ -86,7 +87,7 @@ graph LR
     Rot2 --- BR2(Block rotation):::unfinished
     
     W5 --> W_Hard[难量化]
-    W_Hard --- Diceq2(diceq: 针对权重训练):::unfinished
+    W_Hard --- Diceq2(diceq: 针对权重训练)
     W_Hard --- Mixed2(混合精度 v1: 基于quarot/diceq<br/>只针对moe/mlp合并的暴力搜索):::unfinished
     Mixed2 --- Lora[lora: linear附加lora补偿gptq残差]
     Mixed2 --- Bit2[提升bit做gptq]
@@ -100,3 +101,34 @@ graph LR
     Risks --- R1(moe算子内部down_proj输入无法优化可smooth):::risk
     Risks --- R2(需要替换gptq的quantizer为sefp与ssfp方式):::risk
 ```
+
+## 5. TODO List
+- [ ]  block rotation：可以只支持个block_hadamard就行
+- [ ]  diceq算法：
+    - [ ] 对于ov_rotate,需要支持head_wise的旋转，这块目前还没支持，还没验证
+- [ ]  校准集生成：
+    - [ ] ebss集成到pipeline中，moe模型默认开启
+    - [ ] ivss集成到pipeline中，默认不开启
+- [ ]  混合精度：
+    - [ ] moe/mlp 算子当成一个整体去搜索，给出config
+    - [ ] 激活混合精度
+        - [ ] 配置1：将singlequant这种小克罗内克旋转矩阵
+        - [ ] 配置2：提升bit
+    - [ ] 权重混合精度
+        - [ ] 配置1：lora去补偿权重损失
+        - [ ] 配置2：提升bit，导出config给gptq
+- [ ] 替换gptq的quantizer为sefp/ssfp的
+- [ ] moe算子内部的down_proj应用smooth平滑优化
+
+
+
+
+
+
+
+
+
+
+
+
+

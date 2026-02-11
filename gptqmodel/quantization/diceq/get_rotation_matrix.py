@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -640,6 +641,8 @@ def train_rotation_for_target(
     log_level: str = "INFO",
     output_dir: Optional[Union[str, Path]] = None,
     save_name: Optional[str] = None,
+    data_type: str = "activation",
+    debug: bool = False,
 ) -> Dict[str, Any]:
     """
     Pipeline接口：基于指定数据目录训练单个 target 的旋转矩阵。
@@ -651,6 +654,12 @@ def train_rotation_for_target(
     layer_config = resolve_layer_config(config_file=config_file, config_dict=config_dict)
     selected_name, entry = select_target_entry(layer_config, target_name, None)
     entry_train_args = entry.get("train_args", {})
+
+    # Extract data_type and debug from entry, use defaults if not provided
+    if data_type == "activation":
+        data_type = entry.get("data_type", "activation")
+    if not debug:
+        debug = entry.get("debug", False)
 
     if device is None:
         device = str(entry_train_args.get("device", DEFAULT_TRAIN_ARGS["device"]))
@@ -698,6 +707,7 @@ def train_rotation_for_target(
             device=device_obj,
             logger=logger,
             wandb_run=None,
+            data_type=data_type,
         )
     elif train_mode in {"layer_wise", "head_wise"}:
         rotation_dict, metrics, hidden_size = train_layer_or_head_wise_mode(
@@ -708,6 +718,7 @@ def train_rotation_for_target(
             logger=logger,
             args=runtime_args,
             wandb_run=None,
+            data_type=data_type,
         )
     else:
         raise ValueError(f"Unsupported train mode: {train_mode}")
@@ -729,6 +740,18 @@ def train_rotation_for_target(
             output_dir=Path(output_dir),
             save_name=save_name,
         )
+
+    # Debug mode cleanup: if debug=False, clean up intermediate data
+    if not debug:
+        # Clean up training data directory
+        if data_dir.exists():
+            logger.info(f"[{selected_name}] Cleaning up training data directory: {data_dir}")
+            shutil.rmtree(data_dir, ignore_errors=True)
+        # Note: We keep the final rotation matrix file for application use
+        # If you want to clean rotation files too, uncomment below:
+        # if save_path and save_path.exists():
+        #     logger.info(f"[{selected_name}] Cleaning up rotation matrix file: {save_path}")
+        #     save_path.unlink()
 
     return {
         "target_name": selected_name,
@@ -756,6 +779,7 @@ def train_rotation_for_targets(
     log_dir: Optional[Union[str, Path]] = None,
     log_level: str = "INFO",
     output_dir: Optional[Union[str, Path]] = None,
+    debug: bool = False,
 ) -> Dict[str, Any]:
     """
     Pipeline接口：批量训练多个 target，并返回可直接供 rotation 使用的矩阵映射。
@@ -770,6 +794,12 @@ def train_rotation_for_targets(
         if target_name not in target_to_data_path:
             raise KeyError(f"Missing data path for target `{target_name}`.")
         target_output_dir = Path(output_dir) / target_name if output_dir else None
+
+        # Extract data_type and debug from config entry
+        target_entry = config.get(target_name, {})
+        target_data_type = target_entry.get("data_type", "activation")
+        target_debug = target_entry.get("debug", debug)
+
         target_result = train_rotation_for_target(
             config_file=config_file,
             config_dict=config,
@@ -785,6 +815,8 @@ def train_rotation_for_targets(
             log_level=log_level,
             output_dir=target_output_dir,
             save_name=None,
+            data_type=target_data_type,
+            debug=target_debug,
         )
         result[target_name] = target_result["rotation"]
     return result
