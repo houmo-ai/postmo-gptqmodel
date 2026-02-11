@@ -1,13 +1,111 @@
 # 校准集生成
 
 ## 面向dense的校准集生成
-> 待补充
+使用说明：以Qwen3-8B为例，
+```
+cd gptqmodel/quantization/calibration/Dense_IVSG
 
-## 面向MOE的校准集生成
-使用说明：以qwen3-30b-a3b为例：
+python qwen3_dense_gen.py \ 
+    --model_path /moe/model/path \  # 模型地址
+    --num_beams 4 \ # 束宽，一般4足够
+    --seqlen 512 \  # 句子长度
+    --nsamples 100 \  # 生成多少条句子 
+    --gen_dir gen_data # 生成目录名
+```
+当前qwen3系列的dense模型均可直接使用上述脚本生成
+
+### 开发方法
+以Qwen3-8B为例，环境为transformers==4.57.0
+
+以monkey-patch的方式将原来库里的utils中beam search方法替换:
+```
+from custom_ivsg import _beam_search_ivsg
+GenerationMixin._beam_search = _beam_search_ivsg
+```
+在生成时会自动进入_beam_search_ivsg进行生成
+
+#### 生成脚本中hook
+对加载的模型，进行线性层的维度统计，同时记录每个linear的输入x
+```
+    def save_input_hook(name):
+        def hook_fn(module, input, output):
+            x = input[0]
+            module.input = x
+        return hook_fn
+
+    hook_handles = []
+    hidden_dim = 0
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            handle = module.register_forward_hook(save_input_hook(name))
+            hook_handles.append(handle)
+            hidden_dim = hidden_dim+module.weight.shape[1]
+    builtins.HIDDEN_DIM = hidden_dim
+```
+#### beam search改造，生成过程加入IVSG影响
 
 ```
-python calibration_generation/qwen3_moe_gen.py \ 
+        ...
+        while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
+            # a. Forward current tokens, obtain the logits
+            flat_running_sequences = self._flatten_beam_dim(running_sequences[:, :, :cur_len])
+            model_inputs = self.prepare_inputs_for_generation(flat_running_sequences, **model_kwargs)
+
+            model_outputs = self(**model_inputs, return_dict=True)
+            # IVSG
+            _useless_output= self(flat_running_sequences,return_dict = True)
+            # diag_scores = torch.zeros(num_beams).to('cuda')
+            # r_l2 = torch.zeros(num_beams).to('cuda')
+            scores = []
+            # stretch_scores = []
+            if flat_running_sequences.shape[1]>8:
+                for name, module in self.named_modules():
+                    if isinstance(module, nn.Linear):  
+                        x = module.input
+                        x = x - x.mean(dim=1, keepdim=True)
+                        # 计算多样性指标（trace）
+                        H = torch.bmm(x.transpose(1,2), x)
+                        diversity = torch.mean(x.pow(2),dim=(1,2))
+                        # 计算稳定性惩罚（norm）
+                        trace_H = H.diagonal(dim1=-2, dim2=-1).sum(-1)
+                        norm_term = torch.norm(x, p='fro',dim=(1,2))
+                        # 归一化得分
+                        raw_penalty = norm_term / (trace_H + 1e-6)
+                        div_norm = (diversity - diversity.mean()) / (diversity.std() + 1e-6)
+                        pen_norm = (raw_penalty - raw_penalty.mean()) / (raw_penalty.std() + 1e-6)
+                        # 核心公式: Normalized Diversity - Beta * Normalized Penalty
+                        layer_weight = module.weight.shape[1] / HIDDEN_DIM
+                        combined_score =layer_weight*( div_norm - 1.2 * pen_norm)
+                        scores.append(combined_score.tolist())
+                        # scores.append((module.weight.shape[1]/hidden_dim*(diversity - 0.5* norm_term)).tolist())
+                final_score = torch.tensor(scores).sum(dim=0)
+                del _useless_output
+                ...
+```
+
+对最后的得分进行干预：
+
+```
+...
+log_probs = log_probs + running_beam_scores[:, :, None]
+if flat_running_sequences.shape[1]>8: # 这里和前面的随机生成的短语长度相关，大于6就行
+    
+    # final_score =2* (final_score-final_score.min())/(final_score.max()-final_score.min())-1
+    # combine
+    log_probs = log_probs + final_score.unsqueeze(0).unsqueeze(-1).to(log_probs.device)
+log_probs = torch.reshape(log_probs, (batch_size, num_beams * vocab_size))
+...
+```
+由于每次都是对整句话从新计算，所以不需要维护什么状态矩阵，也就不需要像kvcache一样和束搜索的路径对齐（后续应该可以优化）
+
+
+## 面向MOE的校准集生成
+使用说明：以Qwen3-30B-A3B为例,
+
+```
+cd gptqmodel/quantization/calibration/MoE_EBSS
+
+python qwen3_moe_gen.py \ 
     --model_path /moe/model/path \  # 模型地址
     --num_beams 4 \ # 束宽，一般4足够
     --seqlen 512 \  # 句子长度
@@ -19,7 +117,7 @@ python calibration_generation/qwen3_moe_gen.py \
 
 ### 开发方法
 
-以qwen3-30b-a3b为例，环境为transformers==4.57.0
+以Qwen3-30B-A3B为例，环境为transformers==4.57.0
 
 以monkey-patch的方式将原来库里的utils中beam search方法替换:
 
@@ -148,5 +246,9 @@ sequences = sequences[:, :output_length]
 ```
 
 
+## 生成性能说明（资源占用情况）
 
+1. dense模型以Qwen3-8B为例，单卡占50G左右，生成128条句子的时间为8-10小时左右（待优化）
+
+2. moe模型以Qwen3-30B-A3B为例，双卡各占60G左右，生成512条句子的时间为24-26小时左右
 

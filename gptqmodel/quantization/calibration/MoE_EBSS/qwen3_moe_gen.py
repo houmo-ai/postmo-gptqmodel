@@ -32,15 +32,15 @@ if __name__ == "__main__":
     if not os.path.exists(args.gen_dir):
         os.mkdir(args.gen_dir)
     prefix = args.model_path.split('/')[-1]
-    for i in n_vocab:
-        input_ids = torch.tensor([[i]]).cuda()
-        print("generating: ", i)
-        random_len = random.randint(3, 6)
-        outputs1 = model.generate(input_ids, do_sample=False, max_length=random_len)
-        outputs = model.generate(outputs1, do_sample=False, num_beams=args.num_beams, max_length=args.seqlen,repetition_penalty=2.0)
-        gen_text = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        print(gen_text)
-        text_dict = {"text" : gen_text[0]}
-        with open(os.path.join(args.gen_dir,prefix+".jsonl"), "a") as f:
+    with open(os.path.join(args.gen_dir,prefix+".jsonl"), "a") as f:
+        for i in n_vocab:
+            input_ids = torch.tensor([[i]]).cuda()
+            print("generating: ", i)
+            random_len = random.randint(3, 6)
+            outputs1 = model.generate(input_ids, do_sample=False, max_length=random_len)
+            outputs = model.generate(outputs1, do_sample=False, num_beams=args.num_beams, max_length=args.seqlen,repetition_penalty=2.0)
+            gen_text = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            print(gen_text)
+            text_dict = {"text" : gen_text[0]}
             f.write(json.dumps(text_dict))
             f.write('\n')
