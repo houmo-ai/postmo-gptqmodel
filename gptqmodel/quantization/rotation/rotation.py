@@ -12,7 +12,7 @@ from transformers import PreTrainedModel
 from ...utils.logger import setup_logger
 from ...utils.model import get_module_by_name_prefix
 from ...utils.torch import torch_empty_cache
-from .hadamard_utils import apply_exact_had_to_linear, random_hadamard_matrix
+from .hadamard_utils import apply_exact_had_to_linear, random_hadamard_matrix, random_block_hadamard_matrix
 
 
 log = setup_logger()
@@ -240,6 +240,9 @@ def get_orthogonal_matrix(size, mode, device):
         return random_orthogonal_matrix(size, device)
     elif mode == "hadamard":
         return random_hadamard_matrix(size, device)
+    elif mode == "block_hadamard":
+        # Use default block size; falls back to full hadamard if not compatible
+        return random_block_hadamard_matrix(size, device)
     else:
         raise ValueError(f"Unknown mode {mode}")
 

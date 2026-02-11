@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover
     geoopt = None
 
 from .rotation_data import ActivationReferenceDataset, SampleRef, WeightReferenceDataset
-from ..rotation.hadamard_utils import random_hadamard_matrix
+from ..rotation.hadamard_utils import random_hadamard_matrix, random_block_hadamard_matrix
 
 
 def random_orthogonal_matrix(size: int, device) -> torch.Tensor:
@@ -47,6 +47,9 @@ def get_orthogonal_matrix(size: int, mode: str, device) -> torch.Tensor:
         return random_orthogonal_matrix(size, device)
     elif mode == "hadamard":
         return random_hadamard_matrix(size, device)
+    elif mode == "block_hadamard":
+        # Use default block size; falls back to full hadamard if not compatible
+        return random_block_hadamard_matrix(size, device)
     elif mode == "identity":
         return torch.eye(size, dtype=torch.float64, device=device)
     else:

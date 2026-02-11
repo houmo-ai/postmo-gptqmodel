@@ -104,6 +104,35 @@ def random_hadamard_matrix(size, device):
     return matmul_hadU(Q).to(device)
 
 
+def random_block_hadamard_matrix(size, device, block_size: int = 64):
+    """
+    Generate a block-diagonal random Hadamard matrix.
+
+    - The whole matrix is size x size.
+    - It is composed of blocks on the diagonal, each block being a randomized Hadamard matrix.
+    - block_size must divide size and be a power of 2 to be compatible with Hadamard.
+
+    If block_size is not valid for the given size, this function falls back to full random_hadamard_matrix(size, device).
+    """
+    if block_size <= 0:
+        return random_hadamard_matrix(size, device)
+
+    if size % block_size != 0:
+        # Fallback to global hadamard if cannot evenly split
+        return random_hadamard_matrix(size, device)
+
+    if not is_pow2(block_size):
+        # Fallback to global hadamard if block_size is not a power of 2
+        return random_hadamard_matrix(size, device)
+
+    num_blocks = size // block_size
+    # Build block-diagonal matrix; reuse the same Hadamard structure in each block but with independent random signs
+    blocks = []
+    for _ in range(num_blocks):
+        blocks.append(random_hadamard_matrix(block_size, device))
+    return torch.block_diag(*blocks)
+
+
 # TODO make this a util
 def import_fast_hadamard_transform():
     try:

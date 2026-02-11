@@ -41,7 +41,7 @@ from .rotation_training_core import (
 
 ALLOWED_TRAIN_MODES = {"all", "layer_wise", "head_wise"}
 ALLOWED_OPTIMIZERS = {"sgd", "adam", "adamw", "RSGD", "RAdam"}
-ALLOWED_INIT_MODES = {"hadamard", "random", "identity"}
+ALLOWED_INIT_MODES = {"hadamard", "block_hadamard", "random", "identity"}
 ALLOWED_SAMPLING_POLICIES = {"random", "outlier_mix"}
 ALLOWED_OUTLIER_SCORE_METRICS = {"absmax", "p99", "p99_over_median"}
 

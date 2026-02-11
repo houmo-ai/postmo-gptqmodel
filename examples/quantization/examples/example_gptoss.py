@@ -30,7 +30,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--nsamples", type=int, default=128)
     parser.add_argument("--seqlen", type=int, default=2048)
-    parser.add_argument("--rotation", type=str, default="hadamard", choices=[None, "hadamard"], help="可选旋转优化")
+    parser.add_argument("--rotation", type=str, default="hadamard", choices=[None, "hadamard", "block_hadamard", "random"], help="可选旋转优化")
     parser.add_argument("--sym", default=True, help="对称量化")
     parser.add_argument("--mse", default=True, help="开启 MSE 辅助优化")
     args = parser.parse_args()

@@ -236,8 +236,8 @@ class QuantizeConfig():
     offload_to_disk: bool = field(default=True, metadata={"help": "Offload completed module memory to disk during quantization loop"})
     offload_to_disk_path: str = field(default=None, metadata={"help": "Offload disk path. Only applicable if Offload to disk is enabled"})
 
-    rotation: Optional[str] = field(default=None, metadata={"choices": ["hadamard", "random"]})
-    rotation_vision: Optional[str] = field(default=None, metadata={"choices": ["hadamard", "random"]})
+    rotation: Optional[str] = field(default=None, metadata={"choices": ["hadamard", "block_hadamard", "random"]})
+    rotation_vision: Optional[str] = field(default=None, metadata={"choices": ["hadamard", "block_hadamard", "random"]})
 
     # deprecated: only used for compat
     is_marlin_format: bool = False
