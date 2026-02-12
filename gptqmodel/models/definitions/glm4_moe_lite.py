@@ -4,13 +4,14 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import copy
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.nn as nn
 
 from ..base import BaseQModel
 from ...quantization.diceq.config import DiceQConfigBase
+from ...quantization.mix_precision.config import MixPrecisionConfigBase
 from .deepseek_v3 import MLA, Glm4MoeLiteNaiveMoeNew
 
 
@@ -232,7 +233,30 @@ class Glm4MoeLiteQModel(BaseQModel):
         if not cfg.get("targets"):
             cfg["targets"] = [k for k, v in layer_config.items() if isinstance(v, dict)]
         return cfg
-    
+
+    @classmethod
+    def mix_precision_config_template(cls) -> Dict[str, Any]:
+        """Return mix precision config template for GLM-4.7-Flash MoE model.
+
+        This model has MoE structure, so we enable MoE-specific settings:
+        - moe_unified=True: All experts in a MoE group use the same bit
+        - moe_unify_strategy="max": Use highest bit for conservative quantization
+        - moe_unify_layer_level=True: Unify at layer level (include shared experts)
+        """
+        class Glm4MoeLiteMixPrecisionConfig(MixPrecisionConfigBase):
+            enabled: bool = True
+            weight_bits: List[int] = [4, 8]
+            act_bits: List[int] = [8]
+            policy: str = "topk"
+            topk: float = 0.1
+            threshold: float = 1e-6
+            metric: str = "kl"
+            moe_unified: bool = True
+            moe_unify_strategy: str = "max"
+            moe_unify_layer_level: bool = True
+
+        return Glm4MoeLiteMixPrecisionConfig().build()
+
     def before_model_load(self, load_quantized_model=False):
         if load_quantized_model:
             import transformers.models.glm4_moe_lite.modeling_glm4_moe_lite as glm4_moe_lite_modeling

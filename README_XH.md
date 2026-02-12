@@ -15,6 +15,7 @@ pip install SoundFile
 ```bash
 1. 支持自研算法**MoeQuant**：用于moe模型校准数据集的生成，使得moe专家都能获得合适的校准数据去做gptq，example在gptqmodel/quantization/ebss
 2. 支持自研算法**dicequant**：搜集对应位置激活，激活进行训练获取旋转矩阵，算法实现在gptqmodel/quantization/diceq，example在gptqmodel/models/definitions/glm4_moe_lite.py中的diceq_config_template里的配置
+3. 支持自研算法**混合精度**：针对moe模型，根据模型结构和激活分布，自动搜索最优的混合精度配置，example在gptqmodel/models/definitions/glm4_moe_lite.py中的mix_precision_config_template里的配置
 ```
 
 ## 3. 特定模型需要特定版本的仓库

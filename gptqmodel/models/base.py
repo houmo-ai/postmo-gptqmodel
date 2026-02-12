@@ -604,9 +604,56 @@ class BaseQModel(nn.Module):
         *,
         rotation_device: Union[str, torch.device],
     ) -> Optional[Dict[str, Any]]:
+        """Execute DiceQ pipeline with dual-switch check.
+
+        Requires both quantize_config.diceq_search=True AND
+        diceq_config_template().enabled=True to run.
+
+        Args:
+            rotation_device: Device for rotation operations
+
+        Returns:
+            DiceQ Q matrices or None if disabled
+        """
+        if not self.quantize_config.diceq_search:
+            return None
+
+        config = self.diceq_config_template()
+        if not config.get("enabled", False):
+            log.info("DiceQ config.enabled=False, skipping DiceQ pipeline")
+            return None
+
         from ..quantization.diceq.diceq_pipeline import run_diceq_pipeline
 
         return run_diceq_pipeline(model=self, rotation_device=rotation_device)
+
+    @classmethod
+    def diceq_config_template(cls) -> Dict[str, Any]:
+        """Return default DiceQ config template.
+
+        Subclasses should override this method to provide model-specific defaults.
+
+        Returns:
+            Default config dict with enabled=False
+        """
+        from ..quantization.diceq.config import DiceQConfigBase
+
+        class DefaultDiceQConfig(DiceQConfigBase):
+            enabled: bool = False
+
+        return DefaultDiceQConfig().build()
+
+    @classmethod
+    def mix_precision_config_template(cls) -> Dict[str, Any]:
+        """Return default mix precision config template.
+
+        Subclasses should override this method to provide model-specific defaults.
+
+        Returns:
+            Default config dict
+        """
+        from ..quantization.mix_precision.config import DefaultMixPrecisionConfig
+        return DefaultMixPrecisionConfig().build()
 
     def quantize(
         self,
@@ -825,6 +872,19 @@ class BaseQModel(nn.Module):
                                                 device=rotation_device, **module_name_args)
             self.model, _ = entry["rotate_fn"](model=self.model, rotate_mode=self.quantize_config.rotation,
                                             device=rotation_device, Q=diceq_q, **module_name_args)
+
+        # Mix precision search
+        if self.quantize_config.mix_precision_search:
+            from ..quantization.mix_precision import run_mix_precision_pipeline
+            mix_precision_device = self.quantize_config.device if self.quantize_config.device != DEVICE.MPS else DEVICE.CPU
+            run_mix_precision_pipeline(
+                model=self.model,
+                quantize_config=self.quantize_config,
+                calibration_data=calibration,
+                device=mix_precision_device,
+                mix_precision_config_template=self.mix_precision_config_template(),
+            )
+
         # init processor with default GPTQ processor
         from ..looper.tensorparallel_weight_processor import TensorParallelWeightProcessor
 

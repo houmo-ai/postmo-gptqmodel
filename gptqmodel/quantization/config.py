@@ -265,6 +265,12 @@ class QuantizeConfig():
     # VRAM allocation strategy for MoE-heavy subsets
     vram_strategy: VRAMStrategy = field(default=VRAMStrategy.EXCLUSIVE)
 
+    # DiceQ search configuration (requires both diceq_search=True AND config.enabled=True)
+    diceq_search: bool = field(default=False, metadata={"help": "Enable DiceQ search (also requires enabled=True in diceq_config_template)"})
+
+    # Mix precision search configuration (requires both mix_precision_search=True AND config.enabled=True)
+    mix_precision_search: bool = field(default=False, metadata={"help": "Enable mix precision search (also requires enabled=True in mix_precision_config_template)"})
+
     def __post_init__(self):
         fields_info = fields(self)
 
