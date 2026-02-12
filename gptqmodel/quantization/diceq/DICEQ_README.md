@@ -101,7 +101,7 @@ qcfg = QuantizeConfig(
 在模型定义中重写 `diceq_config_template()` 方法：
 
 ```python
-from gptqmodel.quantization.diceq.config import DiceQConfigBase
+from gptqmodel.quantization.diceq.diceq_config import DiceQConfigBase
 
 class MyModelDiceQConfig(DiceQConfigBase):
     """自定义 DiceQ 配置"""

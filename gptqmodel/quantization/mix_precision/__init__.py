@@ -7,7 +7,7 @@ from .search_engine import MixPrecisionSearchEngine, run_mix_precision_search, e
 from .moe_handler import MoEHandler
 from .layer_selector import LayerSelector
 from .metrics import MetricFactory, MetricBase
-from .config import MixPrecisionConfigBase, DefaultMixPrecisionConfig, MoEMixPrecisionConfig, validate_mix_precision_config
+from .mixsearch_config import MixPrecisionConfigBase, DefaultMixPrecisionConfig, MoEMixPrecisionConfig, validate_mix_precision_config
 from .pipeline import run_mix_precision_pipeline, get_mix_precision_config
 
 __all__ = [

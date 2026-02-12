@@ -13,7 +13,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from ...utils.logger import setup_logger
-from .config import validate_mix_precision_config
+from .mixsearch_config import validate_mix_precision_config
 from .layer_selector import LayerSelector, LayerSelectionResult
 from .metrics import MetricFactory
 from .moe_handler import MoEHandler

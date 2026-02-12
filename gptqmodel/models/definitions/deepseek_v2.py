@@ -7,7 +7,7 @@ import copy
 from typing import Any, Dict
 
 from ..base import BaseQModel
-from ...quantization.diceq.config import DiceQConfigBase
+from ...quantization.diceq.diceq_config import DiceQConfigBase
 
 
 """

@@ -10,8 +10,8 @@ import torch
 import torch.nn as nn
 
 from ..base import BaseQModel
-from ...quantization.diceq.config import DiceQConfigBase
-from ...quantization.mix_precision.config import MixPrecisionConfigBase
+from ...quantization.diceq.diceq_config import DiceQConfigBase
+from ...quantization.mix_precision.mixsearch_config import MixPrecisionConfigBase
 from .deepseek_v3 import MLA, Glm4MoeLiteNaiveMoeNew
 
 

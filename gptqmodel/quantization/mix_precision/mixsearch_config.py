@@ -94,6 +94,19 @@ class MixPrecisionConfigBase:
         return config
 
 
+class DefaultMixPrecisionConfig(MixPrecisionConfigBase):
+    """Default mix precision config for most models.
+
+    This class provides sensible defaults that work well for most cases.
+    Override in model definitions for specific requirements.
+    
+    Note: This class sets enabled=True, assuming the user explicitly chose
+    to use this config. The dual-switch still requires mix_precision_search=True
+    in QuantizeConfig.
+    """
+    enabled: bool = True
+
+
 class MoEMixPrecisionConfig(MixPrecisionConfigBase):
     """Mix precision config optimized for MoE models.
 
@@ -106,6 +119,7 @@ class MoEMixPrecisionConfig(MixPrecisionConfigBase):
     in QuantizeConfig.
     """
 
+    enabled: bool = True
     moe_unified: bool = True
     moe_unify_strategy: str = "max"
     moe_unify_layer_level: bool = True

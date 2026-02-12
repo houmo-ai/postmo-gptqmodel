@@ -34,6 +34,8 @@ def main():
     parser.add_argument("--sym", default=True, help="对称量化")
     parser.add_argument("--mse", default=True, help="开启 MSE 辅助优化")
     parser.add_argument("--hessian-mse", default=True, help="开启 Hessian MSE 辅助优化")
+    parser.add_argument("--mix-precision-search", action="store_true", help="启用混合精度搜索")
+    parser.add_argument("--diceq-search", action="store_true", help="启用 DiceQ 搜索")
     args = parser.parse_args()
 
     model_id = os.path.normpath(args.model)
@@ -48,8 +50,10 @@ def main():
         group_size=args.group_size,
         sym=bool(args.sym),
         mse=bool(args.mse),
-        rotation=args.rotation,
+        rotation=args.rotation if not args.mix_precision_search else None,
         hessian_mse=bool(args.hessian_mse),
+        mix_precision_search=args.mix_precision_search,
+        diceq_search=args.diceq_search,
     )
 
     # gpt-oss 需要 remote code（模型定义），这里务必开启

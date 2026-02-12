@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 
 from ...utils.logger import setup_logger
-from .config import DefaultMixPrecisionConfig, validate_mix_precision_config
+from .mixsearch_config import DefaultMixPrecisionConfig, validate_mix_precision_config
 from .search_engine import run_mix_precision_search, expand_bit_allocation_to_modules
 
 log = setup_logger()

@@ -636,7 +636,7 @@ class BaseQModel(nn.Module):
         Returns:
             Default config dict with enabled=False
         """
-        from ..quantization.diceq.config import DiceQConfigBase
+        from ..quantization.diceq.diceq_config import DiceQConfigBase
 
         class DefaultDiceQConfig(DiceQConfigBase):
             enabled: bool = False
@@ -652,7 +652,7 @@ class BaseQModel(nn.Module):
         Returns:
             Default config dict
         """
-        from ..quantization.mix_precision.config import DefaultMixPrecisionConfig
+        from ..quantization.mix_precision.mixsearch_config import DefaultMixPrecisionConfig
         return DefaultMixPrecisionConfig().build()
 
     def quantize(
@@ -828,6 +828,13 @@ class BaseQModel(nn.Module):
         #     else:   
         #         self.model, _ = rotate_model_qwen3_vl(model=self.model, rotate_mode=self.quantize_config.rotation,
         #                                         device=rotation_device, **module_name_args)
+        # Auto-enable rotation when DiceQ is enabled
+        if self.quantize_config.diceq_search:
+            diceq_config = self.diceq_config_template()
+            if diceq_config.get("enabled", False) and self.quantize_config.rotation is None:
+                log.info("DiceQ is enabled, auto-enabling rotation with 'hadamard' mode")
+                self.quantize_config.rotation = "hadamard"
+
         if self.quantize_config.rotation:
             from ..quantization.rotation.model import get_rotation_entry
             entry = get_rotation_entry(self)
