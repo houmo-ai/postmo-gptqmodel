@@ -29,17 +29,25 @@ class SearchResult:
         bit_allocation: 模块名到比特配置的映射
         sensitivities: 模块名到敏感度的映射
         statistics: 统计信息
+        fixed_bits: 固定bit配置的层
     """
     bit_allocation: Dict[str, Dict[str, int]]
     sensitivities: Dict[str, float]
     statistics: Dict[str, Any]
+    fixed_bits: Dict[str, int]
 
 
 class MixPrecisionSearchEngine:
     """混合精度搜索引擎
     
-    执行混合精度搜索，为每层分配合适的比特数
-    支持MoE专家一致性
+    执行混合精度权重搜索，为每层分配合适的比特数
+    仅针对权重进行bit搜索，不包含激活量化
+    
+    Features:
+    - Weight-only bit search
+    - Flexible layer grouping via group_by_path
+    - Fixed bit configuration
+    - MoE routing expert unification
     """
     
     def __init__(
@@ -67,20 +75,17 @@ class MixPrecisionSearchEngine:
         self.layer_selector = LayerSelector(
             include_patterns=config.get("layer_include"),
             exclude_patterns=config.get("layer_exclude"),
+            group_by_path=config.get("group_by_path"),
+            fixed_bits=config.get("fixed_bits"),
             moe_unified=config.get("moe_unified", True),
-            moe_unify_strategy=config.get("moe_unify_strategy", "max"),
-            moe_unify_layer_level=config.get("moe_unify_layer_level", False),
         )
         self.metric = MetricFactory.create(config.get("metric", "kl"))
         
         self.weight_bits = config.get("weight_bits", [4, 8])
-        self.act_bits = config.get("act_bits", [8])
         self.policy = config.get("policy", "topk")
         self.topk = config.get("topk", 0.1)
         self.threshold = config.get("threshold", 1e-6)
         self.moe_unified = config.get("moe_unified", True)
-        self.moe_unify_strategy = config.get("moe_unify_strategy", "max")
-        self.moe_unify_layer_level = config.get("moe_unify_layer_level", False)
         
         self._baseline_outputs = {}
     
@@ -97,7 +102,7 @@ class MixPrecisionSearchEngine:
         
         log.info(f"Found {len(candidates)} candidates for mix precision search")
         log.info(f"MoE groups: {len(selection_result.moe_groups)}")
-        log.info(f"MoE layers: {len(selection_result.moe_layers)}")
+        log.info(f"Fixed bits layers: {len(selection_result.fixed_bits)}")
         
         self._run_baseline()
         
@@ -114,6 +119,7 @@ class MixPrecisionSearchEngine:
             bit_allocation=bit_allocation,
             sensitivities=sensitivities,
             statistics=statistics,
+            fixed_bits=selection_result.fixed_bits,
         )
     
     def _run_baseline(self) -> None:
@@ -129,13 +135,20 @@ class MixPrecisionSearchEngine:
                 desc="Baseline forward",
                 leave=False,
             )):
-                if isinstance(batch, torch.Tensor):
-                    batch = [batch]
-                
-                batch = [b.to(self.device) if isinstance(b, torch.Tensor) else b for b in batch]
-                
                 try:
-                    output = self.model(*batch)
+                    if isinstance(batch, dict):
+                        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                        output = self.model(**batch)
+                    elif isinstance(batch, torch.Tensor):
+                        batch = batch.to(self.device)
+                        output = self.model(batch)
+                    elif isinstance(batch, (list, tuple)):
+                        batch = [b.to(self.device) if isinstance(b, torch.Tensor) else b for b in batch]
+                        output = self.model(*batch)
+                    else:
+                        log.warning(f"Unsupported batch type: {type(batch)}")
+                        continue
+                    
                     self._baseline_outputs[batch_idx] = self._extract_output(output)
                 except Exception as e:
                     log.warning(f"Baseline forward failed for batch {batch_idx}: {e}")
@@ -186,27 +199,97 @@ class MixPrecisionSearchEngine:
         sensitivities = {}
         
         for candidate in tqdm(candidates, desc="Computing sensitivities"):
-            modules = self.layer_selector.get_modules_for_sensitivity(
-                candidate, selection_result
-            )
-            
-            if not modules:
-                continue
-            
-            candidate_sensitivities = []
-            
-            for module_name in modules:
-                try:
-                    sens = self._compute_module_sensitivity(module_name)
-                    candidate_sensitivities.append(sens)
-                except Exception as e:
-                    log.warning(f"Failed to compute sensitivity for {module_name}: {e}")
-                    candidate_sensitivities.append(0.0)
-            
-            if candidate_sensitivities:
-                sensitivities[candidate] = sum(candidate_sensitivities) / len(candidate_sensitivities)
+            try:
+                sens = self._compute_group_sensitivity(candidate, selection_result)
+                sensitivities[candidate] = sens
+            except Exception as e:
+                log.warning(f"Failed to compute sensitivity for {candidate}: {e}")
+                sensitivities[candidate] = 0.0
         
         return sensitivities
+    
+    def _compute_group_sensitivity(
+        self,
+        candidate: str,
+        selection_result: LayerSelectionResult,
+    ) -> float:
+        """计算整个组的敏感度（组内所有模块统一量化后计算敏感度）
+        
+        Args:
+            candidate: 候选层标识
+            selection_result: 层选择结果
+            
+        Returns:
+            敏感度值
+        """
+        modules = self.layer_selector.get_modules_for_sensitivity(
+            candidate, selection_result
+        )
+        
+        if not modules:
+            return 0.0
+        
+        total_sensitivity = 0.0
+        valid_batches = 0
+        
+        for batch_idx, batch in enumerate(self.calibration_data):
+            if batch_idx not in self._baseline_outputs:
+                continue
+            
+            baseline_output = self._baseline_outputs[batch_idx]
+            
+            try:
+                quant_output = self._run_quantized_forward_group(modules, batch)
+                sensitivity = self.metric.compute(baseline_output, quant_output)
+                total_sensitivity += sensitivity
+                valid_batches += 1
+            except Exception as e:
+                log.debug(f"Sensitivity computation failed for {candidate} batch {batch_idx}: {e}")
+        
+        return total_sensitivity / max(valid_batches, 1)
+    
+    def _run_quantized_forward_group(
+        self,
+        module_names: List[str],
+        batch: Union[List, Dict, torch.Tensor],
+    ) -> torch.Tensor:
+        """运行量化模式前向传播（组内所有模块统一量化）
+        
+        Args:
+            module_names: 要量化的模块名称列表
+            batch: 输入批次
+            
+        Returns:
+            量化后的输出
+        """
+        original_weights = {}
+        
+        try:
+            for module_name in module_names:
+                module = self._get_module(module_name)
+                if module is not None and hasattr(module, 'weight'):
+                    original_weights[module_name] = module.weight.data.clone()
+                    quantized_weight = self._quantize_weight(module.weight.data, self.weight_bits[0])
+                    module.weight.data.copy_(quantized_weight)
+            
+            if isinstance(batch, dict):
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                output = self.model(**batch)
+            elif isinstance(batch, torch.Tensor):
+                batch = batch.to(self.device)
+                output = self.model(batch)
+            elif isinstance(batch, (list, tuple)):
+                batch = [b.to(self.device) if isinstance(b, torch.Tensor) else b for b in batch]
+                output = self.model(*batch)
+            else:
+                raise ValueError(f"Unsupported batch type: {type(batch)}")
+            
+            return self._extract_output(output)
+        finally:
+            for module_name, original_weight in original_weights.items():
+                module = self._get_module(module_name)
+                if module is not None:
+                    module.weight.data.copy_(original_weight)
     
     def _compute_module_sensitivity(self, module_name: str) -> float:
         """计算单个模块的敏感度
@@ -260,8 +343,17 @@ class MixPrecisionSearchEngine:
             quantized_weight = self._quantize_weight(module.weight.data, self.weight_bits[0])
             module.weight.data.copy_(quantized_weight)
             
-            batch = [b.to(self.device) if isinstance(b, torch.Tensor) else b for b in batch]
-            output = self.model(*batch)
+            if isinstance(batch, dict):
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                output = self.model(**batch)
+            elif isinstance(batch, torch.Tensor):
+                batch = batch.to(self.device)
+                output = self.model(batch)
+            elif isinstance(batch, (list, tuple)):
+                batch = [b.to(self.device) if isinstance(b, torch.Tensor) else b for b in batch]
+                output = self.model(*batch)
+            else:
+                raise ValueError(f"Unsupported batch type: {type(batch)}")
             
             return self._extract_output(output)
         finally:
@@ -348,7 +440,6 @@ class MixPrecisionSearchEngine:
         
         high_bit = max(self.weight_bits)
         low_bit = min(self.weight_bits)
-        default_act_bit = self.act_bits[0] if self.act_bits else 8
         
         allocation = {}
         
@@ -359,7 +450,6 @@ class MixPrecisionSearchEngine:
                 bit = high_bit if i < topk_count else low_bit
                 allocation[candidate] = {
                     "weight_bits": bit,
-                    "act_bits": default_act_bit,
                 }
         
         elif self.policy == "threshold":
@@ -367,18 +457,18 @@ class MixPrecisionSearchEngine:
                 bit = high_bit if sens > self.threshold else low_bit
                 allocation[candidate] = {
                     "weight_bits": bit,
-                    "act_bits": default_act_bit,
                 }
         
         else:
             for candidate, _ in sorted_candidates:
                 allocation[candidate] = {
                     "weight_bits": low_bit,
-                    "act_bits": default_act_bit,
                 }
         
         if self.moe_unified:
             allocation = self._unify_moe_bits(allocation, selection_result)
+        
+        allocation = self._apply_group_unification(allocation, selection_result)
         
         return allocation
     
@@ -405,20 +495,47 @@ class MixPrecisionSearchEngine:
                     allocation.get(m, bits_config).get("weight_bits", 4)
                     for m in members
                 ]
-                
-                if self.moe_unify_strategy == "max":
-                    target_bit = max(member_bits)
-                elif self.moe_unify_strategy == "min":
-                    target_bit = min(member_bits)
-                else:
-                    target_bit = round(sum(member_bits) / len(member_bits))
+                target_bit = max(member_bits)
                 
                 unified[candidate] = {
                     "weight_bits": target_bit,
-                    "act_bits": bits_config.get("act_bits", 8),
                 }
             else:
                 unified[candidate] = bits_config
+        
+        return unified
+    
+    def _apply_group_unification(
+        self,
+        allocation: Dict[str, Dict[str, int]],
+        selection_result: LayerSelectionResult,
+    ) -> Dict[str, Dict[str, int]]:
+        """应用自定义分组统一
+        
+        Args:
+            allocation: 原始分配
+            selection_result: 层选择结果
+            
+        Returns:
+            统一后的分配
+        """
+        if not selection_result.group_mapping:
+            return allocation
+        
+        unified = dict(allocation)
+        
+        group_bits = {}
+        for module_name, group_name in selection_result.group_mapping.items():
+            if group_name not in group_bits:
+                group_bits[group_name] = []
+            if module_name in allocation:
+                group_bits[group_name].append(allocation[module_name].get("weight_bits", 4))
+        
+        for group_name, bits_list in group_bits.items():
+            if bits_list:
+                target_bit = max(bits_list)
+                if group_name in unified:
+                    unified[group_name] = {"weight_bits": target_bit}
         
         return unified
     
@@ -471,7 +588,7 @@ def run_mix_precision_search(
         device: 执行设备
         
     Returns:
-        比特分配结果 {layer_name: {"weight_bits": int, "act_bits": int}}
+        比特分配结果 {layer_name: {"weight_bits": int}}
     """
     engine = MixPrecisionSearchEngine(
         model=model,
@@ -491,6 +608,7 @@ def run_mix_precision_search(
                 "bit_allocation": result.bit_allocation,
                 "sensitivities": result.sensitivities,
                 "statistics": result.statistics,
+                "fixed_bits": result.fixed_bits,
             }, f, indent=2)
         
         log.info(f"Mix precision search result saved to {output_path}")
@@ -502,15 +620,18 @@ def expand_bit_allocation_to_modules(
     bit_allocation: Dict[str, Dict[str, int]],
     model: nn.Module,
     config: Dict[str, Any],
+    fixed_bits: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Dict[str, int]]:
     """将比特分配展开到所有模块
     
     对于MoE组，将组级别的比特分配展开到组内所有成员
+    对于固定bit的层，直接使用固定值
     
     Args:
         bit_allocation: 原始比特分配
         model: 模型实例
         config: 混合精度配置字典
+        fixed_bits: 固定bit配置
         
     Returns:
         展开后的比特分配
@@ -518,20 +639,25 @@ def expand_bit_allocation_to_modules(
     layer_selector = LayerSelector(
         include_patterns=config.get("layer_include"),
         exclude_patterns=config.get("layer_exclude"),
+        group_by_path=config.get("group_by_path"),
+        fixed_bits=config.get("fixed_bits"),
         moe_unified=config.get("moe_unified", True),
-        moe_unify_strategy=config.get("moe_unify_strategy", "max"),
-        moe_unify_layer_level=config.get("moe_unify_layer_level", False),
     )
     selection_result = layer_selector.select(model)
     
     expanded = {}
+    
+    for module_name, bits in (fixed_bits or {}).items():
+        if bits is not None:
+            expanded[module_name] = {"weight_bits": bits}
     
     for candidate, bits_config in bit_allocation.items():
         modules = layer_selector.get_modules_for_sensitivity(candidate, selection_result)
         
         if modules:
             for module_name in modules:
-                expanded[module_name] = bits_config
+                if module_name not in expanded:
+                    expanded[module_name] = bits_config
         else:
             expanded[candidate] = bits_config
     

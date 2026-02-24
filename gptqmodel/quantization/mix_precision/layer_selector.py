@@ -4,8 +4,9 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+import fnmatch
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set, Tuple, Any
 
 import torch
 import torch.nn as nn
@@ -18,22 +19,33 @@ class LayerSelectionResult:
     """层选择结果
     
     Attributes:
-        candidates: 候选层列表（包含MoE组标识和普通模块名）
+        candidates: 候选层列表（包含组标识和模块名）
         moe_groups: MoE组映射 {moe_group_key: [module_names]}
         moe_layers: MoE层映射 {moe_layer_key: {"experts": [...], "shared_experts": [...]}}
         regular_modules: 普通模块列表（非MoE）
+        fixed_bits: 固定bit配置的层 {module_name: bits}
+        group_mapping: 分组映射 {module_name: group_name}
     """
     candidates: List[str]
     moe_groups: Dict[str, List[str]]
     moe_layers: Dict[str, Dict[str, List[str]]]
     regular_modules: List[str]
+    fixed_bits: Dict[str, int] = field(default_factory=dict)
+    group_mapping: Dict[str, str] = field(default_factory=dict)
 
 
 class LayerSelector:
     """层选择机制
     
-    支持MoE停止搜索功能，当遇到MoE容器类型时停止向下搜索叶子节点
-    支持按层名称和层类型指定包含/排除规则
+    支持功能：
+    - MoE停止搜索：遇到MoE容器类型时停止向下搜索叶子节点
+    - 包含/排除规则：按层名称和层类型指定包含/排除规则
+    - 灵活分组：按配置路径将层分组
+    - 固定bit：指定某些层的固定量化bit（None表示不量化）
+    
+    MoE behavior:
+    - moe_unified=True: 每个MoE层的路由专家统一为一个组
+    - Shared experts: Always independent (each linear gets its own bit)
     """
     
     LAYER_TYPE_PATTERNS = {
@@ -56,27 +68,81 @@ class LayerSelector:
         self,
         include_patterns: Optional[List[str]] = None,
         exclude_patterns: Optional[List[str]] = None,
+        group_by_path: Optional[Dict[str, str]] = None,
+        fixed_bits: Optional[Dict[str, Optional[int]]] = None,
         moe_unified: bool = True,
-        moe_unify_strategy: str = "max",
-        moe_unify_layer_level: bool = False,
     ):
         """初始化层选择器
         
         Args:
             include_patterns: 包含的层模式列表
             exclude_patterns: 排除的层模式列表
-            moe_unified: 是否统一MoE组内bit
-            moe_unify_strategy: MoE统一策略 ("max", "min", "avg")
-            moe_unify_layer_level: 是否在MoE层级别统一（包含路由专家和共享专家）
+            group_by_path: 分组配置 {"path_pattern": "group_name"}
+            fixed_bits: 固定bit配置 {"module_path": bits}，设为None表示不量化
+            moe_unified: 是否将每个MoE层的路由专家统一为一个组
         """
         self.include_patterns = include_patterns or []
         self.exclude_patterns = exclude_patterns or []
+        self.group_by_path = group_by_path or {}
+        self.fixed_bits = fixed_bits or {}
         self.moe_unified = moe_unified
-        self.moe_unify_strategy = moe_unify_strategy
-        self.moe_unify_layer_level = moe_unify_layer_level
+    
+    def _match_path_pattern(self, name: str, pattern: str) -> bool:
+        """匹配路径模式，支持通配符
+        
+        Args:
+            name: 模块名称
+            pattern: 模式（支持 * 通配符）
+            
+        Returns:
+            是否匹配
+        """
+        return fnmatch.fnmatch(name, pattern)
+    
+    def _get_fixed_bits_for_module(self, module_name: str) -> Optional[int]:
+        """获取模块的固定bit配置
+        
+        优先精确匹配，其次通配符匹配
+        
+        Args:
+            module_name: 模块名称
+            
+        Returns:
+            固定bit值，如果没有配置则返回None
+        """
+        if module_name in self.fixed_bits:
+            return self.fixed_bits[module_name]
+        
+        for pattern, bits in self.fixed_bits.items():
+            if self._match_path_pattern(module_name, pattern):
+                return bits
+        
+        return None
+    
+    def _get_group_for_module(self, module_name: str) -> Optional[str]:
+        """获取模块的分组名称
+        
+        Args:
+            module_name: 模块名称
+            
+        Returns:
+            分组名称，如果没有配置则返回None
+        """
+        for pattern, group_name in self.group_by_path.items():
+            if self._match_path_pattern(module_name, pattern):
+                return group_name
+        return None
     
     def select(self, model: nn.Module) -> LayerSelectionResult:
         """选择参与混合精度搜索的层
+        
+        流程：
+        1. 遍历模型所有Linear层
+        2. 应用include/exclude过滤
+        3. 检查MoE路由层排除规则
+        4. 检查固定bit配置
+        5. 应用group_by_path分组
+        6. MoE路由专家统一分组
         
         Args:
             model: 模型实例
@@ -90,7 +156,9 @@ class LayerSelector:
         candidates = []
         regular_modules = []
         visited_moe_groups = set()
-        visited_moe_layers = set()
+        visited_groups = set()
+        fixed_bits_map = {}
+        group_mapping = {}
         
         for name, module in model.named_modules():
             if not isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
@@ -99,19 +167,41 @@ class LayerSelector:
             if not self._should_include(name):
                 continue
             
-            moe_group = MoEHandler.get_moe_group_key(name)
-            moe_layer = MoEHandler.get_moe_layer_key(name)
+            fixed_bits = self._get_fixed_bits_for_module(name)
+            if fixed_bits is not None:
+                fixed_bits_map[name] = fixed_bits
+                continue
             
-            if self.moe_unified and self.moe_unify_layer_level and moe_layer:
-                if moe_layer in visited_moe_layers:
+            if MoEHandler.is_shared_expert(name):
+                candidates.append(name)
+                regular_modules.append(name)
+                continue
+            
+            if MoEHandler.is_routed_expert(name):
+                if not MoEHandler.is_routed_expert_projection(name):
                     continue
-                visited_moe_layers.add(moe_layer)
-                candidates.append(moe_layer)
-            elif self.moe_unified and moe_group:
-                if moe_group in visited_moe_groups:
-                    continue
-                visited_moe_groups.add(moe_group)
-                candidates.append(moe_group)
+
+                if self.moe_unified:
+                    moe_group = MoEHandler.get_moe_group_key(name)
+                    if not moe_group:
+                        continue
+                    if moe_group in visited_moe_groups:
+                        continue
+                    visited_moe_groups.add(moe_group)
+                    candidates.append(moe_group)
+                else:
+                    candidates.append(name)
+                    regular_modules.append(name)
+                continue
+            
+            group_name = self._get_group_for_module(name)
+            if group_name:
+                if group_name not in visited_groups:
+                    visited_groups.add(group_name)
+                    candidates.append(group_name)
+                    group_mapping[name] = group_name
+                else:
+                    group_mapping[name] = group_name
             else:
                 candidates.append(name)
                 regular_modules.append(name)
@@ -121,6 +211,8 @@ class LayerSelector:
             moe_groups=moe_groups,
             moe_layers=moe_layers,
             regular_modules=regular_modules,
+            fixed_bits=fixed_bits_map,
+            group_mapping=group_mapping,
         )
     
     def _should_include(self, name: str) -> bool:
@@ -196,6 +288,7 @@ class LayerSelector:
         """获取候选层对应的所有模块名称
         
         对于MoE组，返回组内所有成员
+        对于分组，返回组内所有成员
         对于普通模块，返回单个模块
         
         Args:
@@ -211,6 +304,10 @@ class LayerSelector:
         if candidate in selection_result.moe_layers:
             layer_info = selection_result.moe_layers[candidate]
             return layer_info.get("experts", []) + layer_info.get("shared_experts", [])
+        
+        modules_in_group = [k for k, v in selection_result.group_mapping.items() if v == candidate]
+        if modules_in_group:
+            return modules_in_group
         
         return [candidate]
     

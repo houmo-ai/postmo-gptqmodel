@@ -108,7 +108,7 @@ graph LR
     - [ ] 对于ov_rotate,需要支持head_wise的旋转，这块目前还没支持，还没验证
 - [ ]  校准集生成：
     - [ ] ebss集成到pipeline中，moe模型默认开启
-    - [ ] ivss集成到pipeline中，默认不开启
+    - [ ] ivsg集成到pipeline中，默认不开启
 - [ ]  混合精度：
     - [ ] moe/mlp 算子当成一个整体去搜索，给出config
     - [ ] 激活混合精度

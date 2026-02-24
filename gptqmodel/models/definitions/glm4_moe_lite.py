@@ -239,21 +239,17 @@ class Glm4MoeLiteQModel(BaseQModel):
         """Return mix precision config template for GLM-4.7-Flash MoE model.
 
         This model has MoE structure, so we enable MoE-specific settings:
-        - moe_unified=True: All experts in a MoE group use the same bit
-        - moe_unify_strategy="max": Use highest bit for conservative quantization
-        - moe_unify_layer_level=True: Unify at layer level (include shared experts)
+        - moe_unified=True: Each MoE layer's routed experts use the same bit
+        - Shared experts: Always independent (each linear gets its own bit)
         """
         class Glm4MoeLiteMixPrecisionConfig(MixPrecisionConfigBase):
             enabled: bool = True
             weight_bits: List[int] = [4, 8]
-            act_bits: List[int] = [8]
             policy: str = "topk"
             topk: float = 0.1
             threshold: float = 1e-6
             metric: str = "kl"
             moe_unified: bool = True
-            moe_unify_strategy: str = "max"
-            moe_unify_layer_level: bool = True
 
         return Glm4MoeLiteMixPrecisionConfig().build()
 

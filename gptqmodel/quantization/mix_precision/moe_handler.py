@@ -14,11 +14,13 @@ import torch.nn as nn
 class MoEHandler:
     """MoE结构识别与统一处理
     
-    负责识别MoE结构，确保MoE组内所有专家使用统一的量化bit
+    负责识别MoE结构，确保路由专家组内使用统一的量化bit
+    共享专家始终独立处理
     """
     
-    MOE_EXPERT_PATTERN = r"\.experts\.\d+\."
+    MOE_EXPERT_PATTERN = r"\.experts\."
     MOE_SHARED_EXPERT_PATTERN = r"\.shared_experts\."
+    ROUTED_EXPERT_ALLOWED_PROJ_PATTERN = r"(?:^|\.)(gate_proj|up_proj|down_proj)(?:\.\d+)?$"
     
     MOE_CONTAINER_TYPES = [
         "MoE", "Experts", "ExpertBlock", "MixtralSparseMoeBlock",
@@ -58,7 +60,26 @@ class MoEHandler:
         """
         if not module_name:
             return False
+        if cls.is_shared_expert(module_name):
+            return False
         return bool(re.search(cls.MOE_EXPERT_PATTERN, module_name))
+
+    @classmethod
+    def is_routed_expert_projection(cls, module_name: str) -> bool:
+        """判断是否为 routed expert 的目标投影层
+
+        仅允许以下三类进入 routed expert 搜索组：
+        - gate_proj
+        - up_proj
+        - down_proj
+
+        兼容两种常见命名：
+        - experts.{idx}.gate_proj
+        - experts.gate_proj.{idx}
+        """
+        if not cls.is_routed_expert(module_name):
+            return False
+        return bool(re.search(cls.ROUTED_EXPERT_ALLOWED_PROJ_PATTERN, module_name))
     
     @classmethod
     def is_shared_expert(cls, module_name: str) -> bool:
@@ -140,7 +161,9 @@ class MoEHandler:
     
     @classmethod
     def collect_moe_modules(cls, model: nn.Module) -> Dict[str, List[str]]:
-        """收集所有MoE组及其成员模块
+        """收集所有路由专家组及其成员模块
+        
+        只收集路由专家，共享专家不在此统计中
         
         Args:
             model: 模型实例
@@ -152,9 +175,10 @@ class MoEHandler:
         
         for name, module in model.named_modules():
             if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
-                group_key = cls.get_moe_group_key(name)
-                if group_key:
-                    moe_groups[group_key].append(name)
+                if cls.is_routed_expert_projection(name):
+                    group_key = cls.get_moe_group_key(name)
+                    if group_key:
+                        moe_groups[group_key].append(name)
         
         return dict(moe_groups)
     
@@ -176,7 +200,7 @@ class MoEHandler:
             if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
                 layer_key = cls.get_moe_layer_key(name)
                 if layer_key:
-                    if cls.is_routed_expert(name):
+                    if cls.is_routed_expert_projection(name):
                         moe_layers[layer_key]["experts"].append(name)
                     elif cls.is_shared_expert(name):
                         moe_layers[layer_key]["shared_experts"].append(name)
@@ -221,47 +245,6 @@ class MoEHandler:
                 target_bit = max(member_bits)
             
             for m in members:
-                unified[m] = target_bit
-        
-        return unified
-    
-    @classmethod
-    def unify_moe_layer_bits(
-        cls,
-        bit_allocation: Dict[str, int],
-        moe_layers: Dict[str, Dict[str, List[str]]],
-        strategy: str = "max",
-    ) -> Dict[str, int]:
-        """统一MoE层内所有专家（包括路由专家和共享专家）的bit
-        
-        Args:
-            bit_allocation: 原始bit分配 {module_name: bits}
-            moe_layers: MoE层映射 {moe_layer_key: {"experts": [...], "shared_experts": [...]}}
-            strategy: 统一策略
-                
-        Returns:
-            统一后的bit分配
-        """
-        unified = dict(bit_allocation)
-        
-        for layer_key, layer_info in moe_layers.items():
-            all_members = layer_info.get("experts", []) + layer_info.get("shared_experts", [])
-            
-            if not all_members:
-                continue
-            
-            member_bits = [unified.get(m, 4) for m in all_members]
-            
-            if strategy == "max":
-                target_bit = max(member_bits)
-            elif strategy == "min":
-                target_bit = min(member_bits)
-            elif strategy == "avg":
-                target_bit = round(sum(member_bits) / len(member_bits))
-            else:
-                target_bit = max(member_bits)
-            
-            for m in all_members:
                 unified[m] = target_bit
         
         return unified

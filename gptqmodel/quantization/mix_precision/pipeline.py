@@ -69,8 +69,9 @@ def run_mix_precision_pipeline(
         device=device,
     )
 
+    fixed_bits = config.get("fixed_bits", {})
     expanded_allocation = expand_bit_allocation_to_modules(
-        bit_allocation, model, config
+        bit_allocation, model, config, fixed_bits
     )
 
     if quantize_config.dynamic is None:
