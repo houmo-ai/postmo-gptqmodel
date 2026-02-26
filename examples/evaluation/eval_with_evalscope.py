@@ -1,11 +1,13 @@
 import argparse
+import os
+import sys
 from typing import Any, Dict, List, Optional
 
 import torch
 from gptqmodel import BACKEND, GPTQModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from ..utils.infer_utils import parse_gpt_oss_output
+from gptqmodel.utils.infer_utils import parse_gpt_oss_output
 from evalscope.api.tool import ToolChoice, ToolInfo
 from evalscope.api.messages import ChatMessage
 from evalscope.api.registry import register_model_api
@@ -60,6 +62,20 @@ class EvalModel(ModelAPI):
                 add_generation_prompt=True,
                 enable_thinking=getattr(self.config, "enable_thinking", False),
             )
+        elif 'glm' in self.model_name.lower():
+            try:
+                prompt = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=getattr(self.config, "enable_thinking", False),
+                )
+            except TypeError:
+                prompt = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
         else:
             prompt = self.tokenizer.apply_chat_template(
                 messages,
@@ -83,7 +99,7 @@ class EvalModel(ModelAPI):
             temperature=getattr(self.config, "temperature", 0.0),
             pad_token_id=self.tokenizer.eos_token_id
         )
-        if hasattr(self.config, "enable_thinking"):
+        if ('qwen3' in self.model_name.lower()) and hasattr(self.config, "enable_thinking"):
             generation_kwargs["enable_thinking"] = getattr(self.config, "enable_thinking")
         generated_ids = self.model.generate(**generation_kwargs)[0]
         input_length = inputs["input_ids"].shape[1]
@@ -102,14 +118,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-path",
         type=str,
-        default="/data02/datasets/Qwen3-Coder-30B-A3B-Instruct/",
+        default="output/GLM-4.7-Flash-4bit-64g",
         help="模型路径",
     )
     parser.add_argument(
         "--model-loader",
         type=str,
         choices=["float", "quantized"],
-        default="float",
+        default="quantized",
         help="模型加载方式：float 表示 AutoModelForCausalLM，quantized 表示 GPTQModel.load",
     )
     parser.add_argument(
@@ -191,8 +207,8 @@ def get_evalscope_task_config() -> Dict[str, Any]:
         "temperature": 0.0,
         "do_sample": False,
         "reasoning_effort": "low",
-        "enable_thinking": True,
-        "datasets": ["humaneval"],
+        "enable_thinking": False,
+        "datasets": ["humaneval",'aime25','gpqa_diamond','gsm8k'],
         "dataset_args": {
             "cmmlu": {
                 "subset_list": [
@@ -204,7 +220,7 @@ def get_evalscope_task_config() -> Dict[str, Any]:
             }
         },
         "dataset_max_tokens": {
-            "humaneval": 8192,
+            # "humaneval": 8192,
         },
         "work_dir": "./outputs-evalscope",
         "timeout": 600,
@@ -234,17 +250,6 @@ def detect_model_family(model_path: str, model_family: str) -> str:
         return "glm"
     return "generic"
 
-
-def maybe_apply_glm_convert_for_float_model(model: Any, model_family: str) -> None:
-    """仅对 AutoModelForCausalLM 路径尝试 GLM 结构转换。"""
-    if model_family != "glm":
-        return
-    try:
-        from gptqmodel.models.definitions.glm4_moe_lite import convert_glm4_moe_lite_convert
-        convert_glm4_moe_lite_convert(model, model.config)
-        print("已应用 GLM convert_glm4_moe_lite_convert 适配")
-    except Exception as e:
-        print(f"GLM convert 适配未生效（可能不需要），继续评测。error: {e}")
 
 def load_model_and_tokenizer(args: argparse.Namespace, task_config: Dict[str, Any]):
     gpu_count = torch.cuda.device_count()
@@ -288,7 +293,6 @@ def load_model_and_tokenizer(args: argparse.Namespace, task_config: Dict[str, An
             load_kwargs["device_map"] = device
 
         model = AutoModelForCausalLM.from_pretrained(args.model_path, **load_kwargs)
-        maybe_apply_glm_convert_for_float_model(model, model_family)
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=args.use_fast_tokenizer)
 
     print(f"------- load model from {args.model_path} --------")
@@ -317,6 +321,14 @@ def build_generate_config(
         )
 
     if family == "qwen3":
+        return GenerateConfig(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            do_sample=do_sample,
+            enable_thinking=enable_thinking,
+        )
+
+    if family == "glm":
         return GenerateConfig(
             max_tokens=max_tokens,
             temperature=temperature,

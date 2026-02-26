@@ -193,3 +193,4 @@ diceq_tmp
 gptqmodel/quantization/diceq/DICEQuant
 .trae
 workdirs
+outputs-evalscope
