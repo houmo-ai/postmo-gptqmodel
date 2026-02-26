@@ -56,7 +56,7 @@ def main():
         diceq_search=args.diceq_search,
     )
 
-    # gpt-oss 需要 remote code（模型定义），这里务必开启
+
     model = GPTQModel.load(model_id, qcfg, trust_remote_code=True)
     
     # 根据显存调整 batch_size 以加速量化
