@@ -64,6 +64,7 @@ def parse_args():
     )
     parser.add_argument("--bits", type=int, default=4, choices=[2, 3, 4, 5, 8])
     parser.add_argument("--group-size", type=int, default=64)
+    parser.add_argument("--rotation", type=str, default=None, choices=["hadamard", "block_hadamard", "random"])
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--nsamples", type=int, default=8)
     parser.add_argument("--max-calib-length", type=int, default=1024)
@@ -105,6 +106,7 @@ def main():
         quantize_config = QuantizeConfig(
             bits=args.bits,
             group_size=args.group_size,
+            rotation=args.rotation,
             device=args.device,
             offload_to_disk=args.offload_to_disk,
             offload_to_disk_path=args.offload_path if args.offload_to_disk else None,

@@ -57,7 +57,7 @@ def _get_norm_scale(layernorm: torch.nn.Module) -> torch.Tensor:
     uses `(1 + weight) * x`.
     """
     weight = layernorm.weight.data.double()
-    if layernorm.__class__.__name__ == "Qwen3_5MoeRMSNorm":
+    if layernorm.__class__.__name__ in {"Qwen3_5MoeRMSNorm", "Qwen3_5RMSNorm"}:
         return 1.0 + weight
     return weight
 
@@ -66,7 +66,7 @@ def _reset_norm_for_fusion(layernorm: torch.nn.Module) -> None:
     """
     Reset a norm module to the identity transform after fusing into linear ops.
     """
-    if layernorm.__class__.__name__ == "Qwen3_5MoeRMSNorm":
+    if layernorm.__class__.__name__ in {"Qwen3_5MoeRMSNorm", "Qwen3_5RMSNorm"}:
         layernorm.weight.data.zero_()
         if hasattr(layernorm, "bias"):
             layernorm.bias.data.zero_()
@@ -240,6 +240,55 @@ def fuse_layer_norms_qwen3_5_moe(
                     _fuse_norm_into_linears(post_ln, [experts.gate_proj[i], experts.up_proj[i]])
 
         # Token-mixer input fusion (input norm)
+        attn_inputs = []
+        if hasattr(layer, "self_attn"):
+            attn_inputs.extend([layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj])
+        if hasattr(layer, "linear_attn"):
+            attn_inputs.extend(
+                [
+                    layer.linear_attn.in_proj_qkv,
+                    layer.linear_attn.in_proj_z,
+                    layer.linear_attn.in_proj_b,
+                    layer.linear_attn.in_proj_a,
+                ]
+            )
+        if attn_inputs:
+            _fuse_norm_into_linears(input_ln, attn_inputs)
+
+        _reset_norm_for_fusion(post_ln)
+        _reset_norm_for_fusion(input_ln)
+
+    pre_head_layernorm, _ = get_module_by_name_prefix(model, pre_lm_head_norm_module_name)
+    lm_head, _ = get_module_by_name_prefix(model, lm_head_name)
+    _fuse_norm_into_linears(pre_head_layernorm, [lm_head])
+    _reset_norm_for_fusion(pre_head_layernorm)
+
+    return model
+
+
+def fuse_layer_norms_qwen3_5(
+    model: PreTrainedModel,
+    pre_lm_head_norm_module_name: str,
+    layers_node: str,
+    lm_head_name: str,
+):
+    """
+    Qwen3.5 dense specific LN fusion.
+
+    Qwen3.5 RMSNorm uses `(1 + weight)` scaling, and decoder layers may be either
+    full-attention (`self_attn`) or linear-attention (`linear_attn`).
+    """
+    layers, _ = get_module_by_name_prefix(model, layers_node)
+
+    for layer in layers:
+        post_ln = layer.post_attention_layernorm
+        input_ln = layer.input_layernorm
+
+        _fuse_norm_into_linears(
+            post_ln,
+            [layer.mlp.gate_proj, layer.mlp.up_proj],
+        )
+
         attn_inputs = []
         if hasattr(layer, "self_attn"):
             attn_inputs.extend([layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj])
@@ -607,7 +656,43 @@ def rotate_attention_inputs_qwen3_5_moe(layer, Q, device) -> None:
         W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
 
 
+def rotate_attention_inputs_qwen3_5(layer, Q, device) -> None:
+    projections = []
+    if hasattr(layer, "self_attn"):
+        projections.extend([layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj])
+    if hasattr(layer, "linear_attn"):
+        projections.extend(
+            [
+                layer.linear_attn.in_proj_qkv,
+                layer.linear_attn.in_proj_z,
+                layer.linear_attn.in_proj_b,
+                layer.linear_attn.in_proj_a,
+            ]
+        )
+
+    for W in projections:
+        dtype = W.weight.dtype
+        W_ = W.weight.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+
 def rotate_attention_output_qwen3_5_moe(layer, Q, device) -> None:
+    if hasattr(layer, "self_attn"):
+        W = layer.self_attn.o_proj
+    elif hasattr(layer, "linear_attn"):
+        W = layer.linear_attn.out_proj
+    else:
+        return
+
+    dtype = W.weight.data.dtype
+    W_ = W.weight.data.to(device=device, dtype=torch.float64)
+    W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+    if W.bias is not None:
+        b = W.bias.data.to(device=device, dtype=torch.float64)
+        W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+
+def rotate_attention_output_qwen3_5(layer, Q, device) -> None:
     if hasattr(layer, "self_attn"):
         W = layer.self_attn.o_proj
     elif hasattr(layer, "linear_attn"):
@@ -654,6 +739,13 @@ def rotate_mlp_input_qwen3_5_moe(layer, Q, device) -> None:
         W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
 
 
+def rotate_mlp_input_qwen3_5(layer, Q, device) -> None:
+    for W in [layer.mlp.gate_proj, layer.mlp.up_proj]:
+        dtype = W.weight.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+
 def rotate_mlp_output_qwen3_5_moe(layer, Q, device) -> None:
     mlp = layer.mlp
     output_linears = []
@@ -678,6 +770,16 @@ def rotate_mlp_output_qwen3_5_moe(layer, Q, device) -> None:
         if W.bias is not None:
             b = W.bias.data.to(device=device, dtype=torch.float64)
             W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+
+def rotate_mlp_output_qwen3_5(layer, Q, device) -> None:
+    W = layer.mlp.down_proj
+    dtype = W.weight.data.dtype
+    W_ = W.weight.data.to(device=device, dtype=torch.float64)
+    W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+    if W.bias is not None:
+        b = W.bias.data.to(device=device, dtype=torch.float64)
+        W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
 
 
 @torch.inference_mode()
@@ -721,6 +823,46 @@ def rotate_model_qwen3_5_moe(
         # Qwen3.5-MoE already mixes full-attention and linear-attention blocks; we
         # keep block-rotation only and skip extra V/O hadamard projection rewrite
         # here to avoid additional backend dependency constraints.
+
+    return model, Q_block
+
+
+@torch.inference_mode()
+def rotate_model_qwen3_5(
+    model: PreTrainedModel,
+    rotate_mode: str,
+    device: torch.device,
+    lm_head_name: str,
+    layers_node: str,
+    Q=None,
+):
+    q_block_spec = Q
+    if isinstance(Q, dict):
+        q_block_spec = Q.get("Q_block", Q.get("Q"))
+
+    text_config = getattr(model.config, "text_config", model.config)
+    hidden_size = getattr(text_config, "hidden_size", None)
+    if hidden_size is None:
+        raise ValueError("Qwen3.5 rotation requires `hidden_size` in text config.")
+
+    Q_block = _resolve_rotation_matrix(q_block_spec, 0, "Q_block")
+    if Q_block is None:
+        Q_block = get_orthogonal_matrix(hidden_size, rotate_mode, device)
+
+    rotate_embeddings(model, Q_block, device)
+    rotate_head(model, Q_block, device, lm_head_name)
+    torch_empty_cache()
+
+    layers, _ = get_module_by_name_prefix(model, layers_node)
+    for idx, layer in enumerate(log.pb(layers).title("Rotating Qwen3.5")):
+        q_layer = _resolve_rotation_matrix(q_block_spec, idx, "Q_block")
+        if q_layer is None:
+            q_layer = Q_block
+
+        rotate_attention_inputs_qwen3_5(layer, q_layer, device)
+        rotate_attention_output_qwen3_5(layer, q_layer, device)
+        rotate_mlp_input_qwen3_5(layer, q_layer, device)
+        rotate_mlp_output_qwen3_5(layer, q_layer, device)
 
     return model, Q_block
 

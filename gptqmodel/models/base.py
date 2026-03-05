@@ -848,7 +848,8 @@ class BaseQModel(nn.Module):
             if self.model.config.tie_word_embeddings:
                 log.info("Rotation requires word embeddings to be untied. Untying.")
                 self.model.config.tie_word_embeddings = False
-                self.model.config.text_config.tie_word_embeddings = False
+                if hasattr(self.model.config, "text_config"):
+                    self.model.config.text_config.tie_word_embeddings = False
                 lm_head, _ = get_module_by_name_prefix(self.model, self.lm_head)
                 lm_head.weight = nn.Parameter(lm_head.weight.data.clone())
 

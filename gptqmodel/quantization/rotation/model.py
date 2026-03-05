@@ -4,6 +4,7 @@ from gptqmodel.models.definitions.llama import LlamaQModel
 from gptqmodel.models.definitions.qwen2 import Qwen2QModel
 from gptqmodel.models.definitions.qwen3_vl import Qwen3_VLQModel
 from gptqmodel.models.definitions.qwen2_5_vl import Qwen2_5_VLQModel
+from gptqmodel.models.definitions.qwen3_5 import Qwen3_5QModel
 from gptqmodel.models.definitions.qwen3_5_moe import Qwen3_5MoeQModel
 from gptqmodel.models.definitions.qwen3_moe import Qwen3MoeQModel
 from gptqmodel.models.definitions.glm4_moe_lite import Glm4MoeLiteQModel
@@ -29,6 +30,12 @@ MODEL_ROTATION_REGISTRY = [
         "vision": False,
         "fuse_norm": fuse_layer_norms_moe,
         "rotate_fn": rotate_model_moe,
+    },
+    {
+        "cls": Qwen3_5QModel,
+        "vision": False,
+        "fuse_norm": fuse_layer_norms_qwen3_5,
+        "rotate_fn": rotate_model_qwen3_5,
     },
     {
         "cls": Qwen3_5MoeQModel,
