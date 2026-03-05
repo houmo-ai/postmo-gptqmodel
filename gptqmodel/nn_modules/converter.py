@@ -3,6 +3,119 @@
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers.activations import ACT2FN
+
+
+def _resolve_dtype_from_config(config):
+    dtype = getattr(config, "dtype", None)
+    if isinstance(dtype, str):
+        dtype = getattr(torch, dtype, None)
+    if isinstance(dtype, torch.dtype):
+        return dtype
+
+    torch_dtype = getattr(config, "torch_dtype", None)
+    if isinstance(torch_dtype, str):
+        torch_dtype = getattr(torch, torch_dtype, None)
+    if isinstance(torch_dtype, torch.dtype):
+        return torch_dtype
+
+    return None
+
+
+class Qwen3_5MoeExpertsNew(nn.Module):
+    """Qwen3.5-MoE experts rewritten as per-expert Linear modules for GPTQ."""
+
+    def __init__(self, config, ori_experts=None):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.hidden_dim = config.hidden_size
+        self.intermediate_dim = config.moe_intermediate_size
+        self.act_fn = ACT2FN[config.hidden_act]
+
+        self.gate_proj = nn.ModuleList()
+        self.up_proj = nn.ModuleList()
+        self.down_proj = nn.ModuleList()
+
+        dtype = _resolve_dtype_from_config(config)
+        linear_kwargs = {"bias": False}
+        if ori_experts is not None:
+            # Quantization path: avoid redundant allocation before assigning sliced weights.
+            linear_kwargs["device"] = "meta"
+        if dtype is not None:
+            linear_kwargs["dtype"] = dtype
+
+        for _ in range(self.num_experts):
+            self.gate_proj.append(nn.Linear(self.hidden_dim, self.intermediate_dim, **linear_kwargs))
+            self.up_proj.append(nn.Linear(self.hidden_dim, self.intermediate_dim, **linear_kwargs))
+            self.down_proj.append(nn.Linear(self.intermediate_dim, self.hidden_dim, **linear_kwargs))
+
+        if ori_experts is not None:
+            self._load_from_original(ori_experts)
+
+    def _load_from_original(self, ori_experts) -> None:
+        with torch.no_grad():
+            for i in range(self.num_experts):
+                gate_up = ori_experts.gate_up_proj[i].detach()
+                down = ori_experts.down_proj[i].detach()
+
+                gate_weight = gate_up[: self.intermediate_dim, :]
+                up_weight = gate_up[self.intermediate_dim :, :]
+
+                self.gate_proj[i].weight = nn.Parameter(gate_weight)
+                self.up_proj[i].weight = nn.Parameter(up_weight)
+                self.down_proj[i].weight = nn.Parameter(down)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        top_k_index: torch.Tensor,
+        top_k_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+
+            current_hidden_states = self.act_fn(self.gate_proj[expert_idx](current_state))
+            current_hidden_states = current_hidden_states * self.up_proj[expert_idx](current_state)
+            current_hidden_states = self.down_proj[expert_idx](current_hidden_states)
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+        return final_hidden_states
+
+
+def convert_qwen3_5_moe_expert_converter(module, config):
+    import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as qwen3_5_moe_modeling
+
+    to_replace = []
+    for name, sub_module in module.named_modules():
+        if isinstance(sub_module, qwen3_5_moe_modeling.Qwen3_5MoeExperts):
+            to_replace.append((name, sub_module))
+
+    for name, sub_module in to_replace:
+        parent_name, _, child_name = name.rpartition(".")
+        parent = module.get_submodule(parent_name) if parent_name else module
+        new_module = Qwen3_5MoeExpertsNew(config=config, ori_experts=sub_module)
+        setattr(parent, child_name, new_module)
+
+    return module
+
 
 def convert_gpt_oss_expert_converter(module, config):
     import torch.nn as nn
@@ -107,4 +220,6 @@ def convert_llama4_expert_converter(module, config):
 MODULE_CONVERTER_MAP = {
     "llama4": convert_llama4_expert_converter,
     "gpt_oss": convert_gpt_oss_expert_converter,
+    "qwen3_5_moe": convert_qwen3_5_moe_expert_converter,
+    "qwen3_5_moe_text": convert_qwen3_5_moe_expert_converter,
 }

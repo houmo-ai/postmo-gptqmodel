@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from importlib.metadata import PackageNotFoundError, version
@@ -561,19 +562,63 @@ def ModelLoader(cls):
 
             modules = find_modules(model)
             ignore_modules = [cls.lm_head] + cls.get_base_modules(model)
+            quantized_module_names = None
+            skipped_missing_qweight = 0
+
+            # For partially-quantized checkpoints (common in MoE when some experts are not routed
+            # during calibration), keep unmatched modules in FP instead of force-replacing them
+            # with QuantLinear, which would otherwise drop `.weight` tensors at load time.
+            if model_save_name.endswith(".index.json"):
+                try:
+                    with open(model_save_name, "r", encoding="utf-8") as f:
+                        model_index = json.load(f)
+                    weight_map = model_index.get("weight_map", {})
+                    quantized_module_names = {
+                        key[: -len(".qweight")] for key in weight_map if key.endswith(".qweight")
+                    }
+                    if len(quantized_module_names) == 0:
+                        quantized_module_names = None
+                except Exception as e:
+                    log.warn(f"Loader: failed to parse checkpoint index `{model_save_name}`: {e}")
+            elif model_save_name.endswith(".safetensors"):
+                try:
+                    from safetensors import safe_open
+
+                    with safe_open(model_save_name, framework="pt", device="cpu") as f:
+                        quantized_module_names = {
+                            key[: -len(".qweight")] for key in f.keys() if key.endswith(".qweight")
+                        }
+                    if len(quantized_module_names) == 0:
+                        quantized_module_names = None
+                except Exception as e:
+                    log.warn(f"Loader: failed to inspect checkpoint tensor keys `{model_save_name}`: {e}")
 
             for name in list(modules.keys()):
                 # allow loading of quantized lm_head
                 if qcfg.lm_head and name == cls.lm_head:
                     continue
 
-                if not any(name.startswith(prefix) for prefix in cls.extract_layers_node()) or any(name.startswith(ignore_module) for ignore_module in ignore_modules) or all(
+                out_of_scope = (
+                    not any(name.startswith(prefix) for prefix in cls.extract_layers_node())
+                    or any(name.startswith(ignore_module) for ignore_module in ignore_modules)
+                    or all(
                         not name.endswith(ignore_module) for sublist in cls.simple_layer_modules(config, qcfg) for ignore_module in sublist
-                ):
+                    )
+                )
+                missing_qweight = quantized_module_names is not None and name not in quantized_module_names
+
+                if out_of_scope or missing_qweight:
                     # log non-lm-head quantized modules only
-                    if name is not cls.lm_head:
+                    if missing_qweight:
+                        skipped_missing_qweight += 1
+                    elif name is not cls.lm_head:
                         log.info(f"The layer {name} is not quantized.")
                     del modules[name]
+
+            if skipped_missing_qweight > 0:
+                log.info(
+                    f"Loader: {skipped_missing_qweight} modules have no `.qweight` in checkpoint and were left unquantized."
+                )
 
             preload_qlinear_kernel = make_quant(
                 model,
