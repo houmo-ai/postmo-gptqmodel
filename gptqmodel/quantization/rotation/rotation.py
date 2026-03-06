@@ -348,6 +348,11 @@ def bake_mean_into_linear(linear: torch.nn.Linear) -> None:
         linear.bias.data = linear.bias.data.to(linear_dtype)
 
 
+def fuse_deepstack_linear(model):
+    for layer in model.visual.deepstack_merger_list:
+        fuse_merger_linear(layer.norm, [layer.linear_fc1])
+
+
 def fuse_vision_layer_norms_qwen2_5_vl(model: PreTrainedModel, pre_lm_head_norm_module_name: str, layers_node: str, lm_head_name: str):
     model = model.eval()
     for layer in model.visual.blocks:
@@ -378,6 +383,7 @@ def fuse_vision_layer_norms_qwen3_vl(model: PreTrainedModel, pre_lm_head_norm_mo
         bake_mean_into_linear(layer.mlp.linear_fc2)
     fuse_merger_linear(model.visual.merger.norm, [
                     model.visual.merger.linear_fc1])
+    fuse_deepstack_linear(model)
     reset_ln(model.visual.merger.norm)
     return model
 
@@ -1047,7 +1053,17 @@ def rotate_vision_model_qwen3_vl(model: PreTrainedModel, rotate_mode: str, devic
         rotate_mlp_input_qwen3_vl(layer, Q, device)
         rotate_mlp_output_qwen3_vl(layer, Q, device)
     rotate_visual_merger_qwen3_vl(model, Q, device)
+    rotate_qwen3_vl_deepstack_merger(model, Q, device)
     return model, Q
+
+
+def rotate_qwen3_vl_deepstack_merger(model, Q: torch.Tensor, device) -> None:
+    for layer in model.visual.deepstack_merger_list:
+        dtype = layer.linear_fc1.weight.dtype
+        q_shape = Q.shape[0]
+        o_shape, i_shape = layer.linear_fc1.weight.shape
+        W_ = layer.linear_fc1.weight.to(device=device, dtype=torch.float64).reshape(o_shape, -1, q_shape)
+        layer.linear_fc1.weight.data = torch.matmul(W_, Q).to(device=device, dtype=dtype).reshape(o_shape, i_shape).contiguous()
 
 
 # ============================================================================
@@ -1716,3 +1732,4 @@ def rotate_model_deepseekv2_mla_moe(
             rotate_mlp_output(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
 
     return model, Q_block
+
