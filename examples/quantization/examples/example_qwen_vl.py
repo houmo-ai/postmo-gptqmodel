@@ -19,6 +19,7 @@ def get_args():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--with_random", action="store_true", default=False)
     parser.add_argument("--rotation", type=str, default=None, choices=['random', 'hadamard', 'block_hadamard'])
+    parser.add_argument("--vision_rotation", type=str, default=None, choices=['random', 'hadamard', 'block_hadamard'])
     parser.add_argument("--hessian_mse", action="store_true", default=False)
     # parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
     return parser.parse_args()
@@ -103,11 +104,11 @@ def main():
             print("image_path:", image_path, "output_text:", output_text)
             breakpoint()
     else:
-        quant_config = QuantizeConfig(bits=4, group_size=64, sym=True, damp_percent=0.01, mse=2.4, desc_act=False, rotation=args.rotation, rotation_vision=args.rotation, offload_to_disk=False, hessian_mse=args.hessian_mse)
+        quant_config = QuantizeConfig(bits=4, group_size=64, sym=True, damp_percent=0.01, mse=2.4, desc_act=False, rotation=args.rotation, rotation_vision=args.vision_rotation, offload_to_disk=False, hessian_mse=args.hessian_mse)
         # quant_config = QuantizeConfig(bits=4, group_size=64, sym=True, damp_percent=0.01, mse=2.4, desc_act=False)
         # model = GPTQModel.load(args.model_id, quant_config, dtype=torch.float16, attn_implementation="flash_attention_2")
         model = GPTQModel.load(args.model_id, quant_config)
-        breakpoint()
+        # breakpoint()
         if args.quarot_model_path:
             state_dict = load_safetensors_file(args.quarot_model_path)
             model.model.load_state_dict(state_dict)
