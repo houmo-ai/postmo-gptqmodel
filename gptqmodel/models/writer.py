@@ -33,7 +33,6 @@ from ..quantization.config import (
     META_FIELD_ACT_GROUP_AWARE,
     META_FIELD_DAMP_AUTO_INCREMENT,
     META_FIELD_DAMP_PERCENT,
-    META_FIELD_GPTAQ_ALPHA,
     META_FIELD_GPTAQ_ENABLED,
     META_FIELD_MSE,
     META_FIELD_QUANTIZER,
@@ -45,7 +44,7 @@ from ..quantization.config import (
     MIN_VERSION_WITH_V2,
 )
 from ..utils.backend import BACKEND
-from ..utils.hf import sanitize_generation_config_file
+from ..utils.hf import no_init_weights, sanitize_generation_config_file
 from ..utils.logger import setup_logger
 from ..utils.model import (
     copy_py_files,
@@ -59,7 +58,7 @@ from ..utils.model import (
 from ..utils.structure import alias_all_from_turtle_if_meta
 from ..utils.torch import torch_empty_cache
 from ..version import __version__
-from ._const import DEFAULT_MAX_SHARD_SIZE
+from ._const import DEFAULT_MAX_SHARD_SIZE, DEVICE
 
 
 log = setup_logger()
@@ -203,12 +202,14 @@ def ModelWriter(cls):
 
         self.quantize_config.meta_set(
             key=META_FIELD_GPTAQ_ENABLED,
-            value=self.quantize_config.gptaq
-        )
-
-        self.quantize_config.meta_set(
-            key=META_FIELD_GPTAQ_ALPHA,
-            value=self.quantize_config.gptaq_alpha
+            value=None if self.quantize_config.gptaq is None else {
+                "alpha": self.quantize_config.gptaq.alpha,
+                "device": (
+                    self.quantize_config.gptaq.device
+                    if isinstance(self.quantize_config.gptaq.device, str)
+                    else str(self.quantize_config.gptaq.device)
+                ),
+            }
         )
 
         self.quantize_config.meta_set(
@@ -501,16 +502,22 @@ def ModelWriter(cls):
         if self.tokenizer:
             self.tokenizer.save_pretrained(save_dir)
 
-            # fixed this issue: https://github.com/huggingface/transformers/issues/35832
-            saved_tokenizer_config = get_tokenizer_config(save_dir)
-            config_tokenizer_class = saved_tokenizer_config.get("tokenizer_class")
-            # if the tokenizer is fast, but the tokenizer_config.json does not have Fast suffix, add "Fast" suffix
-            if (not config_tokenizer_class.endswith("Fast")) and (
-                isinstance(self.tokenizer.tokenizer, PreTrainedTokenizerFast)
-                ):
-                saved_tokenizer_config["tokenizer_class"] = saved_tokenizer_config["tokenizer_class"] + "Fast"
-                with open(os.path.join(save_dir, "tokenizer_config.json"), "w", encoding="utf-8") as f:
-                    json.dump(saved_tokenizer_config, f, indent=2, ensure_ascii=False)
+            # Use source model's tokenizer_class for cross-version compatibility
+            # (transformers 5.0 save_pretrained writes "TokenizersBackend" which older versions can't load)
+            source_tokenizer_config = get_tokenizer_config(self.model_local_path)
+            source_tokenizer_class = source_tokenizer_config.get("tokenizer_class")
+
+            if source_tokenizer_class:
+                # fix https://github.com/huggingface/transformers/issues/35832
+                # if source tokenizer_class lacks "Fast" suffix but tokenizer is actually fast, add it
+                if (not source_tokenizer_class.endswith("Fast")) and isinstance(self.tokenizer.tokenizer, PreTrainedTokenizerFast):
+                    source_tokenizer_class = source_tokenizer_class + "Fast"
+
+                saved_tokenizer_config = get_tokenizer_config(save_dir)
+                if saved_tokenizer_config.get("tokenizer_class") != source_tokenizer_class:
+                    saved_tokenizer_config["tokenizer_class"] = source_tokenizer_class
+                    with open(os.path.join(save_dir, "tokenizer_config.json"), "w", encoding="utf-8") as f:
+                        json.dump(saved_tokenizer_config, f, indent=2, ensure_ascii=False)
 
 
     cls.save_quantized = save_quantized
@@ -559,6 +566,7 @@ def ModelWriter(cls):
                 backend=BACKEND.AUTO,
                 lm_head_name=cls.lm_head,
                 pack=True,
+                device=DEVICE.CPU,
             )
 
         load_checkpoint_in_model_then_tie_weights(

@@ -105,7 +105,6 @@ def random_hadamard_matrix(size, device):
     Q = torch.diag(Q)
     return matmul_hadU(Q).to(device)
 
-
 def random_block_hadamard_matrix(size, device, block_size: int = 64):
     """
     Generate a block-diagonal random Hadamard matrix.

@@ -11,7 +11,13 @@ from .utils.nogil_patcher import patch_safetensors_save_file, patch_triton_autot
 # isort: on
 
 patch_safetensors_save_file()
-patch_triton_autotuner()
+
+# TODO: waiting for official fix from triton
+#  monkeypatching triton threading issues is fragile
+try:
+    patch_triton_autotuner()
+except Exception:
+    pass
 
 from .utils.env import env_flag
 from .utils.logger import setup_logger
@@ -36,7 +42,7 @@ DEVICE_THREAD_POOL = DeviceThreadPool(
         "cuda:per": 4,
         "xpu:per": 1,
         "mps": 8,
-        "cpu": min(12, max(1, (os.cpu_count() or 1) // 2)),
+        "cpu": min(12, max(1, (os.cpu_count() or 1) + 1 // 2)), # count + 1, fixed pool size > 1 check when count=3
         "model_loader:cpu": 2,
     },
     empty_cache_every_n=512,
@@ -44,7 +50,7 @@ DEVICE_THREAD_POOL = DeviceThreadPool(
 
 from .models import GPTQModel, get_best_device
 from .models.auto import ASCII_LOGO
-from .quantization import BaseQuantizeConfig, QuantizeConfig
+from .quantization import BaseQuantizeConfig, GPTAQConfig, QuantizeConfig
 from .utils import BACKEND
 from .utils.exllama import exllama_set_max_input_length
 from .version import __version__

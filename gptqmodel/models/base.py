@@ -45,7 +45,7 @@ from ..nn_modules.qlinear import BaseQuantLinear
 from ..nn_modules.qlinear.lookahead import configure_default_lookahead
 from ..nn_modules.qlinear.torch import TorchQuantLinear
 from ..quantization import QuantizeConfig
-from ..quantization.config import FORMAT, METHOD, QUANTIZE_BLACK_LIST, VRAMStrategy, dynamic_get
+from ..quantization.config import FORMAT, METHOD, QUANTIZE_BLACK_LIST, GcMode, VramStrategy, dynamic_get
 from ..quantization.rotation.rotation import fuse_layer_norms, rotate_model, rotate_model_qwen3_vl, rotate_vision_model
 from ..utils.backend import BACKEND
 from ..utils.calibration import prepare_calibration_dataset
@@ -54,7 +54,6 @@ from ..utils.hf import autofix_hf_model_config
 from ..utils.importer import select_quant_linear
 from ..utils.logger import QuantizationRegionTimer, setup_logger
 from ..utils.model import MODALITY, find_modules, get_module_by_name_prefix, move_to
-from ..utils.offload import offload_to_disk
 from ..utils.structure import alias_from_turtle_for_submodule
 from ..utils.torch import TORCH_HAS_COMPILE, torch_compile
 from ._const import (
@@ -274,6 +273,7 @@ def demo_qwen3_moe_cpu(model, tokenizer):
 
 NOT_QUANTIZE_FLAG = ":!"
 CAPTURE_ONLY_FLAG = ":?"
+MOE_FLAG = ":moe"
 NON_QUANTIZE_FLAGS = (NOT_QUANTIZE_FLAG, CAPTURE_ONLY_FLAG)
 
 
@@ -304,8 +304,10 @@ class BaseQModel(nn.Module):
 
     # some models require trust_remove_code = True (dbrx_converted)
     require_trust_remote_code = None
-    # some models require transformer version(internalm require '<=4.42.2')
-    require_pkgs_version: Optional[List[str]] = None
+
+    # some models require extra python packages and/or specific version of pkgs such as transformer version(internalm require '<=4.42.2')
+    require_pkgs: Optional[List[str]] = None
+
     # some models require a specific dtype, such as float16
     require_dtype: Optional[str|torch.dtype] = None
     require_fast_init: bool = True
@@ -322,11 +324,15 @@ class BaseQModel(nn.Module):
     # some models require a different model loader, such as mllama which uses AutoModelForPreTraining
     loader = AutoModelForCausalLM
 
+    # Some models have multiple configurations.
+    # For example, in llama4 and qwen3_5, model_class.form_config requires TextConfig.
+    config_class = None
+
     # monkey patch api for trust_remote_code=True models that have broken transformer compat
     require_monkeypatch = False
 
     # VRAM strategy support list
-    supported_vram_strategies: List[VRAMStrategy] = [VRAMStrategy.EXCLUSIVE, VRAMStrategy.BALANCED]
+    supported_vram_strategies: List[VramStrategy] = [VramStrategy.EXCLUSIVE, VramStrategy.BALANCED]
 
     # some models have broken attention mask codes so we need to only use batch 1 with no masks
     support_batch_quantize = True
@@ -362,7 +368,7 @@ class BaseQModel(nn.Module):
         self,
         model: PreTrainedModel,
         quantized: bool,
-        quantize_config: QuantizeConfig,
+        quantize_config: Optional[QuantizeConfig],
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
         qlinear_kernel: nn.Module = None,
         load_quantized_model: bool = False,
@@ -374,15 +380,16 @@ class BaseQModel(nn.Module):
     ):
         super().__init__()
 
-        quant_method = quantize_config.quant_method
-        # override module_tree if need
-        if self.module_tree_overrides is not None and self.module_tree_overrides.get(quant_method) is not None:
-            log.info(f'Module Tree: overridden by METHOD.{quant_method.upper()}')
-            # setting cls.module_tree
-            type(self).module_tree = apply_module_tree_override(self.module_tree, self.module_tree_overrides[quant_method])
+        if quantize_config:
+            quant_method = quantize_config.quant_method
+            # override module_tree if need
+            if self.module_tree_overrides is not None and self.module_tree_overrides.get(quant_method) is not None:
+                log.info(f'Module Tree: overridden by METHOD.{quant_method.upper()}')
+                # setting cls.module_tree
+                type(self).module_tree = apply_module_tree_override(self.module_tree, self.module_tree_overrides[quant_method])
 
-        if type(self).module_tree is None:
-            type(self).module_tree = self._auto_detect_module_tree(model, quant_method)
+            if type(self).module_tree is None:
+                type(self).module_tree = self._auto_detect_module_tree(model, quant_method)
 
         # If module_tree is still None after auto-detection, raise an error indicating unsupported model type
         if type(self).module_tree is None:
@@ -439,7 +446,7 @@ class BaseQModel(nn.Module):
         from ..adapter.adapter import Lora
 
         # check adapter load and print info so users knows lora(s) are applied
-        if isinstance(self.quantize_config.adapter, Lora):
+        if quantize_config and isinstance(self.quantize_config.adapter, Lora):
             loaded_loras = 0
             qmodules = find_modules(self.model, layers=[BaseQuantLinear])
             for name, m in qmodules.items():
@@ -472,6 +479,154 @@ class BaseQModel(nn.Module):
                 break  # stop if unexpected nested structure
 
         return [".".join(prefix_parts)] if prefix_parts else []
+
+    @classmethod
+    def _parse_module_flags(cls, module_spec: str) -> tuple[str, List[str]]:
+        """
+        Parse a module specification into module name and flags.
+        Example: "gate:moe:!" -> ("gate", ["moe", "!"])
+        """
+        parts = module_spec.split(":") if isinstance(module_spec, str) else []
+        name = parts[0] if parts else module_spec
+        flags = [p for p in parts[1:] if p]
+        return name, flags
+
+    @classmethod
+    def has_moe_flag(cls, module_spec: str) -> bool:
+        """
+        Check if a module specification has the :moe flag.
+        """
+        if not isinstance(module_spec, str):
+            return False
+        _, flags = cls._parse_module_flags(module_spec)
+        return MOE_FLAG.lstrip(":") in flags
+
+    @classmethod
+    def _collect_moe_modules_from_tree(cls, tree_node, parent_path="", parent_is_moe=False) -> Set[str]:
+        """
+        Recursively collect all module paths that have the :moe flag.
+        Returns a set of full module paths (e.g., "mlp", "mlp.experts", "mlp.shared_experts").
+        """
+        moe_modules = set()
+
+        if isinstance(tree_node, dict):
+            for key, value in tree_node.items():
+                # Skip the layer index placeholder
+                if key == "#":
+                    # Recursively process the value if it's a dict
+                    if isinstance(value, dict):
+                        moe_modules.update(cls._collect_moe_modules_from_tree(value, parent_path, parent_is_moe))
+                    continue
+
+                # Build full path
+                module_name, _ = cls._parse_module_flags(key) if isinstance(key, str) else (key, [])
+                if parent_path:
+                    full_path = f"{parent_path}.{module_name}"
+                else:
+                    full_path = module_name
+
+                # Check if this key has :moe flag
+                is_moe = cls.has_moe_flag(key) if isinstance(key, str) else False
+                if is_moe or parent_is_moe:
+                    moe_modules.add(full_path)
+
+                # Recursively process nested structures
+                if isinstance(value, (dict, tuple, list)):
+                    moe_modules.update(
+                        cls._collect_moe_modules_from_tree(value, full_path, parent_is_moe or is_moe)
+                    )
+
+        elif isinstance(tree_node, (tuple, list)):
+            for item in tree_node:
+                if isinstance(item, str) and cls.has_moe_flag(item):
+                    module_name, _ = cls._parse_module_flags(item)
+                    if parent_path:
+                        moe_modules.add(f"{parent_path}.{module_name}")
+                    else:
+                        moe_modules.add(module_name)
+                elif isinstance(item, dict):
+                    moe_modules.update(cls._collect_moe_modules_from_tree(item, parent_path, parent_is_moe))
+
+        return moe_modules
+
+    @classmethod
+    def get_moe_modules(cls) -> Set[str]:
+        """
+        Get all MoE module paths from the model's module_tree.
+        Returns a set of module paths that have the :moe flag.
+
+        Example: {"mlp", "mlp.experts", "mlp.shared_experts", "mlp.gate"}
+        """
+        if cls.module_tree is None:
+            return set()
+
+        return cls._collect_moe_modules_from_tree(cls.module_tree)
+
+    @classmethod
+    def is_moe_module(cls, module_path: str) -> bool:
+        """
+        Check if a given module path is an MoE module based on :moe flags.
+
+        Args:
+            module_path: Full module path like "model.layers.0.mlp.experts.5.gate_proj"
+
+        Returns:
+            True if any parent in the path is marked with :moe flag
+        """
+        moe_modules = cls.get_moe_modules()
+
+        # Check if any MoE module is a prefix of this path
+        for moe_module in moe_modules:
+            # Handle layer index in path (e.g., "model.layers.0.mlp" should match "mlp")
+            if f".{moe_module}" in module_path or module_path.endswith(moe_module):
+                return True
+            # Also check for patterns like "mlp.experts.5" matching "mlp.experts"
+            path_parts = module_path.split(".")
+            for i in range(len(path_parts)):
+                partial_path = ".".join(path_parts[i:])
+                if partial_path.startswith(moe_module + ".") or partial_path == moe_module:
+                    return True
+
+        return False
+
+    @classmethod
+    def get_moe_module_name(cls) -> Optional[str]:
+        """
+        Get the name of the MoE module from module_tree.
+
+        Each layer can have only ONE MoE module marked with :moe flag.
+        For example:
+        - GLM-4: "mlp:moe" -> returns "mlp"
+        - MiniMax-M2: "block_sparse_moe:moe" -> returns "block_sparse_moe"
+
+        Returns:
+            The name of the MoE module (without flags), or None if no MoE module is defined
+        """
+        if cls.module_tree is None:
+            return None
+
+        # Find the dict that represents layer structure (after "#")
+        layer_structure = None
+        found_hash = False
+        for item in cls.module_tree:
+            if item == "#":
+                found_hash = True
+                continue
+            if found_hash and isinstance(item, dict):
+                layer_structure = item
+                break
+
+        if layer_structure is None:
+            return None
+
+        # Look for a key with :moe flag at the top level of layer structure
+        for key in layer_structure.keys():
+            if cls.has_moe_flag(key):
+                # Extract module name without flags
+                module_name, _ = cls._parse_module_flags(key)
+                return module_name
+
+        return None
 
     @classmethod
     def build_moe_modules_if_need(cls, model_config, layer_modules, is_awq_quantize: bool = False):
@@ -507,6 +662,7 @@ class BaseQModel(nn.Module):
                             moe_simple[-1].append(n)
                     # Currently, only need to add `capture_only_modules` to `['mlp.experts.#.gate_proj', 'mlp.experts.#.up_proj']`
                     # or ['mlp.shared_expert.gate_proj', 'mlp.shared_expert.up_proj', 'mlp.experts.#.gate_proj', 'mlp.experts.#.up_proj']
+                    # or ['mlp.shared_experts.gate_proj', 'mlp.shared_experts.up_proj', 'mlp.experts.#.gate_proj', 'mlp.experts.#.up_proj']
                     add_capture_only_module = len(names) == (4 if any("shared_expert" in n for n in names) else 2)
                     if add_capture_only_module and capture_only_modules:
                         # Extend all elements in capture_only_modules
@@ -671,6 +827,9 @@ class BaseQModel(nn.Module):
         calibration_data_min_length: int = 10,
         calibration_concat_separator: Optional[str] = None,
     ) -> Dict[str, List[Dict[str, str]]]:
+        if self.quantize_config is None or not isinstance(self.quantize_config, QuantizeConfig):
+            raise AttributeError("`quantize_config` must be not None")
+
         if self.quantized:
             raise EnvironmentError("quantize() is called a model that is already quantized")
 
@@ -696,14 +855,10 @@ class BaseQModel(nn.Module):
             )
 
         if self.quantize_config.quant_method == METHOD.AWQ:
-            if self.quantize_config.format == FORMAT.GEMV_FAST:
-                # AWQ GEMV_FAST only supports pack_dtype is torch.int16
+            if self.quantize_config.format in [FORMAT.GEMV_FAST, FORMAT.LLM_AWQ]:
+                # AWQ GEMV_FAST / LLM_AWQ only supports pack_dtype is torch.int16
                 log.info("Quantize Model: Auto fix `pack_dtype` to `torch.int16`")
                 self.quantize_config.pack_dtype = torch.int16
-            elif self.quantize_config.format == FORMAT.MARLIN:
-                # AWQ MARLIN only supports zero_point is false
-                log.info("Quantize Model: Auto fix `zero_point` to `False`")
-                self.quantize_config.zero_point = False
 
         if self.support_batch_quantize is False:
             batch_size = 1
@@ -715,7 +870,19 @@ class BaseQModel(nn.Module):
 
         preferred_backend = requested_backend
         if preferred_backend in (None, BACKEND.AUTO):
-            preferred_backend = BACKEND.TORCH
+            if self.quantize_config.quant_method == METHOD.AWQ:
+                if self.quantize_config.format == FORMAT.GEMM:
+                    preferred_backend = BACKEND.TORCH_AWQ
+                elif self.quantize_config.format == FORMAT.GEMV:
+                    preferred_backend = BACKEND.GEMV
+                elif self.quantize_config.format in [FORMAT.GEMV_FAST, FORMAT.LLM_AWQ]:
+                    preferred_backend = BACKEND.GEMV_FAST
+                else:
+                    raise ValueError(f"Unsupported FORMAT: `{self.quantize_config.format}` with `METHOD.AWQ`")
+            elif self.quantize_config.quant_method == METHOD.QQQ:
+                preferred_backend = BACKEND.QQQ
+            else:
+                preferred_backend = BACKEND.TORCH
 
         # Validate quant linear before quantization starts
         _ = select_quant_linear(
@@ -730,6 +897,7 @@ class BaseQModel(nn.Module):
             device=DEVICE(self.quantize_config.device),
             pack=True,
             pack_dtype=self.quantize_config.pack_dtype,
+
         )
 
         # Use the provided tokenizer if one is passed to quantize()
@@ -825,7 +993,7 @@ class BaseQModel(nn.Module):
         #     if not isinstance(self, Qwen3_VLQModel) and not isinstance(self, Qwen2_5_VLQModel):
         #         self.model, _ = rotate_model(model=self.model, rotate_mode=self.quantize_config.rotation,
         #                                         device=rotation_device, **module_name_args)
-        #     else:   
+        #     else:
         #         self.model, _ = rotate_model_qwen3_vl(model=self.model, rotate_mode=self.quantize_config.rotation,
         #                                         device=rotation_device, **module_name_args)
         # Auto-enable rotation when DiceQ is enabled
@@ -927,7 +1095,7 @@ class BaseQModel(nn.Module):
                 GPTQProcessor(**args),
             ]
 
-        if self.quantize_config.gptaq is True:
+        if self.quantize_config.gptaq is not None:
             from ..looper.native_processor import NativeProcessor
 
             # During the deepcopy process, self.prepare_dataset will be deeply copied along with self. However,
@@ -958,10 +1126,19 @@ class BaseQModel(nn.Module):
         # prepare processor worker (looper)
         module_looper = ModuleLooper(self, processors=processors)
 
-        result = module_looper.loop(
-            backend=backend,
-            fail_safe=self.quantize_config.fail_safe,
+        # When gc_mode=ON_STAGE_END, disable auto-gc for the whole quantization process
+        # to prevent interference with manual cleanups performed at stage ends
+        gc_context = (
+            DEVICE_THREAD_POOL.no_auto_gc()
+            if self.quantize_config.gc_mode == GcMode.ON_STAGE_END
+            else nullcontext()
         )
+
+        with gc_context:
+            result = module_looper.loop(
+                backend=backend,
+                failsafe=self.quantize_config.failsafe,
+            )
 
         timer = getattr(self, "quant_region_timer", None)
         if timer is not None:
@@ -1218,7 +1395,9 @@ class BaseQModel(nn.Module):
 
     def pre_quantize_generate_hook_end(self):
         if self.quantize_config.offload_to_disk:
-            offload_to_disk(model=self.model, module=self.get_base_modules(model=self.model), disk_path=self.quantize_config.offload_to_disk_path)
+            # This hook is now disabled as it's handled by the ModuleLooper after input capture.
+            # offload_to_disk(model=self.model, module=self.get_base_modules(model=self.model), disk_path=self.quantize_config.offload_to_disk_path)
+            pass
 
     def lm_head_pre_quantize_generate_hook(self, inputs: List[List[torch.tensor]]) -> List[List[torch.tensor]]:
         if self.pre_lm_head_norm_module:
@@ -1459,7 +1638,7 @@ class BaseQModel(nn.Module):
         if not getattr(self.quantize_config, "offload_to_disk", False):
             return 0
 
-        default_bytes = 512 * 1024 ** 3 #512MB
+        default_bytes = 512 * 1024 ** 2 #512MB
         raw = os.getenv("GPTQMODEL_RELOAD_THRESHOLD")
         if raw is None or raw.strip() == "":
             return default_bytes

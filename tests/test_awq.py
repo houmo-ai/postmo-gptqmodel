@@ -12,6 +12,7 @@ import unittest
 
 import torch
 from datasets import load_dataset
+from models.model_test import ModelTest
 from parameterized import parameterized
 from transformers import AutoTokenizer
 
@@ -21,6 +22,7 @@ from gptqmodel.nn_modules.qlinear.gemv_fast_awq import AwqGEMVFastQuantLinear
 from gptqmodel.nn_modules.qlinear.machete_awq import AwqMacheteQuantLinear
 from gptqmodel.nn_modules.qlinear.marlin_awq import AwqMarlinQuantLinear
 from gptqmodel.quantization import FORMAT, METHOD, QUANT_CONFIG_FILENAME
+from gptqmodel.utils.eval import EVAL
 from gptqmodel.utils.machete import _validate_machete_device_support, machete_import_exception
 
 
@@ -34,7 +36,7 @@ from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
 log = LogBar.shared()
 
 
-class TestGroupSize(unittest.TestCase):
+class TestAwq(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
@@ -76,6 +78,7 @@ class TestGroupSize(unittest.TestCase):
             (FORMAT.GEMM, 128),
             (FORMAT.GEMV, 128),
             (FORMAT.GEMV_FAST, 128),
+            (FORMAT.LLM_AWQ, 128),
         }
 
         for checkpoint_format, group_size in quantize_targets:
@@ -99,6 +102,8 @@ class TestGroupSize(unittest.TestCase):
             with open(tmp_dir_name + "/" + QUANT_CONFIG_FILENAME, "r") as f:
                 file_dict = json.loads(f.read())
                 assert model.quantize_config.to_dict() == file_dict
+                # Exclude `offload_to_disk_path`, which is a random value.
+                file_dict["meta"].pop("offload_to_disk_path")
                 logging.info(f"Saved config file: {file_dict}")
 
             cls.quantized_tempdirs[(checkpoint_format, group_size)] = tmp_dir
@@ -114,22 +119,13 @@ class TestGroupSize(unittest.TestCase):
             tmp_dir.cleanup()
         # torch_empty_cache()
 
-    # def test_load_group_128(self):
-    #     model = GPTQModel.load(
-    #         "/monster/data/model/AWQ-Llama-3-8b-g128",
-    #     )
-    #
-    #     self.assert_awq_linear(model)
-    #
-    #     result = model.generate("Uncovering deep insights begins with")[0] # tokens
-    #     log.info(f"Output: {model.tokenizer.decode(result)}") # string output
-
     @parameterized.expand([
         (FORMAT.GEMM, BACKEND.GEMM, 128),
         #(FORMAT.GEMM, BACKEND.MACHETE, 128),
         (FORMAT.GEMM, BACKEND.MARLIN, 128),
         (FORMAT.GEMV, BACKEND.GEMV, 128),
         (FORMAT.GEMV_FAST, BACKEND.GEMV_FAST, 128),
+        (FORMAT.LLM_AWQ, BACKEND.GEMV_FAST, 128),
     ])
     def test_quant_and_inference(self, checkpoint_format, backend, group_size: int):
         if backend == BACKEND.MACHETE:
@@ -145,9 +141,13 @@ class TestGroupSize(unittest.TestCase):
         model = GPTQModel.load(
             model_path,
             backend=backend,
+            device="cuda",
         )
 
-        self.assertEqual(model.quantize_config.to_dict(), expected_config)
+        # Exclude `offload_to_disk_path`, which is a random value.
+        actual_quantize_config = model.quantize_config.to_dict()
+        actual_quantize_config["meta"].pop("offload_to_disk_path")
+        self.assertEqual(actual_quantize_config, expected_config)
 
         self.assert_awq_linear(model, backend)
 
@@ -187,6 +187,7 @@ class TestInferenceOnly(unittest.TestCase):
         model = GPTQModel.load(
             "TheBloke/Mistral-7B-v0.1-AWQ",
             backend=BACKEND.GEMM,
+            device="cuda"
         )
 
         tokens = model.generate("Capital of France is", max_new_tokens=64)[0]
@@ -196,3 +197,60 @@ class TestInferenceOnly(unittest.TestCase):
 
         del model
 
+    def test_inference_quantized_by_llm_awq(self):
+        model = GPTQModel.load(
+            "ModelCloud/opt-125m-llm-awq",  # this quantized by llm-awq
+            backend=BACKEND.AUTO,
+            device="cuda"
+        )
+
+        tokens = model.generate("Capital of France is",
+                                max_new_tokens=512)[0]
+        result = model.tokenizer.decode(tokens)
+        print("result", result)
+        if "paris" not in result.lower() and "city" not in result.lower() and "food" not in result.lower() and "market" not in result.lower() and "country" not in result.lower():
+            raise AssertionError(" `paris` not found in `result`")
+
+        del model
+
+
+class TestQwen3_8B_Base_awq(ModelTest):
+    NATIVE_MODEL_ID = "/monster/data/model/Qwen3-8B-Base" # "Qwen/Qwen3-8B-Base"
+    # DATASET_CONCAT_SIZE = 2048 # new
+    # STOP_AFTER_LAYER = 0
+    EVAL_TASKS = {
+        EVAL.LM_EVAL.GSM8K_PLATINUM_COT: {
+            "chat_template": True,
+            "exact_match,flexible-extract": {
+                "value": 0.2994,
+                "floor_pct": 0.04,
+            },
+        },
+        EVAL.LM_EVAL.ARC_CHALLENGE: {
+            "chat_template": True,
+            "acc": {
+                "value": 0.3166,
+                "floor_pct": 0.04,
+            },
+            "acc_norm": {
+                "value": 0.3464,
+                "floor_pct": 0.04,
+            },
+        },
+        EVAL.LM_EVAL.MMLU_STEM: {
+            "chat_template": False,
+            "acc": {
+                "value": 0.3692,
+                "floor_pct": 0.04,
+            },
+        },
+    }
+    FORMAT = FORMAT.GEMM
+    METHOD = METHOD.AWQ
+    QUANT_BATCH_SIZE = 1
+    EVAL_BATCH_SIZE = 64
+    SAVE_PATH = "QWEN3-8B-AWQ"
+    # DATASET_SIZE = 1
+
+    def test_qwen3_8b_base_awq(self):
+        self.quant_lm_eval()

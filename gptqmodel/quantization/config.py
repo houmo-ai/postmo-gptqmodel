@@ -5,7 +5,7 @@
 
 import json
 import os.path
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from os.path import join
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -13,10 +13,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import pcre as re
 import torch
 from packaging import version
-from random_word import random_word
 
 from ..adapter.adapter import Lora, normalize_adapter
 from ..utils.logger import setup_logger
+from ..utils.random_str import get_random_string
 
 
 log = setup_logger()
@@ -24,12 +24,16 @@ log = setup_logger()
 BITS_FIELD_CODE = "bits"
 GROUP_SIZE_FIELD_CODE = "group_size"
 FORMAT_FIELD_CODE = "format"
+SYMMETRIC_FIELD_CODE = "sym"
 FORMAT_FIELD_CHECKPOINT = "checkpoint_format"
 FORMAT_FIELD_COMPAT_MARLIN = "is_marlin_format"
 QUANT_METHOD_FIELD = "quant_method"
 PACK_DTYPE_FIELD = "pack_dtype"
 QUANT_CONFIG_FILENAME = "quantize_config.json"
 QUANT_CONFIG_FILENAME_COMPAT = [QUANT_CONFIG_FILENAME, "quant_config.json", "config.json"]
+# This is AwqBackendPackingMethod, not GPTQModel.BACKEND.
+# It's used to distinguish between quantization by llm-awq and autoawq; llm-awq actually uses GEMV_FAST for packing.
+AWQ_PACKING_BACKEND_FIELD = "backend"
 
 MIN_VERSION_WITH_V2 = "0.9.0"
 
@@ -53,8 +57,6 @@ META_FIELD_HESSIAN_MSE = "hessian_mse"
 META_FIELD_ACT_GROUP_AWARE = "act_group_aware"
 
 META_FIELD_GPTAQ_ENABLED = "gptaq"
-META_FIELD_GPTAQ_ALPHA = "gptaq_alpha"
-META_FIELD_GPTAQ_MEMORY_DEVICE = "gptaq_memory_device"
 
 ADAPTER_FIELD = "adapter"
 
@@ -70,6 +72,7 @@ class FORMAT(str, Enum):
     GEMM = "gemm"
     GEMV = "gemv"
     GEMV_FAST = "gemv_fast"
+    LLM_AWQ = "llm-awq"
 
 
 # quant methods
@@ -79,9 +82,374 @@ class METHOD(str, Enum):
     AWQ = "awq"
 
 
-class VRAMStrategy(str, Enum):
+class VramStrategy(str, Enum):
     EXCLUSIVE = "exclusive"
     BALANCED = "balanced"
+
+
+class FailSafeStrategy(str, Enum):
+    """
+    +-----------+----------------------+---------------------------+------------------------------+
+    | strategy  | center               | scale                     | strengths / weaknesses       |
+    +-----------+----------------------+---------------------------+------------------------------+
+    | rtn       | min/max (quantizer)  | min/max (quantizer)        | simple, but outlier-driven   |
+    | midpoint  | (min+max)/2          | (max-min)                  | symmetric, outlier-sensitive |
+    | mean      | mean(w)              | 2*max(|w-mean|)            | stable for symmetric data    |
+    | median    | median(w)            | 2*max(|w-median|)          | robust center vs outliers    |
+    | stdclip   | mean(w)              | 2*sigma*std                | tames tails, may clip signal |
+    +-----------+----------------------+---------------------------+------------------------------+
+    """
+    RTN = "rtn" # round to nearest
+    MIDPOINT = "midpoint"
+    MEAN = "mean"
+    MEDIAN = "median"
+    STDCLIP = "stdclip"
+
+@dataclass
+class SmoothMethod:
+    name: str
+    # Apply the smoother only when group size >= this threshold.
+    group_size_threshold: int = 128
+
+
+@dataclass
+class SmoothPercentile(SmoothMethod):
+    """
+    +----------------+-------------------------------------------+
+    | math           | clip(|w|) at p-th percentile             |
+    | config         | SmoothPercentile(percentile=p)           |
+    +----------------+-------------------------------------------+
+    +----------------+-------------------------------------------+
+    | percentile (p) | percentile of |w| used as clip threshold |
+    | effect         | higher p = less clipping                  |
+    +----------------+-------------------------------------------+
+    """
+    percentile: float = 99.0
+
+    def __init__(self, percentile: float = 99.0, group_size_threshold: int = 128):
+        super().__init__(name="percentile", group_size_threshold=group_size_threshold)
+        self.percentile = percentile
+
+
+@dataclass
+class SmoothPercentileAsymmetric(SmoothMethod):
+    """
+    +-------------------+-------------------------------------------+
+    | math              | clip to [p_low, p_high] percentiles      |
+    | config            | SmoothPercentileAsymmetric(low, high)    |
+    +-------------------+-------------------------------------------+
+    +-------------------+-------------------------------------------+
+    | low/high          | percentile bounds on raw weights         |
+    | effect            | asymmetric clipping of tails             |
+    +-------------------+-------------------------------------------+
+    """
+    low: float = 0.5
+    high: float = 99.5
+
+    def __init__(self, low: float = 0.5, high: float = 99.5, group_size_threshold: int = 128):
+        super().__init__(name="percentile_asym", group_size_threshold=group_size_threshold)
+        self.low = low
+        self.high = high
+
+
+@dataclass
+class SmoothMAD(SmoothMethod):
+    """
+    +----------------+-------------------------------------------+
+    | math           | median +/- K * MAD                        |
+    | config         | SmoothMAD(k=K)                            |
+    +----------------+-------------------------------------------+
+    +----------------+-------------------------------------------+
+    | K              | width multiplier for MAD window           |
+    | effect         | higher K = less clipping                  |
+    +----------------+-------------------------------------------+
+    """
+    k: float = 2.75
+
+    def __init__(self, k: float = 2.75, group_size_threshold: int = 128):
+        super().__init__(name="mad", group_size_threshold=group_size_threshold)
+        self.k = k
+
+
+@dataclass
+class SmoothMSE(SmoothMethod):
+    """
+    +----------------+-------------------------------------------+
+    | math           | grid-search shrink p in [1..maxshrink]    |
+    | config         | SmoothMSE(steps=N, maxshrink=S)           |
+    +----------------+-------------------------------------------+
+    +----------------+-------------------------------------------+
+    | steps (N)      | number of shrink candidates               |
+    | maxshrink (S)  | smallest range multiplier                 |
+    | effect         | more steps = better fit, slower           |
+    +----------------+-------------------------------------------+
+    """
+    steps: int = 32
+    maxshrink: float = 0.8
+
+    def __init__(self, steps: int = 32, maxshrink: float = 0.8, group_size_threshold: int = 128):
+        super().__init__(name="mse", group_size_threshold=group_size_threshold)
+        self.steps = steps
+        self.maxshrink = maxshrink
+
+
+@dataclass
+class SmoothOutlier(SmoothMethod):
+    """
+    +----------------+-------------------------------------------+
+    | math           | clip by kth |w|, keep (100-pct)% mass     |
+    | config         | SmoothOutlier(pct=p)                      |
+    +----------------+-------------------------------------------+
+    +----------------+-------------------------------------------+
+    | pct (p)        | top-pct of |w| treated as outliers        |
+    | effect         | higher p = more clipping                  |
+    +----------------+-------------------------------------------+
+    """
+    pct: float = 1.0
+
+    def __init__(self, pct: float = 1.0, group_size_threshold: int = 128):
+        super().__init__(name="outlier", group_size_threshold=group_size_threshold)
+        self.pct = pct
+
+
+@dataclass
+class SmoothSoftNorm(SmoothMethod):
+    """
+    +----------------+-------------------------------------------+
+    | math           | z=(w-mean)/rms, clip z to +/-K            |
+    | config         | SmoothSoftNorm(k=K)                       |
+    +----------------+-------------------------------------------+
+    +----------------+-------------------------------------------+
+    | K              | z-score clip limit                        |
+    | effect         | higher K = less clipping                  |
+    +----------------+-------------------------------------------+
+    """
+    k: float = 3.0
+
+    def __init__(self, k: float = 3.0, group_size_threshold: int = 128):
+        super().__init__(name="softnorm", group_size_threshold=group_size_threshold)
+        self.k = k
+
+
+@dataclass
+class SmoothLog(SmoothMethod):
+    """
+    +----------------+-------------------------------------------+
+    | math           | log1p(mu*|w|) percentile, invert to clip  |
+    | config         | SmoothLog(percentile=p, mu=mu)            |
+    +----------------+-------------------------------------------+
+    +----------------+-------------------------------------------+
+    | percentile (p) | percentile in log space for clip          |
+    | mu             | log companding strength                   |
+    | effect         | higher mu compresses outliers more        |
+    +----------------+-------------------------------------------+
+    """
+    percentile: float = 99.0
+    mu: float = 8.0
+
+    def __init__(self, percentile: float = 99.0, mu: float = 8.0, group_size_threshold: int = 128):
+        super().__init__(name="log", group_size_threshold=group_size_threshold)
+        self.percentile = percentile
+        self.mu = mu
+
+
+@dataclass
+class SmoothRowCol(SmoothMethod):
+    """
+    +----------------+-------------------------------------------+
+    | math           | divide by row/col RMS, re-scale after     |
+    | config         | SmoothRowCol(axis="row"|"col")            |
+    +----------------+-------------------------------------------+
+    +----------------+-------------------------------------------+
+    | axis           | apply RMS scale per "row" or "col"        |
+    | effect         | normalizes dynamic range before quant     |
+    +----------------+-------------------------------------------+
+    """
+    axis: str = "row"
+
+    def __init__(self, axis: str = "row", group_size_threshold: int = 128):
+        super().__init__(name="rowcol", group_size_threshold=group_size_threshold)
+        self.axis = axis
+
+
+class GcMode(str, Enum):
+    INTERVAL = "interval"
+    ON_STAGE_END = "on_stage_end"
+
+
+@dataclass
+class FailSafe:
+    strategy: FailSafeStrategy = FailSafeStrategy.RTN # enable failsafe by default due to moe routing behavior breaking calibration based quantization
+
+    # int/float = if captured module fwd tokens is less than value, trigger strategy
+    # string = if string is int/float followed by %, then if captured module fwd tokens is less than value in percentage relative to calibration, trigger strategy
+    threshold: int | float | str = "0.5%" # if less than 0.5% of calibration reaches module (think moe) then we trigger per-module failsafe quantization
+
+    # naive quantization methods used in failsafe has issue with very small/large outliers that can severely degrade the quantization quality
+    # use smoothers to normalize these outliers so they do not dominate the scale/zero calculation
+    smooth: Optional[SmoothMethod] = field(default_factory=SmoothMAD)
+
+
+@dataclass
+class HessianConfig:
+    # Hessian accumulation controls (GPTQ only)
+    chunk_size: Optional[int] = field(default=None, metadata={"help": "Maximum rows per Hessian chunk"})
+    chunk_bytes: Optional[int] = field(default=None, metadata={"help": "Memory budget (in bytes) for Hessian chunk staging"})
+    staging_dtype: Union[str, torch.dtype] = field(
+        default=torch.float32,
+        metadata={"help": "Stage Hessian chunks in a lower precision dtype when supported"},
+    )
+
+    def __post_init__(self):
+        if self.chunk_size is not None:
+            if not isinstance(self.chunk_size, int):
+                raise ValueError("HessianConfig: `chunk_size` must be an integer or None.")
+            if self.chunk_size <= 0:
+                raise ValueError("HessianConfig: `chunk_size` must be a positive integer.")
+
+        if self.chunk_bytes is not None:
+            if not isinstance(self.chunk_bytes, int):
+                raise ValueError("HessianConfig: `chunk_bytes` must be an integer or None.")
+            if self.chunk_bytes <= 0:
+                raise ValueError("HessianConfig: `chunk_bytes` must be a positive integer amount of bytes.")
+
+        if isinstance(self.staging_dtype, str):
+            self.staging_dtype = self.staging_dtype.lower()
+            if self.staging_dtype not in ["float32", "float16", "bfloat16"]:
+                raise ValueError("HessianConfig: `staging_dtype` must be float32, float16, or bfloat16.")
+            self.staging_dtype = getattr(torch, self.staging_dtype)
+        elif isinstance(self.staging_dtype, torch.dtype):
+            if self.staging_dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+                raise ValueError("HessianConfig: `staging_dtype` must be float32, float16, or bfloat16.")
+        else:
+            raise ValueError("HessianConfig: `staging_dtype` must be a torch.dtype or string.")
+
+
+@dataclass
+class GPTAQConfig:
+    alpha: float = field(default=0.25)
+    device: Union[str, torch.device] = field(default="auto")
+
+    def __post_init__(self):
+        if not isinstance(self.alpha, (int, float)):
+            raise ValueError("GPTAQConfig: `alpha` must be a numeric value.")
+        if isinstance(self.device, str):
+            if not self.device:
+                raise ValueError("GPTAQConfig: `device` must be a non-empty string or torch.device.")
+        elif not isinstance(self.device, torch.device):
+            raise ValueError("GPTAQConfig: `device` must be a string or torch.device.")
+
+
+@dataclass
+class BaseMoERouting:
+    pass
+
+
+MOE_ALL_EXPERTS = "all"
+
+
+@dataclass
+class ExpertsRoutingOverride(BaseMoERouting):
+    num_experts_per_tok: Union[int, str] = MOE_ALL_EXPERTS
+
+    def __post_init__(self):
+        # Handle string values
+        if isinstance(self.num_experts_per_tok, str):
+            raw = self.num_experts_per_tok.strip()
+
+            # Numeric string -> int (must be > 0)
+            if raw.isdigit():
+                value = int(raw)
+                if value <= 0:
+                    raise ValueError(
+                        f"num_experts_per_tok must be a positive int or '{MOE_ALL_EXPERTS}', "
+                        f"got '{self.num_experts_per_tok}'"
+                    )
+                self.num_experts_per_tok = value
+                return
+
+            # Normalize keyword string
+            value = raw.lower()
+            if value != MOE_ALL_EXPERTS:
+                raise ValueError(
+                    f"num_experts_per_tok must be a positive int or '{MOE_ALL_EXPERTS}', "
+                    f"got '{self.num_experts_per_tok}'"
+                )
+
+            self.num_experts_per_tok = value
+            return
+
+        # Validate integer values
+        if not isinstance(self.num_experts_per_tok, int) or self.num_experts_per_tok <= 0:
+            raise ValueError(
+                f"num_experts_per_tok must be a positive int or '{MOE_ALL_EXPERTS}', "
+                f"got {self.num_experts_per_tok}"
+            )
+
+
+# MoE quantization: forward whole calibration dataset to each expert instead of only routed data
+# This ensures all experts receive sufficient calibration samples but increases quantization time
+@dataclass
+class ExpertsRoutingBypass(BaseMoERouting):
+    # Number of modules to process in a single batch to reduce VRAM pressure during quantization
+    # For example, with batch_size=10 and 20 expert modules (gate_proj + up_proj for 10 experts):
+    # - First batch processes 10 modules (could be gate_proj for experts 0-9, or a mix depending on sorting)
+    # - Second batch processes remaining 10 modules
+    batch_size: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of modules to process in a single batch during MoE quantization"}
+    )
+
+
+@dataclass
+class MoEConfig:
+    routing: BaseMoERouting
+
+    def __post_init__(self):
+        if not isinstance(self.routing, BaseMoERouting):
+            raise ValueError(
+                f"routing must be an instance of BaseMoERouting, "
+                f"got {type(self.routing).__name__}"
+            )
+
+    def routing_bypass(self) -> bool:
+        return isinstance(self.routing, ExpertsRoutingBypass)
+
+    def routing_override(self, num_experts: int) -> Union[int, None]:
+        """
+        Resolve MoE routing top-k override.
+
+        Returns the effective number of experts per token if routing override
+        is enabled, otherwise None.
+
+        - "all" resolves to `num_experts`
+        - integer value is returned directly
+        """
+        if isinstance(self.routing, ExpertsRoutingOverride):
+            # Resolve "all" to full expert count
+            if isinstance(self.routing.num_experts_per_tok, str) and self.routing.num_experts_per_tok.lower().strip() == MOE_ALL_EXPERTS:
+                return num_experts
+
+            assert isinstance(self.routing.num_experts_per_tok, int)
+            top_k = self.routing.num_experts_per_tok
+
+            # Clamp to valid range and warn user if needed
+            if top_k > num_experts:
+                log.info(f"MoEConfig: MoE routing override num_experts_per_tok ({top_k}) exceeds "
+                    f"num_experts ({num_experts}); clamping to {num_experts}.",)
+                top_k = num_experts
+
+            return top_k
+
+        return None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "routing": {
+                "class": self.routing.__class__.__name__,
+                **asdict(self.routing),
+            }
+        }
 
 
 QUANT_METHOD_FORMAT_MAPPING = {
@@ -99,6 +467,7 @@ QUANT_METHOD_FORMAT_MAPPING = {
         FORMAT.GEMV,
         FORMAT.GEMV_FAST,
         FORMAT.MARLIN,
+        FORMAT.LLM_AWQ,
     },
 }
 
@@ -108,23 +477,24 @@ QUANTIZE_BLACK_LIST = {}
 # compat
 QUANT_CONFIG_ARG_SYNONYMS = {
     "w_bit": BITS_FIELD_CODE,
+
     # QQQ compat
     "wbits": BITS_FIELD_CODE,
     "q_group_size": GROUP_SIZE_FIELD_CODE,
+
     # AWQ compat
     "version" : FORMAT_FIELD_CODE,
-    "v2": "gptaq",
-    "v2_alpha": "gptaq_alpha",
-    "v2_memory_device": "gptaq_memory_device",
+
     # map format field (checkpoint_format) to class/code (format)
     FORMAT_FIELD_CHECKPOINT: FORMAT_FIELD_CODE,
 }
 
-DYNAMIC_FIELD_SYNONYMS = {
-    "gptaq": ("v2",),
-    "gptaq_alpha": ("v2_alpha",),
-    "gptaq_memory_device": ("v2_memory_device",),
+# compat (values are negated)
+QUANT_CONFIG_ARG_SYNONYMS_NEGATED = {
+    # AWQ compat
+    "zero_point": SYMMETRIC_FIELD_CODE,
 }
+DYNAMIC_FIELD_SYNONYMS = {}
 
 def dict_scale_dtype_to_str(d: Dict[str, Any]) -> None:
     """
@@ -137,6 +507,74 @@ def dict_scale_dtype_to_str(d: Dict[str, Any]) -> None:
     for value in d.values():
         if isinstance(value, dict):
             dict_scale_dtype_to_str(value)
+
+
+def _build_smooth_method_from_dict(payload: Dict[str, Any]) -> Optional[SmoothMethod]:
+    method_type = payload.get("type") or payload.get("name")
+    if not method_type:
+        return None
+    method_type = str(method_type).strip().lower()
+    group_size_threshold_raw = payload.get("group_size_threshold", 128)
+    group_size_threshold = int(group_size_threshold_raw) if group_size_threshold_raw is not None else 128
+    if method_type == "percentile":
+        return SmoothPercentile(
+            percentile=float(payload.get("percentile", 99.0)),
+            group_size_threshold=group_size_threshold,
+        )
+    if method_type in ("percentile_asym", "percentile_asymmetric"):
+        return SmoothPercentileAsymmetric(
+            low=float(payload.get("low", 0.5)),
+            high=float(payload.get("high", 99.5)),
+            group_size_threshold=group_size_threshold,
+        )
+    if method_type == "mad":
+        return SmoothMAD(
+            k=float(payload.get("k", 3.0)),
+            group_size_threshold=group_size_threshold,
+        )
+    if method_type == "mse":
+        return SmoothMSE(
+            steps=int(payload.get("steps", 32)),
+            maxshrink=float(payload.get("maxshrink", 0.8)),
+            group_size_threshold=group_size_threshold,
+        )
+    if method_type == "outlier":
+        return SmoothOutlier(
+            pct=float(payload.get("pct", 1.0)),
+            group_size_threshold=group_size_threshold,
+        )
+    if method_type == "softnorm":
+        return SmoothSoftNorm(
+            k=float(payload.get("k", 3.0)),
+            group_size_threshold=group_size_threshold,
+        )
+    if method_type == "log":
+        return SmoothLog(
+            percentile=float(payload.get("percentile", 99.0)),
+            mu=float(payload.get("mu", 8.0)),
+            group_size_threshold=group_size_threshold,
+        )
+    if method_type == "rowcol":
+        return SmoothRowCol(
+            axis=str(payload.get("axis", "row")),
+            group_size_threshold=group_size_threshold,
+        )
+    if method_type == "none":
+        return None
+    raise ValueError(f"QuantizeConfig: Unknown smooth type `{method_type}`.")
+
+
+def _parse_smooth_method(setting: Any) -> Optional[SmoothMethod]:
+    if setting is None:
+        return None
+    if isinstance(setting, SmoothMethod):
+        return setting
+    if isinstance(setting, str):
+        return _build_smooth_method_from_dict({"type": setting})
+    if isinstance(setting, dict):
+        return _build_smooth_method_from_dict(setting)
+    raise ValueError("QuantizeConfig: `failsafe.smooth` must be a SmoothMethod, string, or dict.")
+
 
 def dynamic_get(dynamic: Dict[str, Dict[str, Union[int, bool]]], module_name: str, key: str = None,
                 default: Union[int, bool] = None, sub_key: str = None) -> Union[Dict, int, bool]:
@@ -181,6 +619,7 @@ class QuantizeConfig():
     # allow dynamic bitsize per layer, if None or some layer not set, use bits
     dynamic: Optional[Dict[str, Dict[str, Union[int, bool]]]] = field(default=None)
 
+    # GPTQ only
     # 128 offer good balance between inference speed, vram usage (bpw), and quality
     # use 32 for highest quality with slower inference and higher vram usage
     group_size: int = field(default=64)
@@ -190,9 +629,14 @@ class QuantizeConfig():
     damp_auto_increment: float = field(default=None)
 
     desc_act: Optional[bool] = field(default=None)
+
+    # GPTQ only
     act_group_aware: Optional[bool] = field(default=None)
     static_groups: bool = field(default=False)
+
+    # symmetric quantization toggle (True=symmetric, False=asymmetric).
     sym: bool = field(default=True)
+
     true_sequential: bool = field(default=True)
 
     lm_head: bool = field(default=False)
@@ -208,6 +652,7 @@ class QuantizeConfig():
     # is_distributed: bool = False,
     # tied_gptq_handle: Optional["GPTQ"] = None
 
+    # GPTQ only
     # mean square error calculation: may reduce error loss for some models
     hessian_mse: bool = field(default=False)
     mse: float = field(default=0.0)
@@ -239,31 +684,68 @@ class QuantizeConfig():
     rotation: Optional[str] = field(default=None, metadata={"choices": ["hadamard", "block_hadamard", "random"]})
     rotation_vision: Optional[str] = field(default=None, metadata={"choices": ["hadamard", "block_hadamard", "random"]})
 
+    # GPTQ only
     # deprecated: only used for compat
     is_marlin_format: bool = False
 
-    # use mock quantization to quantize module so the gptq process can continue and not fail
-    fail_safe: bool = field(default=False)
+    # gptq only:
+    # if calibration is insufficient, fallback to a simple quantization strategy; encapsulated in FailSafe config
+    failsafe: Optional[FailSafe] = field(default_factory=FailSafe)
 
+    # GPTQ only
     # gptaq only:
-    gptaq: bool = field(default=False)
-    gptaq_alpha: float = field(default=0.25)
-    gptaq_memory_device: str = field(default="auto")
-
-    # awq only:
-    zero_point: bool = field(default=True)
+    gptaq: Optional[GPTAQConfig] = field(default=None)
 
     # gptq only:
     # skip all heavy computations for testing model loading
     mock_quantization: bool = field(default=False, metadata={"help": "Skip heavy computations for fast model loading validation"})
 
+    # GPTQ only
     # Hessian accumulation controls (GPTQ only)
-    hessian_chunk_size: Optional[int] = field(default=None, metadata={"help": "Maximum rows per Hessian chunk"})
-    hessian_chunk_bytes: Optional[int] = field(default=None, metadata={"help": "Memory budget (in bytes) for Hessian chunk staging"})
-    hessian_use_bfloat16_staging: bool = field(default=False, metadata={"help": "Stage Hessian chunks in bfloat16 when supported"})
+    hessian: Optional[HessianConfig] = field(default_factory=HessianConfig)
+
+    # Callback function to filter devices for compute-intensive stages (quantization and forwarding)
+    # Takes a list of devices and returns either the original list or a filtered subset
+    compute_device_filter: Optional[callable] = field(
+        default=None,
+        metadata={"help": "Callback function to filter devices for compute-intensive stages. Function signature: fn(devices: List) -> List. "
+                  "Example to exclude device 0: compute_device_filter=lambda devices: [d for d in devices if d.index != 0]"}
+    )
+
+    # Works faster than data parallel with some configurations
+    auto_forward_data_parallel: bool = field(
+        default=True,
+        metadata={"help": "When multi-gpu is detected, we may data clone modules to each gpu for data parallelism "
+        "to speed up quantization forwarding. This causes extra time spent (especially for MoE layers) and vram pressure, "
+        "leading in some cases to slower forwarding or vram OOM"}
+    )
 
     # VRAM allocation strategy for MoE-heavy subsets
-    vram_strategy: VRAMStrategy = field(default=VRAMStrategy.EXCLUSIVE)
+    vram_strategy: VramStrategy = field(default=VramStrategy.EXCLUSIVE)
+
+    gc_mode: GcMode = field(
+        default=GcMode.INTERVAL,
+        metadata={"help": "Garbage collection mode: 'interval' for regular GC or 'on_stage_end' for GC after stage end (after forward pass, quantize, layer finilization)."}
+    )
+
+    # Control whether to wait for layer finalization (packing, writing) before proceeding to next layer
+    # Default False preserves current behavior (async finalization in background while next layer starts)
+    wait_for_submodule_finalizers: bool = field(
+        default=False,
+        metadata={"help": "Wait for all layer finalization tasks (packing, offloading to disk, etc) to complete before proceeding to next layer. May reduce vram pressure for some env."}
+    )
+
+    moe: MoEConfig = field(
+        default=None,
+        metadata={"help": "Mixture-of-Experts (MoE) configuration for routing strategy and expert batching. "
+                  "Example with bypass routing (forward all data to each expert): "
+                  "moe={'routing': {'class': 'ExpertsRoutingBypass', 'batch_size': None}} - processes all experts in one batch (default). "
+                  "moe={'routing': {'class': 'ExpertsRoutingBypass', 'batch_size': 4}} - processes 4 experts at a time to reduce VRAM pressure. "
+                  "Example with routing override (limit experts per token): "
+                  "moe={'routing': {'class': 'ExpertsRoutingOverride', 'num_experts_per_tok': 2}}. "
+                  "Example to forward to all experts: "
+                  "moe={'routing': {'class': 'ExpertsRoutingOverride', 'num_experts_per_tok': 'all'}}"}
+    )
 
     # DiceQ search configuration (requires both diceq_search=True AND config.enabled=True)
     diceq_search: bool = field(default=False, metadata={"help": "Enable DiceQ search (also requires enabled=True in diceq_config_template)"})
@@ -294,11 +776,6 @@ class QuantizeConfig():
         if valid_formats is None:
             raise ValueError(f"QuantizeConfig: Unsupported `quant_method`: {self.quant_method}")
 
-        # TODO FIXME qqq compat which didn't have checkpoint_format before merging to gptqmodel
-        if self.quant_method == METHOD.QQQ and self.format != FORMAT.QQQ:
-            log.info(f"QuantizeConfig: Auto fix `format` to `{FORMAT.QQQ}`")
-            self.format = FORMAT.QQQ
-
         # If the user does not pass it, the default value will be set according to quant_method
         if self.damp_percent is None:
             if self.quant_method == METHOD.QQQ:
@@ -312,7 +789,7 @@ class QuantizeConfig():
                 self.damp_auto_increment = 0.01
 
         # TODO FIXME awq compat which didn't have checkpoint_format before merging to gptqmodel
-        if self.quant_method == METHOD.AWQ and self.format not in [FORMAT.MARLIN, FORMAT.GEMV, FORMAT.GEMV_FAST, FORMAT.GEMM]:
+        if self.quant_method == METHOD.AWQ and self.format not in [FORMAT.MARLIN, FORMAT.GEMV, FORMAT.GEMV_FAST, FORMAT.GEMM, FORMAT.LLM_AWQ]:
             log.info(f"QuantizeConfig: Auto fix `format` to `{FORMAT.GEMM}`")
             self.format = FORMAT.GEMM
 
@@ -320,6 +797,66 @@ class QuantizeConfig():
             raise ValueError(
                 f"QuantizeConfig: checkpoint `format` used is {self.format}, and the quantization method is {self.quant_method}. "
             )
+
+        # normalize failsafe config
+        if self.failsafe is None:
+            pass
+        elif isinstance(self.failsafe, dict):
+            strategy = self.failsafe.get("strategy", FailSafeStrategy.RTN)
+            threshold = self.failsafe.get("threshold", "1.0%")
+            smooth = self.failsafe.get("smooth")
+            if smooth is None:
+                smooth = self.failsafe.get("smooth_method")
+            if smooth is None and "clip_method" in self.failsafe:
+                smooth = self.failsafe.get("clip_method")
+            smooth = _parse_smooth_method(smooth)
+            if smooth is None:
+                if "smooth_percentile" in self.failsafe:
+                    smooth = SmoothPercentile(
+                        percentile=float(self.failsafe.get("smooth_percentile", 99.0))
+                    )
+                elif "smooth_mad_k" in self.failsafe:
+                    smooth = SmoothMAD(k=float(self.failsafe.get("smooth_mad_k", 3.0)))
+                elif "smooth_mse_steps" in self.failsafe or "smooth_mse_maxshrink" in self.failsafe:
+                    smooth = SmoothMSE(
+                        steps=int(self.failsafe.get("smooth_mse_steps", 32)),
+                        maxshrink=float(self.failsafe.get("smooth_mse_maxshrink", 0.8)),
+                    )
+                elif "smooth_outlier_pct" in self.failsafe:
+                    smooth = SmoothOutlier(pct=float(self.failsafe.get("smooth_outlier_pct", 1.0)))
+                elif "smooth_rms_k" in self.failsafe:
+                    smooth = SmoothSoftNorm(k=float(self.failsafe.get("smooth_rms_k", 3.0)))
+                elif "smooth_log_mu" in self.failsafe:
+                    smooth = SmoothLog(
+                        percentile=float(self.failsafe.get("smooth_percentile", 99.0)),
+                        mu=float(self.failsafe.get("smooth_log_mu", 8.0)),
+                    )
+                elif "smooth_axis" in self.failsafe:
+                    smooth = SmoothRowCol(axis=str(self.failsafe.get("smooth_axis", "row")))
+            self.failsafe = FailSafe(
+                strategy=strategy,
+                threshold=threshold,
+                smooth=smooth,
+            )
+        elif isinstance(self.failsafe, (str, int, float)):
+            self.failsafe = FailSafe(strategy=FailSafeStrategy.RTN, threshold=self.failsafe)
+        elif not isinstance(self.failsafe, FailSafe):
+            raise ValueError("QuantizeConfig: `failsafe` must be a FailSafe config, dict, string, int, float, or None.")
+
+        if self.failsafe is not None:
+            if isinstance(self.failsafe.strategy, str):
+                try:
+                    self.failsafe.strategy = FailSafeStrategy(self.failsafe.strategy.lower())
+                except ValueError as exc:
+                    raise ValueError(
+                        f"QuantizeConfig: `failsafe.strategy` must be one of {[v.value for v in FailSafeStrategy]}."
+                    ) from exc
+            elif not isinstance(self.failsafe.strategy, FailSafeStrategy):
+                raise ValueError(
+                    f"QuantizeConfig: `failsafe.strategy` must be one of {[v.value for v in FailSafeStrategy]}."
+                )
+
+            self.failsafe.smooth = _parse_smooth_method(self.failsafe.smooth)
 
         if self.bits not in fields_info[0].metadata["choices"]:
             raise ValueError(f"QuantizeConfig: `bits` must be in the set of `{fields_info[0].metadata['choices']}`.")
@@ -346,17 +883,19 @@ class QuantizeConfig():
         if self.damp_auto_increment < 0:
             raise ValueError("QuantizeConfig:: `damp_auto_increment` must greater than 0.")
 
-        if self.hessian_chunk_size is not None:
-            if not isinstance(self.hessian_chunk_size, int):
-                raise ValueError("QuantizeConfig: `hessian_chunk_size` must be an integer or None.")
-            if self.hessian_chunk_size <= 0:
-                raise ValueError("QuantizeConfig: `hessian_chunk_size` must be a positive integer.")
+        if self.hessian is None:
+            self.hessian = HessianConfig()
+        elif isinstance(self.hessian, dict):
+            self.hessian = HessianConfig(**self.hessian)
+        elif not isinstance(self.hessian, HessianConfig):
+            raise ValueError("QuantizeConfig: `hessian` must be a HessianConfig, dict, or None.")
 
-        if self.hessian_chunk_bytes is not None:
-            if not isinstance(self.hessian_chunk_bytes, int):
-                raise ValueError("QuantizeConfig: `hessian_chunk_bytes` must be an integer or None.")
-            if self.hessian_chunk_bytes <= 0:
-                raise ValueError("QuantizeConfig: `hessian_chunk_bytes` must be a positive integer amount of bytes.")
+        if self.gptaq is None:
+            pass
+        elif isinstance(self.gptaq, dict):
+            self.gptaq = GPTAQConfig(**self.gptaq)
+        elif not isinstance(self.gptaq, GPTAQConfig):
+            raise ValueError("QuantizeConfig: `gptaq` must be a GPTAQConfig, dict, or None.")
 
         # resolve activation ordering compatibility and defaults
         desc_act_user_value = self.desc_act
@@ -402,21 +941,32 @@ class QuantizeConfig():
         #print(f"adapter: {self.adapter}")
 
         if self.offload_to_disk and not self.offload_to_disk_path:
-            randWords = random_word.RandomWords()
-            path_key = f"{randWords.get_random_word()}-{randWords.get_random_word()}"
+            path_key = f"{get_random_string()}-{get_random_string()}"
             self.offload_to_disk_path = f"./gptqmodel_offload/{path_key}/"
             log.info(f"QuantizeConfig: offload_to_disk_path auto set to `{self.offload_to_disk_path}`")
 
         if isinstance(self.vram_strategy, str):
             try:
-                self.vram_strategy = VRAMStrategy(self.vram_strategy.lower())
+                self.vram_strategy = VramStrategy(self.vram_strategy.lower())
             except ValueError as exc:
                 raise ValueError(
-                    f"QuantizeConfig: `vram_strategy` must be one of {[v.value for v in VRAMStrategy]}."
+                    f"QuantizeConfig: `vram_strategy` must be one of {[v.value for v in VramStrategy]}."
                 ) from exc
-        elif not isinstance(self.vram_strategy, VRAMStrategy):
+        elif not isinstance(self.vram_strategy, VramStrategy):
             raise ValueError(
-                f"QuantizeConfig: `vram_strategy` must be one of {[v.value for v in VRAMStrategy]}."
+                f"QuantizeConfig: `vram_strategy` must be one of {[v.value for v in VramStrategy]}."
+            )
+
+        if isinstance(self.gc_mode, str):
+            try:
+                self.gc_mode = GcMode(self.gc_mode.lower())
+            except ValueError as exc:
+                raise ValueError(
+                    f"QuantizeConfig: `gc_mode` must be one of {[v.value for v in GcMode]}."
+                ) from exc
+        elif not isinstance(self.gc_mode, GcMode):
+            raise ValueError(
+                f"QuantizeConfig: `gc_mode` must be one of {[v.value for v in GcMode]}."
             )
 
     def extension_set(self, key: str, value: Any):
@@ -546,6 +1096,9 @@ class QuantizeConfig():
             # remap keys according to compat map
             if key in QUANT_CONFIG_ARG_SYNONYMS and QUANT_CONFIG_ARG_SYNONYMS[key] in field_names:
                 key = QUANT_CONFIG_ARG_SYNONYMS[key]
+            elif key in QUANT_CONFIG_ARG_SYNONYMS_NEGATED and QUANT_CONFIG_ARG_SYNONYMS_NEGATED[key] in field_names:
+                key = QUANT_CONFIG_ARG_SYNONYMS_NEGATED[key]
+                val = not bool(val)
 
             if key == FORMAT_FIELD_CHECKPOINT:
                 val = val.lower()
@@ -567,6 +1120,8 @@ class QuantizeConfig():
                     normalized[QUANT_METHOD_FIELD] = val
             elif key == FORMAT_FIELD_CODE:
                 normalized[key] = val.lower() if isinstance(val, str) else val
+            elif key == "failsafe":
+                normalized[key] = val
             elif key in field_names:
                 normalized[key] = val
             else:
@@ -575,6 +1130,13 @@ class QuantizeConfig():
         # fix method if format is not allowed for the method
         fmt = normalized.get(FORMAT_FIELD_CODE)
         method = normalized.get(QUANT_METHOD_FIELD)
+
+        # TODO FIXME qqq compat which didn't have checkpoint_format before merging to gptqmodel
+        if method == METHOD.QQQ and fmt != FORMAT.QQQ:
+            log.info(f"QuantizeConfig: Auto fix `format` to `{FORMAT.QQQ}`")
+            normalized[FORMAT_FIELD_CODE] = FORMAT.QQQ
+            fmt = FORMAT.QQQ
+
         if fmt is not None:
             allowed_methods = [m for m, fmts in QUANT_METHOD_FORMAT_MAPPING.items() if fmt in fmts]
             if method not in allowed_methods:
@@ -605,19 +1167,39 @@ class QuantizeConfig():
                 "QuantizeConfig: config does not contain `sym` (symmetric quantization). This may result in silent errors. Defaulting to `sym=True`."
             )
 
-        dynamic_overrides = normalized.get("dynamic")
-        if isinstance(dynamic_overrides, dict):
-            for overrides in dynamic_overrides.values():
-                if not isinstance(overrides, dict):
-                    continue
-                if "v2" in overrides and "gptaq" not in overrides:
-                    overrides["gptaq"] = overrides.pop("v2")
-                if "v2_alpha" in overrides and "gptaq_alpha" not in overrides:
-                    overrides["gptaq_alpha"] = overrides.pop("v2_alpha")
-                if "v2_memory_device" in overrides and "gptaq_memory_device" not in overrides:
-                    overrides["gptaq_memory_device"] = overrides.pop("v2_memory_device")
+        meta_payload = normalized.get(META_FIELD)
+        if "failsafe" not in normalized and isinstance(meta_payload, dict) and "failsafe" in meta_payload:
+            normalized["failsafe"] = meta_payload.get("failsafe")
+        if "hessian" not in normalized and isinstance(meta_payload, dict) and "hessian" in meta_payload:
+            normalized["hessian"] = meta_payload.get("hessian")
+        if "gptaq" not in normalized and isinstance(meta_payload, dict) and "gptaq" in meta_payload:
+            normalized["gptaq"] = meta_payload.get("gptaq")
+        if "gc_mode" not in normalized and isinstance(meta_payload, dict) and "gc_mode" in meta_payload:
+            normalized["gc_mode"] = meta_payload.get("gc_mode")
+        if (
+            "wait_for_submodule_finalizers" not in normalized
+            and isinstance(meta_payload, dict)
+            and "wait_for_submodule_finalizers" in meta_payload
+        ):
+            normalized["wait_for_submodule_finalizers"] = meta_payload.get("wait_for_submodule_finalizers")
+        if (
+            "auto_forward_data_parallel" not in normalized
+            and isinstance(meta_payload, dict)
+            and "auto_forward_data_parallel" in meta_payload
+        ):
+            normalized["auto_forward_data_parallel"] = meta_payload.get("auto_forward_data_parallel")
 
-        return cls(**normalized)
+        cfg = cls(**normalized)
+
+        if quantize_cfg.get(AWQ_PACKING_BACKEND_FIELD) and quantize_cfg[AWQ_PACKING_BACKEND_FIELD] == "llm-awq":
+            cfg.quant_method = METHOD.AWQ
+            cfg.format = FORMAT.LLM_AWQ
+            cfg.pack_dtype = torch.int16
+            log.info(
+                "Detected llm-awq quantization format; FORMAT automatically set to FORMAT.LLM_AWQ."
+            )
+
+        return cfg
 
     @classmethod
     def from_pretrained(cls, save_dir: str, **kwargs):
@@ -646,31 +1228,94 @@ class QuantizeConfig():
             return cls.from_quant_config(args_from_json, format)
 
     def to_dict(self):
+        smooth = None
+        if self.failsafe is not None and self.failsafe.smooth is not None:
+            payload = {"type": self.failsafe.smooth.name}
+            payload["group_size_threshold"] = self.failsafe.smooth.group_size_threshold
+            if isinstance(self.failsafe.smooth, SmoothPercentile):
+                payload["percentile"] = self.failsafe.smooth.percentile
+            elif isinstance(self.failsafe.smooth, SmoothPercentileAsymmetric):
+                payload["low"] = self.failsafe.smooth.low
+                payload["high"] = self.failsafe.smooth.high
+            elif isinstance(self.failsafe.smooth, SmoothMAD):
+                payload["k"] = self.failsafe.smooth.k
+            elif isinstance(self.failsafe.smooth, SmoothMSE):
+                payload["steps"] = self.failsafe.smooth.steps
+                payload["maxshrink"] = self.failsafe.smooth.maxshrink
+            elif isinstance(self.failsafe.smooth, SmoothOutlier):
+                payload["pct"] = self.failsafe.smooth.pct
+            elif isinstance(self.failsafe.smooth, SmoothSoftNorm):
+                payload["k"] = self.failsafe.smooth.k
+            elif isinstance(self.failsafe.smooth, SmoothLog):
+                payload["percentile"] = self.failsafe.smooth.percentile
+                payload["mu"] = self.failsafe.smooth.mu
+            elif isinstance(self.failsafe.smooth, SmoothRowCol):
+                payload["axis"] = self.failsafe.smooth.axis
+            smooth = payload
+
+        meta_payload = dict(self.meta) if self.meta else {}
+        if self.moe:
+            meta_payload["moe"] = self.moe.to_dict()
+
+        if self.failsafe is None:
+            meta_payload["failsafe"] = None
+        else:
+            meta_payload["failsafe"] = {
+                "strategy": self.failsafe.strategy.value if isinstance(self.failsafe.strategy, FailSafeStrategy) else self.failsafe.strategy,
+                "threshold": self.failsafe.threshold,
+                "smooth": smooth,
+            }
+
+        if self.gptaq is None:
+            meta_payload["gptaq"] = None
+        else:
+            device = self.gptaq.device
+            device_value = device if isinstance(device, str) else str(device)
+            meta_payload["gptaq"] = {
+                "alpha": self.gptaq.alpha,
+                "device": device_value,
+            }
+        meta_payload["offload_to_disk"] = self.offload_to_disk
+        meta_payload["offload_to_disk_path"] = self.offload_to_disk_path
+        meta_payload["pack_impl"] = self.pack_impl
+        meta_payload["mse"] = self.mse
+        meta_payload["mock_quantization"] = self.mock_quantization
+        meta_payload["act_group_aware"] = self.act_group_aware
+        meta_payload["gc_mode"] = self.gc_mode
+        meta_payload["wait_for_submodule_finalizers"] = self.wait_for_submodule_finalizers
+        meta_payload["auto_forward_data_parallel"] = self.auto_forward_data_parallel
+        meta_payload["hessian"] = {
+            "chunk_size": self.hessian.chunk_size,
+            "chunk_bytes": self.hessian.chunk_bytes,
+            "staging_dtype": str(self.hessian.staging_dtype).split(".")[-1],
+        }
+        meta_payload["vram_strategy"] = (
+            self.vram_strategy.value if isinstance(self.vram_strategy, VramStrategy) else self.vram_strategy
+        )
+
         out = {
             "bits": self.bits,
             "dynamic": self.dynamic,
             "group_size": self.group_size,
             "desc_act": self.desc_act,
-            "sym": self.sym,
             "lm_head": self.lm_head,
             QUANT_METHOD_FIELD:self.quant_method,
             FORMAT_FIELD_CHECKPOINT: self.format,
             # torch.dtype convert to string
             PACK_DTYPE_FIELD: str(self.pack_dtype).split(".")[-1],
-            META_FIELD: self.meta,
+            META_FIELD: meta_payload,
             # DO NOT EXPORT Adapter to config/json since adapter can be swapped out/in
             # ADAPTER_FIELD: self.adapter.to_dict() if self.adapter else None,
+            # DO NOT EXPORT compute_device_filter since functions are not serializable
         }
 
-        if getattr(self, "pack_impl", "original") != "original":
-            out["pack_impl"] = self.pack_impl
-
-        # TODO FIXME: upstream gpt-qmodel config for awq recognition to transformers/sglang/vllm
         if self.quant_method == METHOD.AWQ:
-            out["zero_point"] = self.zero_point
+            out["zero_point"] = not self.sym
             # awq compat with vllm/sglang/transformers loaders
             out["version"] = self.format
             out[FORMAT_FIELD_CODE] = self.format
+        else:
+            out["sym"] = self.sym
         if self.quant_method == METHOD.GPTQ:
             out[FORMAT_FIELD_CODE] = self.format
 
@@ -708,6 +1353,16 @@ class QuantizeConfig():
             # there is only one scale int32 + one qzero int32 per entire module so overall it contributes to close to 0 bpw
             bpw = self.bits
         log.info(f"Estimated Quantization BPW (bits per weight): {bpw} bpw, based on [bits: {self.bits}, group_size: {self.group_size}]")
+
+    def moe_routing_override(self, num_experts: int) -> Union[int, None]:
+        if self.moe is None:
+            return None
+        return self.moe.routing_override(num_experts)
+
+    def moe_routing_bypass(self) -> bool:
+        if self.moe is None:
+            return False
+        return self.moe.routing_bypass()
 
 # deprecated: will be removed in future update
 @dataclass

@@ -3,10 +3,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
-from ..base import BaseQModel
+from transformers.models.qwen3_5 import Qwen3_5TextConfig
+
+from . import LlamaQModel
 
 
-class Qwen3_5QModel(BaseQModel):
+class Qwen3_5QModel(LlamaQModel):
+    """
+    Qwen3.5 inherits the Llama-style layout but introduces linear-attention
+    layers and Q/K norm helper modules that should be tracked but not quantized.
+    """
+
+    config_class = Qwen3_5TextConfig
+
     # Qwen3.5 alternates linear-attention and full-attention by layer.
     layer_modules_strict = False
 
@@ -25,8 +34,22 @@ class Qwen3_5QModel(BaseQModel):
         "#",
         {
             "input_layernorm": ("input_layernorm:!",),
-            "self_attn": ("q_norm:!", "k_norm:!", "q_proj:0", "k_proj:0", "v_proj:0", "o_proj:1"),
-            "linear_attn": ("in_proj_qkv:0", "in_proj_z:0", "in_proj_b:!", "in_proj_a:!", "out_proj:1"),
+            "self_attn": (
+                "q_norm:!",
+                "k_norm:!",
+                "q_proj:0",
+                "k_proj:0",
+                "v_proj:0",
+                "o_proj:1",
+            ),
+            "linear_attn": (
+                "norm:!",
+                "in_proj_qkv:0",
+                "in_proj_z:1",
+                "in_proj_b:!",
+                "in_proj_a:!",
+                "out_proj:2",
+            ),
             "post_attention_layernorm": ("post_attention_layernorm:!",),
             "mlp": ("gate_proj:0", "up_proj:0", "down_proj:1"),
         },

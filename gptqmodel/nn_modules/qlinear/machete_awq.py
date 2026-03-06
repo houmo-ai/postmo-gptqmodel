@@ -11,10 +11,12 @@ import torch
 from ...adapter.adapter import Adapter, Lora
 from ...models._const import DEVICE, PLATFORM
 from ...nn_modules.qlinear import AWQuantLinear
+from ...quantization import FORMAT, METHOD
 from ...utils.backend import BACKEND
 from ...utils.logger import setup_logger
 from ...utils.machete import (
     _validate_machete_device_support,
+    gptqmodel_machete_kernels,
     machete_import_exception,
     machete_mm,
     machete_prepack_B,
@@ -29,6 +31,9 @@ log = setup_logger()
 
 
 class AwqMacheteQuantLinear(AWQuantLinear):
+    SUPPORTS_BACKENDS = [BACKEND.MACHETE]
+    SUPPORTS_METHODS = [METHOD.AWQ]
+    SUPPORTS_FORMATS = {FORMAT.GEMM: 100, FORMAT.MARLIN: 100}
     SUPPORTS_BITS = [4, 8]
     SUPPORTS_GROUP_SIZE = [-1, 32, 64, 128]
     SUPPORTS_DESC_ACT = [False]  # AWQ kernels do not reorder activations
@@ -95,10 +100,11 @@ class AwqMacheteQuantLinear(AWQuantLinear):
         self.has_zero_points = True
 
     @classmethod
-    def validate(cls, **args) -> Tuple[bool, Optional[Exception]]:
-        if machete_import_exception is not None:
+    def validate_once(cls) -> Tuple[bool, Optional[Exception]]:
+        if gptqmodel_machete_kernels is None:
             return False, ImportError(machete_import_exception)
-        return cls._validate(**args)
+        else:
+            return True, None
 
     @classmethod
     def validate_device(cls, device: DEVICE):

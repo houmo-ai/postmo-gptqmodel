@@ -24,6 +24,7 @@ import torch
 from ...adapter.adapter import Adapter, Lora
 from ...models._const import DEVICE, PLATFORM
 from ...nn_modules.qlinear import BaseQuantLinear
+from ...quantization import FORMAT, METHOD
 from ...utils.backend import BACKEND
 from ...utils.logger import setup_logger
 from ...utils.marlin import (
@@ -38,6 +39,7 @@ from ...utils.marlin import (
     marlin_permute_scales,
     marlin_repeat_scales_on_all_ranks,
     marlin_sort_g_idx,
+    replace_parameter,
 )
 from ...utils.marlin_scalar_type import scalar_types
 from ...utils.rocm import IS_ROCM
@@ -47,6 +49,9 @@ log = setup_logger()
 
 
 class MarlinQuantLinear(BaseQuantLinear):
+    SUPPORTS_BACKENDS = [BACKEND.MARLIN, BACKEND.MARLIN_FP16]
+    SUPPORTS_METHODS = [METHOD.GPTQ]
+    SUPPORTS_FORMATS = {FORMAT.GPTQ: 90, FORMAT.MARLIN: 90}
     SUPPORTS_BITS = [4, 8]
     SUPPORTS_GROUP_SIZE = [-1, 32, 64, 128]
     SUPPORTS_DESC_ACT = [True, False]
@@ -208,11 +213,13 @@ class MarlinQuantLinear(BaseQuantLinear):
     #
     #     super().optimize()
 
+
     @classmethod
-    def validate(cls, **args) -> Tuple[bool, Optional[Exception]]:
+    def validate_once(cls) -> Tuple[bool, Optional[Exception]]:
         if marlin_import_exception is not None:
             return False, ImportError(marlin_import_exception)
-        return cls._validate(**args)
+        return True, None
+
 
     @classmethod
     def validate_device(cls, device: DEVICE):
@@ -288,9 +295,9 @@ class MarlinQuantLinear(BaseQuantLinear):
             return torch.empty((0, self.out_features), dtype=x.dtype, device=x.device)
 
         # make sure scales is synced with x/input
+        if x.dtype != self.scales.dtype:
+            replace_parameter(self, "scales", self.scales.to(dtype=x.dtype))
         scales = self.scales
-        if x.dtype != scales.dtype:
-            scales = scales.to(dtype=x.dtype)
 
         out = apply_gptq_marlin_linear(
             input=x.contiguous() if self.is_lm_head else x,

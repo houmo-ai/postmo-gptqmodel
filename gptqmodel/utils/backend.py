@@ -12,7 +12,6 @@ class BACKEND(str, Enum):
 
     # gptq
     TORCH_FUSED = "torch_fused" # optimized for Intel XPU
-    TORCH_FUSED_AWQ = "torch_fused_awq" # AWQ variant of torch fused kernel
     TORCH = "torch" # GOOD: about 80% of triton
     TRITON = "triton" # VERY GOOD: all-around kernel
     EXLLAMA_V1 = "exllama_v1" # FAST: optimized for batching == 1
@@ -22,6 +21,7 @@ class BACKEND(str, Enum):
     MARLIN = "marlin" # FASTEST: marlin reduce ops in fp32 (higher precision -> more accurate, slightly slower)
     MARLIN_FP16 = "marlin_fp16" # FASTEST and then some: marlin reduce ops in fp16 (lower precision -> less accurate, slightly faster)
     BITBLAS = "bitblas" # EXTREMELY FAST: speed at the cost of 10+ minutes of AOT (ahead of time compilation with disk cache)
+    HF_KERNEL = "hf_kernel" # FAST: optimized from HuggingFace kernels-community
 
     # qqq
     QQQ = "qqq" # marlin based qqq kernel
@@ -31,6 +31,7 @@ class BACKEND(str, Enum):
     GEMM_TRITON = "gemm_triton"
     GEMV = "gemv"
     GEMV_FAST = "gemv_fast"
+    TORCH_FUSED_AWQ = "torch_fused_awq"  # AWQ variant of torch fused kernel
     TORCH_AWQ = "torch_awq"
 
     # external

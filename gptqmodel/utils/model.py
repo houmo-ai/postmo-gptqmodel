@@ -96,6 +96,18 @@ _DTYPE_STR_MAP = {
     "bool": torch.bool,
 }
 
+MoETopKState = List[Tuple[nn.Module, str, int]]
+
+MOE_TOPK_FIELD_NAMES = [
+    "top_k",
+    "moe_k", # ernie4_5_vl_moe
+]
+
+MOE_NUM_EXPERTS_FIELD_NAMES = [
+    "num_experts",
+    "moe_num_experts",  # ernie4_5_vl_moe
+]
+
 
 def _torch_dtype_num_bytes(dtype: torch.dtype) -> int:
     if dtype not in _DTYPE_SAFE_MAP:
@@ -196,6 +208,14 @@ def find_modules(module: nn.Module, layers=None, name: str="") -> Dict[str, nn.M
     return res
 
 
+def get_module_by_name(module, child_name):
+    # get the child module by its name relative to the module
+    for name, m in module.named_modules():
+        if name == child_name:
+            return m
+    raise ValueError(f"Cannot find child_name {child_name} in module {module}")
+
+
 def get_module_by_name_prefix(model, module_name: Union[List[str], str]):
     module_name_list = module_name if isinstance(module_name, list) else [module_name]
     for name, module in model.named_modules():
@@ -244,7 +264,7 @@ def make_quant(
     pack_dtype = qcfg.pack_dtype
 
     # Bitblas needs to be loaded as gptq's quant linear first, and then converted to bitblas format.
-    if not pack and format == FORMAT.GPTQ and backend == BACKEND.BITBLAS:
+    if not pack and format in (FORMAT.GPTQ, FORMAT.GPTQ_V2) and backend == BACKEND.BITBLAS:
         backend = BACKEND.TORCH
 
     # returns multiple validated kernels
@@ -316,6 +336,7 @@ def create_quant_module(
     backend: BACKEND = BACKEND.AUTO,
     register_buffers: bool = True,
     adapter: Optional[Adapter] = None,
+
 ):
     # unwrap named module
     if isinstance(submodule, NamedModule):
@@ -429,6 +450,7 @@ def create_quant_layer(
         pack_dtype: torch.dtype,
         backend: BACKEND,
         adapter: Optional[Adapter] = None,
+
 ) -> Type[BaseQuantLinear]:
     if isinstance(module, linear_cls):
         return linear_cls
@@ -724,7 +746,7 @@ def pack_module(
             module_name=name,
         ):
             module.pack(linear=layer, scales=q_scales, s_extra=q_scales_extra)
-    if quant_linear_cls.QUANT_TYPE.startswith("awq_"):
+    elif quant_linear_cls.QUANT_TYPE.startswith("awq_") or quant_linear_cls.QUANT_TYPE == "llm-awq":
         packer_label = "module.pack"
         with log_time_block(
             packer_label,
@@ -855,6 +877,7 @@ def pack_model(
         backend=backend,
         lm_head_name=lm_head_name,
         pack=True,
+        device=DEVICE.CPU,
     )
 
     qModules = find_modules(model, [quant_linear_cls])
@@ -1466,7 +1489,13 @@ def _collect_state_dict_with_offload(model: nn.Module, offload_root: str) -> Dic
     for name, buf in model.named_buffers():
         if name in state_dict:
             continue
+
+        # If the buffer is non-persistent, it does not need to be written to state_dict.
         module_path, leaf = _split_parameter_path(name)
+        module = get_module_by_name(model, module_path)
+        if hasattr(module, "_non_persistent_buffers_set") and leaf in module._non_persistent_buffers_set:
+            continue
+
         if getattr(buf, "is_meta", False) or buf.device.type == "meta":
             source = _resolve_offload_entry(
                 offload_root,
@@ -1503,6 +1532,13 @@ def get_state_dict_for_save(model: nn.Module, offload_root: Optional[str] = None
         for name, buf in model.named_buffers():
             if name in state_dict:
                 continue
+
+            # If the buffer is non-persistent, it does not need to be written to state_dict.
+            module_path, leaf = _split_parameter_path(name)
+            module = get_module_by_name(model, module_path)
+            if hasattr(module, "_non_persistent_buffers_set") and leaf in module._non_persistent_buffers_set:
+                continue
+
             state_dict[name] = TensorSource(name=name, torch_dtype=buf.dtype, shape=tuple(buf.shape), source=buf)
 
     ptrs = collections.defaultdict(list)
@@ -1708,3 +1744,36 @@ def find_config_seq_len(config_dict, target_keys):
             if found is not None:
                 return found
     return None
+
+
+def has_any_attr(obj, names):
+    return any(hasattr(obj, name) for name in names)
+
+
+def find_moe_routing_modules(model):
+    modules = []
+    for module in model.modules():
+        if has_any_attr(module, MOE_TOPK_FIELD_NAMES) and \
+                has_any_attr(module, MOE_NUM_EXPERTS_FIELD_NAMES):
+            modules.append(module)
+    return modules
+
+
+def set_moe_topk(model: nn.Module, new_topk: int) -> MoETopKState:
+    routers = find_moe_routing_modules(model)
+    state: MoETopKState = []
+    for r in routers:
+        for name in MOE_TOPK_FIELD_NAMES:
+            if hasattr(r, name):
+                old = getattr(r, name)
+                assert isinstance(old, int)
+                state.append((r, name, old))
+                setattr(r, name, new_topk)
+                break
+    return state
+
+
+def restore_moe_topk(state: MoETopKState):
+    for module, name, old in state:
+        if hasattr(module, name):
+            setattr(module, name, old)

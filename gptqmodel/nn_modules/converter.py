@@ -147,11 +147,9 @@ def convert_gpt_oss_expert_converter(module, config):
 
 def convert_llama4_expert_converter(module, config):
     import torch
-    try:
-        from transformers.modeling_utils import no_init_weights
-    except ImportError:
-        from transformers.initialization import no_init_weights
     from transformers.models.llama4.modeling_llama4 import Llama4TextMLP, Llama4TextMoe
+
+    from ..utils.hf import no_init_weights
 
     # adapted/modified from https://github.com/vllm-project/llm-compressor/blob/main/src/llmcompressor/modeling/llama4.py
     class SequentialLlama4TextExperts(torch.nn.ModuleList):
@@ -217,9 +215,21 @@ def convert_llama4_expert_converter(module, config):
 
     return module
 
+def convert_glm4v_mlp_converter(module, config):
+    import transformers.models.glm4v.modeling_glm4v as glm4v_modeling
+
+    from ..models.definitions.glm4v import Glm4vTextMLPNew
+
+    for name, sub_module in module.named_modules():
+        if isinstance(sub_module, glm4v_modeling.Glm4vTextMLP):
+            new_module = Glm4vTextMLPNew(config=config.get_text_config(), ori_mlp=sub_module)
+            setattr(module, name, new_module)
+    return module
+
 MODULE_CONVERTER_MAP = {
     "llama4": convert_llama4_expert_converter,
     "gpt_oss": convert_gpt_oss_expert_converter,
     "qwen3_5_moe": convert_qwen3_5_moe_expert_converter,
     "qwen3_5_moe_text": convert_qwen3_5_moe_expert_converter,
+    "glm4v": convert_glm4v_mlp_converter,
 }

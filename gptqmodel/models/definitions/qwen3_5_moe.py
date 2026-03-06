@@ -3,12 +3,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
+from transformers.models.auto import AutoModelForImageTextToText
+
+from gptqmodel.models.moe_lifecycle import GateUpDownMoELifecycleHooks
+
 from ..base import BaseQModel
 
 
 class Qwen3_5MoeQModel(BaseQModel):
+    loader = AutoModelForImageTextToText
+
     # Qwen3.5-MoE alternates linear attention and full attention by layer.
     layer_modules_strict = False
+
+    require_monkeypatch = False
 
     # Expand expert module templates using config.text_config.num_experts.
     dynamic_expert_index = "num_experts"
@@ -22,24 +30,39 @@ class Qwen3_5MoeQModel(BaseQModel):
     # AWQ scaling requires output projections to align with preceding grouped modules.
     awq_scale_optimize_shape_dependent_modules = ["self_attn.o_proj", "linear_attn.out_proj"]
 
+    # MoE lifecycle hooks for gate_proj/up_proj/down_proj pattern.
+    moe_lifecycle_hooks = GateUpDownMoELifecycleHooks()
+
     module_tree = [
         "model",
+        "language_model",
         "layers",
         "#",
         {
             "input_layernorm": ("input_layernorm:!",),
-            "self_attn": ("q_proj:0", "k_proj:0", "v_proj:0", "o_proj:1"),
-            "linear_attn": ("in_proj_qkv:0", "in_proj_z:0", "in_proj_b:!", "in_proj_a:!", "out_proj:1"),
+            "self_attn": (
+                "norm:!",
+                "q_proj:0",
+                "k_proj:0",
+                "v_proj:0",
+                "o_proj:1",
+            ),
+            "linear_attn": (
+                "norm:!",
+                "in_proj_qkv:0",
+                "in_proj_z:1",
+                "in_proj_b:!",
+                "in_proj_a:!",
+                "out_proj:2",
+            ),
             "post_attention_layernorm": ("post_attention_layernorm:!",),
-            "mlp": {
+            "mlp:moe:?": {
                 "gate": ("gate:!",),
                 "shared_expert_gate": ("shared_expert_gate:!",),
-                "shared_expert": ("gate_proj:0", "up_proj:0", "down_proj:1"),
-                "experts": (
-                    "gate_proj.{expert_index}:0",
-                    "up_proj.{expert_index}:0",
-                    "down_proj.{expert_index}:1",
-                ),
+                "shared_expert:0": ("gate_proj:0", "up_proj:0", "down_proj:1"),
+                "experts": {
+                    "#": ("gate_proj:0", "up_proj:0", "down_proj:1"),
+                },
             },
         },
     ]
@@ -69,7 +92,7 @@ class Qwen3_5MoeQModel(BaseQModel):
     def before_model_load(self, load_quantized_model=False):
         import transformers.models.qwen3_5_moe.configuration_qwen3_5_moe as qwen3_5_moe_config
 
-        # Tokenicer loads config directly from path and expects text-token ids at root level.
+        # Tokenizer loads config directly from path and expects text token ids at root level.
         if not getattr(qwen3_5_moe_config, "_gptqmodel_qwen35_cfg_bridge", False):
             cfg_cls = qwen3_5_moe_config.Qwen3_5MoeConfig
 
@@ -114,3 +137,7 @@ class Qwen3_5MoeQModel(BaseQModel):
 
                 qwen3_5_moe_modeling.Qwen3_5MoePreTrainedModel._init_weights = _patched_init_weights
                 qwen3_5_moe_modeling._gptqmodel_qwen35_skip_expert_init = True
+
+
+# Backward-compatible alias used by conditional imports in models/auto.py.
+Qwen3_5_MoeQModel = Qwen3_5MoeQModel

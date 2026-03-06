@@ -244,14 +244,14 @@ def test_eora_kernel():
     # zeros_copy = zeros.clone() + 0b00010001000100010001000100010001
     # exllama_out = exllama_output( x , pack_dtype_bits, bits, group_size=gptq_groups, qweight = weight, qzeros = zeros_copy, scales = scales,g_idx =idx , out_features = n, in_features = k)
     # exllama_out = exllama_out  + (ax @ eora_b)
-    
+
     # deq_weight = dequantize_weight(bits=4, wf = wf, qweight=weight, qzeros=zeros_copy, maxq=maxq, scales=scales, g_idx=idx, dequant_dtype=torch.int8, num_itr=num_itr)
     # torch_kernel_out = torch.matmul(x, deq_weight).reshape(m,512) + (ax @ eora_b)
 
     idx.data = torch.argsort(idx).to(torch.int32)
     gptq_shuffle(weight, idx, bits)
-    
-    ## I confirmed this part to be identical to that of test_kernel_output.py
+
+    ## I confirmed this part to be identical to that of test_gptq.py
 
 
     out_shape = x.shape[:-1] + (weight.shape[-1],)

@@ -12,11 +12,13 @@ import torch
 from ...adapter.adapter import Adapter, Lora
 from ...models._const import DEVICE, PLATFORM
 from ...nn_modules.qlinear import BaseQuantLinear
+from ...quantization import FORMAT, METHOD
 from ...utils.backend import BACKEND
 from ...utils.logger import setup_logger
 from ...utils.machete import (
     _validate_machete_device_support,
     check_machete_supports_shape,
+    gptqmodel_machete_kernels,
     machete_import_exception,
     machete_mm,
     machete_prepack_B,
@@ -33,6 +35,9 @@ log = setup_logger()
 
 
 class MacheteQuantLinear(BaseQuantLinear):
+    SUPPORTS_BACKENDS = [BACKEND.MACHETE]
+    SUPPORTS_METHODS = [METHOD.GPTQ]
+    SUPPORTS_FORMATS = {FORMAT.GPTQ: 100}
     SUPPORTS_BITS = [4, 8]
     SUPPORTS_GROUP_SIZE = [-1, 64, 128]
     SUPPORTS_DESC_ACT = [True, False]
@@ -149,6 +154,13 @@ class MacheteQuantLinear(BaseQuantLinear):
 
         # Buffer storing permutation applied to activations (empty when unused)
         self.register_buffer("input_perm", torch.empty(0, dtype=torch.int32))
+
+    @classmethod
+    def validate_once(cls) -> Tuple[bool, Optional[Exception]]:
+        if gptqmodel_machete_kernels is None:
+            return False, ImportError(machete_import_exception)
+        else:
+            return True, None
 
     @classmethod
     def validate(cls, **args) -> Tuple[bool, Optional[Exception]]:

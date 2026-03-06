@@ -14,6 +14,7 @@ import torch
 from ...adapter.adapter import Adapter, Lora
 from ...models._const import CPU, DEVICE, PLATFORM
 from ...nn_modules.qlinear import BaseQuantLinear
+from ...quantization import FORMAT, METHOD
 from ...utils.backend import BACKEND
 from ...utils.logger import setup_logger
 from ...utils.rocm import IS_ROCM
@@ -26,6 +27,7 @@ except ImportError as e:
     qqq_import_exception = str(e)
 
 log = setup_logger()
+
 
 def mul(
     A, B, C, D, s1, s2, s3, workspace, thread_k=-1, thread_n=-1, sms=-1, max_par=16
@@ -48,6 +50,9 @@ def mul(
 
 
 class QQQQuantLinear(BaseQuantLinear):
+    SUPPORTS_BACKENDS = [BACKEND.QQQ]
+    SUPPORTS_METHODS = [METHOD.QQQ]
+    SUPPORTS_FORMATS = {FORMAT.QQQ: 100}
     SUPPORTS_BITS = [4]
     SUPPORTS_GROUP_SIZE = [-1, 128]
     SUPPORTS_DESC_ACT = [True, False]
@@ -84,11 +89,6 @@ class QQQQuantLinear(BaseQuantLinear):
         adapter: Adapter = None,
         register_buffers: bool = True,
         **kwargs):
-        if qqq_import_exception is not None:
-            raise ValueError(
-                f"Trying to use the QQQ backend but could not import the kernel cpp extension with the following error: {qqq_import_exception}. Please manually reinstall and recompile package as QQQ kernel extension is not part of prebuilt wheels."
-            )
-
         self.tile = 16
         self.max_par = 16
 
@@ -207,10 +207,13 @@ class QQQQuantLinear(BaseQuantLinear):
     #     super().optimize()
 
     @classmethod
-    def validate(cls, **args) -> Tuple[bool, Optional[Exception]]:
+    def validate_once(cls) -> Tuple[bool, Optional[Exception]]:
         if qqq_import_exception is not None:
             return False, ImportError(qqq_import_exception)
+        return True, None
 
+    @classmethod
+    def validate(cls, **args) -> Tuple[bool, Optional[Exception]]:
         in_features = args.get("in_features")
         out_features = args.get("out_features")
         if in_features and out_features and not any(

@@ -3,14 +3,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
-import contextlib
 import copy
 from typing import Callable, Dict, Optional, Tuple
 
 import torch
 from torch.nn import Module
 
-from .. import BACKEND
 from ..looper.loop_processor import DTYPE_SIZE_COLUMN, MODULE_FEATURE_COLUMN, LoopProcessor
 from ..looper.named_module import NamedModule
 from ..models import BaseQModel
@@ -18,10 +16,11 @@ from ..models.writer import (PROCESS_LOG_FWD_TIME, PROCESS_LOG_LAYER, PROCESS_LO
                              PROCESS_LOG_TIME, QUANT_LOG_DAMP, QUANT_LOG_LOSS, QUANT_LOG_NSAMPLES)
 from ..nn_modules.qlinear.qqq import QQQQuantLinear
 from ..quantization.config import METHOD, QuantizeConfig
+from ..utils.failsafe import normalize_failsafe
 from ..quantization.qqq import QQQ
 from ..utils.logger import setup_logger, log_time_block
-from ..utils.model import create_quant_module, find_modules, move_to, pack_model, pack_module
-from ..utils.torch import CPU, DEVICE_0, tf32_disable_guard, torch_streamCtx, torch_sync
+from ..utils.model import create_quant_module, find_modules, move_to, pack_module
+from ..utils.torch import CPU
 
 log = setup_logger()
 
@@ -58,7 +57,7 @@ class QQQProcessor(LoopProcessor):
     def set_calibration_dataset(self, calibration_dataset):
         raise NotImplementedError("QQQProcessor's calibration_dataset cannot be modified")
 
-    def preprocess(self, module: NamedModule):
+    def preprocess(self, module: NamedModule, failsafe=None, **kwargs):
         # entire module is skipped
         if self.qcfg.dynamic_get(layer_name=module.full_name) == False:
             return
@@ -84,6 +83,9 @@ class QQQProcessor(LoopProcessor):
             qcfg_clone._resolve_activation_ordering(desc_act_override, act_group_aware_override)
 
         tmp = QQQ(module=module, qcfg=qcfg_clone)
+
+        tmp.failsafe = normalize_failsafe(failsafe, qcfg_clone.failsafe)
+        tmp.expected_nsamples = getattr(self, "total_calibration_tokens", None)
 
         if self.qcfg.mse > 0.0:
             mse = True
@@ -126,7 +128,8 @@ class QQQProcessor(LoopProcessor):
         subset_index: Optional[int] = None,
         subset_total: Optional[int] = None,
     ):
-        self.pb.title(f"Quantizing {module.name} in layer ").draw()
+        base_title = f"Quantizing {module.name} in layer"
+        self._pause_controller.register_and_draw_progress_bar(self.pb, title=base_title, subtitle="")
         qqq = self.tasks
 
         # logger.info(f"Quantizing module START: {name}, {gptq[name].shape()}")
@@ -158,13 +161,18 @@ class QQQProcessor(LoopProcessor):
         #         value=duration,
         #         iteration=name_index,
         #     )
+        if isinstance(avg_loss, str):
+            loss_display = avg_loss
+        else:
+            loss_display = f"{avg_loss:.10f}" if isinstance(avg_loss, (int, float)) else "unknown"
+
         stat = {
             PROCESS_LOG_NAME:  self.name(),
             PROCESS_LOG_LAYER: module.layer_index,
             PROCESS_LOG_MODULE: module.name,
             MODULE_FEATURE_COLUMN: self.module_feature_summary(module),
             DTYPE_SIZE_COLUMN: self.module_dtype_size_summary(module),
-            QUANT_LOG_LOSS: f"{avg_loss:.10f}",
+            QUANT_LOG_LOSS: loss_display,
             QUANT_LOG_NSAMPLES: f"{nsamples}",
             QUANT_LOG_DAMP: f"{damp_percent:.5f}",
             PROCESS_LOG_TIME: f"{duration:.3f}",
@@ -176,7 +184,8 @@ class QQQProcessor(LoopProcessor):
 
         with self.lock:
             self.durations.append(duration)
-            self.avg_losses.append(avg_loss)
+            if isinstance(avg_loss, (int, float)):
+                self.avg_losses.append(avg_loss)
             self.module_names.append(f"layer-{module.layer_index}-{module.name}")
             self.log.append(stat)
 
@@ -296,3 +305,6 @@ class QQQProcessor(LoopProcessor):
     @classmethod
     def name(cls) -> str:
         return "qqq"
+
+    def has_captured_input_ids(self, name: str) -> bool:
+        return self.tasks[name].fwd_counter > 0

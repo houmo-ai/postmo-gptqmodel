@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
-import contextlib
 import copy
 import threading
 import time
@@ -18,14 +17,13 @@ from ..models import BaseQModel
 from ..models._const import CPU
 from ..models.writer import (PROCESS_LOG_FWD_TIME, PROCESS_LOG_LAYER, PROCESS_LOG_MODULE, PROCESS_LOG_NAME,
                              PROCESS_LOG_TIME, PROCESS_USED_MEMORY, QUANT_LOG_DAMP, QUANT_LOG_LOSS, QUANT_LOG_NSAMPLES)
-from ..quantization import GPTQ, GPTQv2
-from ..quantization.config import METHOD, QuantizeConfig
-from ..utils.importer import select_quant_linear
+from ..quantization import GPTAQ, GPTQ
+from ..quantization.config import GPTAQConfig, HessianConfig, METHOD, QuantizeConfig
+from ..utils.failsafe import normalize_failsafe
 from ..utils.logger import setup_logger, log_time_block
 from ..utils.device import get_device
-from ..utils.model import create_quant_module, find_modules, move_to, pack_model, pack_module
+from ..utils.model import create_quant_module, find_modules, pack_module
 from ..utils.module_locks import parent_module_lock
-from ..utils.torch import tf32_disable_guard
 
 log = setup_logger()
 lock = threading.Lock()
@@ -65,7 +63,7 @@ class GPTQProcessor(LoopProcessor):
     def set_calibration_dataset(self, calibration_dataset):
         raise NotImplementedError("GPTQProcessor's calibration_dataset cannot be modified")
 
-    def preprocess(self, module: NamedModule, fail_safe: bool):
+    def preprocess(self, module: NamedModule, failsafe=None, **kwargs):
         # entire module is skipped
         if self.qcfg.dynamic_get(layer_name=module.full_name) == False:
             return
@@ -87,19 +85,37 @@ class GPTQProcessor(LoopProcessor):
                 qcfg_clone.act_group_aware = act_group_aware_override
             qcfg_clone.damp_percent = self.qcfg.dynamic_get(module.full_name, "damp_percent", qcfg_clone.damp_percent)
             qcfg_clone.static_groups = self.qcfg.dynamic_get(module.full_name, "static_groups", qcfg_clone.static_groups)
-            qcfg_clone.gptaq = self.qcfg.dynamic_get(module.full_name, "gptaq", qcfg_clone.gptaq)
-            qcfg_clone.gptaq_alpha = self.qcfg.dynamic_get(module.full_name, "gptaq_alpha", qcfg_clone.gptaq_alpha)
+            failsafe_override = self.qcfg.dynamic_get(module.full_name, "failsafe", None)
+            if failsafe_override is not None:
+                qcfg_clone.failsafe = normalize_failsafe(failsafe_override, qcfg_clone.failsafe)
+            hessian_override = self.qcfg.dynamic_get(module.full_name, "hessian", None)
+            if hessian_override is not None:
+                if isinstance(hessian_override, dict):
+                    qcfg_clone.hessian = HessianConfig(**hessian_override)
+                elif isinstance(hessian_override, HessianConfig):
+                    qcfg_clone.hessian = hessian_override
+                else:
+                    raise ValueError("QuantizeConfig: dynamic `hessian` must be a HessianConfig or dict.")
+            gptaq_override = self.qcfg.dynamic_get(module.full_name, "gptaq", None)
+            if gptaq_override is not None:
+                if isinstance(gptaq_override, dict):
+                    qcfg_clone.gptaq = GPTAQConfig(**gptaq_override)
+                elif isinstance(gptaq_override, GPTAQConfig):
+                    qcfg_clone.gptaq = gptaq_override
+                else:
+                    raise ValueError("QuantizeConfig: dynamic `gptaq` must be a GPTAQConfig or dict.")
 
             qcfg_clone._resolve_activation_ordering(desc_act_override, act_group_aware_override)
 
         # store last used qcfg_dynamic
         self.qcfg_dynamic = qcfg_clone
 
-        if qcfg_clone.gptaq is True:
-            tmp = GPTQv2(module=module, qcfg=qcfg_clone)
+        if qcfg_clone.gptaq is not None:
+            tmp = GPTAQ(module=module, qcfg=qcfg_clone)
         else:
             tmp = GPTQ(module=module, qcfg=qcfg_clone)
-            tmp.fail_safe = fail_safe
+            tmp.failsafe = normalize_failsafe(failsafe, qcfg_clone.failsafe)
+            tmp.expected_nsamples = getattr(self, "total_calibration_tokens", None)
 
         tmp.quantizer.configure(
             perchannel=True,
@@ -133,7 +149,8 @@ class GPTQProcessor(LoopProcessor):
     ):
         # Reset peak memory stats
         #torch.cuda.reset_peak_memory_stats()
-        self.pb.title(f"Quantizing {module.name} in layer ").draw()
+        base_title = f"Quantizing {module.name} in layer"
+        self._pause_controller.register_and_draw_progress_bar(self.pb, title=base_title, subtitle="")
 
         # logger.info(f"Quantizing module START: {name}, {gptq[name].shape()}")
         ## Need to return the quantized_weight for offloading
@@ -201,7 +218,8 @@ class GPTQProcessor(LoopProcessor):
 
         with self.lock:
             self.durations.append(duration)
-            self.avg_losses.append(avg_loss)
+            if isinstance(avg_loss, (int, float)):
+                self.avg_losses.append(avg_loss)
             self.module_names.append(f"layer-{module.layer_index}-{module.name}")
         ## Assign the quantized weight to the weight
         #gptq[name].layer.weight.data = q_full_weight.to(device=gptq[name].device)
@@ -226,13 +244,18 @@ class GPTQProcessor(LoopProcessor):
 
 
 
+        if isinstance(avg_loss, str):
+            loss_display = avg_loss
+        else:
+            loss_display = f"{avg_loss:.10f}" if isinstance(avg_loss, (int, float)) else "unknown"
+
         stat = {
             PROCESS_LOG_NAME:  self.name(),
             PROCESS_LOG_LAYER: module.layer_index,
             PROCESS_LOG_MODULE: module.name,
             MODULE_FEATURE_COLUMN: self.module_feature_summary(module),
             DTYPE_SIZE_COLUMN: self.module_dtype_size_summary(module),
-            QUANT_LOG_LOSS: f"{avg_loss:.10f}",
+            QUANT_LOG_LOSS: loss_display,
             QUANT_LOG_NSAMPLES: f"{nsamples}",
             QUANT_LOG_DAMP: f"{damp_percent:.5f}",
             PROCESS_LOG_TIME: f"{duration:.3f}",
@@ -407,6 +430,9 @@ class GPTQProcessor(LoopProcessor):
             return True
 
     def name(self) -> str:
-        # TODO fix me..this hacks inherited base class logic, why not override name in gptqv2?
+        # TODO fix me..this hacks inherited base class logic, why not override name in gptaq?
         qcfg = self.qcfg_dynamic if self.qcfg_dynamic is not None else self.qcfg
-        return "gptaq" if qcfg.gptaq else "gptq"
+        return "gptaq" if qcfg.gptaq is not None else "gptq"
+
+    def has_captured_input_ids(self, name: str) -> bool:
+        return self.tasks[name].fwd_counter > 0

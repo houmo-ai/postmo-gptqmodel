@@ -14,6 +14,7 @@ from concurrent.futures import as_completed
 from typing import TYPE_CHECKING, Dict, List, Optional
 from ..nn_modules.hooked_linear import replace_module_with_hooked_legacy
 from ..nn_modules.converter import MODULE_CONVERTER_MAP
+from ..quantization.config import GcMode
 import torch
 
 from .. import DEBUG_ON, DEVICE_THREAD_POOL
@@ -25,7 +26,7 @@ from ..utils.device import get_device, get_device_new
 from ..utils.logger import log_time_block, setup_logger
 from ..utils.model import find_modules, get_module
 from ..utils.offload import offload_to_disk
-from ..utils.torch import CPU, torch_sync
+from ..utils.torch import CPU, torch_empty_cache, torch_sync
 from .stage_subset import SubsetForwardContext, run_subset_stage
 
 if TYPE_CHECKING:  # pragma: no cover - type hints only
@@ -38,7 +39,7 @@ def run_layer_stage(
     layers: List[torch.nn.Module],
     layer_modules: List[List[str]],
     layers_prefix: Optional[str],
-    fail_safe: bool,
+    failsafe,
     shared_kv_cache_dict: Dict[int, torch.Tensor],
     pb,
     layer_count: int,
@@ -62,7 +63,7 @@ def run_layer_stage(
             layer_title = f"Quantizing layer {layer_index} of {layer_count - 1}"
             module = layers[layer_index]
 
-        pb.title(layer_title).subtitle("").draw()
+        looper.pause_controller.register_and_draw_progress_bar(pb, title=layer_title, subtitle="")
 
         if module.__class__.__name__.lower() == "MllamaCrossAttentionDecoderLayer".lower():
             # TODO FIXME: currently we not support quantizing cross attention layer (pixel_values)
@@ -70,20 +71,22 @@ def run_layer_stage(
 
         module = looper.gptq_model.pre_quantize(module)
 
-        model_type = looper.gptq_model.model.config.model_type
-        if model_type in MODULE_CONVERTER_MAP:
-            converter = MODULE_CONVERTER_MAP[model_type]
-            module = converter(module, looper.gptq_model.model.config)
-
-        replace_module_with_hooked_legacy(module, quant_lm_head=looper.gptq_model.quantize_config.lm_head)
-
-        layers[layer_index] = module
         if is_lm_head_module:
             layer_descriptor = looper.gptq_model.lm_head
-        elif layers_prefix:
-            layer_descriptor = f"{layers_prefix}.{layer_index}"
         else:
-            layer_descriptor = str(layer_index)
+            model_type = looper.gptq_model.model.config.model_type
+            if model_type in MODULE_CONVERTER_MAP:
+                converter = MODULE_CONVERTER_MAP[model_type]
+                module = converter(module, looper.gptq_model.model.config.text_config)
+
+            replace_module_with_hooked_legacy(module, quant_lm_head=looper.gptq_model.quantize_config.lm_head)
+
+            layers[layer_index] = module
+
+            if layers_prefix:
+                layer_descriptor = f"{layers_prefix}.{layer_index}"
+            else:
+                layer_descriptor = str(layer_index)
 
         cur_layer_device = get_device(module)
         full = find_modules(module, name=looper.gptq_model.lm_head if is_lm_head_module else "")
@@ -102,7 +105,7 @@ def run_layer_stage(
                 modules = [sum(modules, [])]
 
             layer_inputs = processor.inputs_cache.layer_inputs
-            if is_lm_head_module:
+            if is_lm_head_module and layer_inputs:
                 layer_inputs = looper.gptq_model.lm_head_pre_quantize_generate_hook(layer_inputs)
             layer_input_kwargs = processor.inputs_cache.layer_input_kwargs
             position_ids = processor.inputs_cache.position_ids
@@ -110,10 +113,28 @@ def run_layer_stage(
 
             processed_subset: Dict[str, NamedModule] = {}
             last_subset_context: Optional[SubsetForwardContext] = None
-            subset_total = len(modules)
             previous_subset_processed: Optional[Dict[str, NamedModule]] = None
 
-            for index, names in enumerate(modules):
+            subsets = []
+            for names in modules:
+                subset = looper.create_named_modules(
+                    module=module,
+                    full=full,
+                    is_lm_head_module=is_lm_head_module,
+                    layer_index=layer_index,
+                    layers_prefix=layers_prefix,
+                    names=names,
+                    processor=processor,
+                    failsafe=failsafe,
+                    layer_module=module,
+                )
+                # Skip empty subsets caused by per-layer structure differences or dynamic config exclusions;
+                # otherwise awq_processor may fail to quantize
+                if subset:
+                    subsets.append(subset)
+
+            subset_total = len(subsets)
+            for index, subset in enumerate(subsets):
                 # Process the layer in smaller subsets so attention groups or
                 # MoE experts can be quantized independently within a layer.
                 if DEBUG_ON and log.isEnabledFor(logging.DEBUG):
@@ -123,8 +144,8 @@ def run_layer_stage(
                             layer_index,
                             index + 1,
                             subset_total,
-                            len(names),
-                            names[:5],
+                            len(subset),
+                            subset[:5],
                         )
                     else:
                         log.debug(
@@ -133,8 +154,8 @@ def run_layer_stage(
                             index + 1,
                             subset_total,
                             processor.name(),
-                            len(names),
-                            names[:8],
+                            len(subset),
+                            subset[:8],
                         )
                 subset_result = run_subset_stage(
                     looper=looper,
@@ -150,11 +171,11 @@ def run_layer_stage(
                     layer_title=layer_title,
                     layer_index=layer_index,
                     layers_prefix=layers_prefix,
-                    subset_names=names,
+                    subset=subset,
                     subset_index=index,
                     subset_total=subset_total,
                     full=full,
-                    fail_safe=fail_safe,
+                    failsafe=failsafe,
                     shared_kv_cache_dict=shared_kv_cache_dict,
                     pb=pb,
                     log=log,
@@ -243,6 +264,10 @@ def run_layer_stage(
                 #     )
 
                 try:
+                    # Reset current subset for MoE lifecycle hooks as we do not need to collect activation at this stage,
+                    # and need to collect only outputs produced by original forward
+                    looper._current_subset = None
+
                     layer_outputs = looper._run_forward_batches(
                         module=module,
                         processor=processor,
@@ -308,8 +333,7 @@ def run_layer_stage(
                 processor.clear_cache_data()
                 processor.receive_layer_inputs(layer_outputs)
                 layer_inputs = processor.inputs_cache.layer_inputs
-
-                pb.title(layer_title).subtitle("").draw()
+                looper.pause_controller.register_and_draw_progress_bar(pb, title=layer_title, subtitle="")
 
             if p_index == len(looper.processors) - 1:
                 torch_sync()
@@ -501,21 +525,43 @@ def run_layer_stage(
                         )
 
                 if finalize_futures_snapshot:
-                    # Drain finalize futures asynchronously so the main loop can continue scheduling work.
-                    threading.Thread(
-                        target=_drain_finalize_futures,
-                        args=(
+                    if looper.gptq_model.quantize_config.wait_for_submodule_finalizers:
+                        # Synchronous: wait for all finalization to complete before proceeding to next layer
+                        # This ensures all packing and writing tasks are done
+                        _drain_finalize_futures(
                             [future for future, *_ in finalize_futures_snapshot],
                             finalize_pb,
                             finalize_count,
                             layer_index,
-                        ),
-                        name="SubmoduleFinalizeWatcher",
-                        daemon=True,
-                    ).start()
+                        )
+                        if looper.gptq_model.quantize_config.gc_mode == GcMode.ON_STAGE_END:
+                            torch_empty_cache()
+                    else:
+                        # Asynchronous (current/default behavior): drain in background thread
+                        # This allows next layer to start while current layer finalizes
+                        finalizer_thread = threading.Thread(
+                            target=_drain_finalize_futures,
+                            args=(
+                                [future for future, *_ in finalize_futures_snapshot],
+                                finalize_pb,
+                                finalize_count,
+                                layer_index,
+                            ),
+                            name="SubmoduleFinalizeWatcher",
+                            daemon=True,
+                        )
+                        looper.register_dangling_thread(finalizer_thread)
+                        finalizer_thread.start()
                 else:
                     looper._emit_layer_complete(
                         layer_idx=layer_index,
                         submodule_finalized=True,
                         raise_in_place=True,
                     )
+
+        # Check for pause after completing each layer
+        layer_info = f"layer {layer_index}" if not is_lm_head_module else "lm_head"
+        looper.pause_controller.check_pause_point(f"after {layer_info}")
+
+        # Unregister progress bar when moving to next layer
+        looper.pause_controller.unregister_progress_bar(pb)

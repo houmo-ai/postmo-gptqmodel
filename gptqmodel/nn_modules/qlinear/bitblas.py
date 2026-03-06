@@ -17,6 +17,7 @@ from packaging import version
 from ...adapter.adapter import Adapter, Lora
 from ...models._const import DEVICE, PLATFORM
 from ...nn_modules.qlinear import BaseQuantLinear
+from ...quantization import FORMAT, METHOD
 from ...utils import BACKEND
 from ...utils.logger import setup_logger
 
@@ -237,6 +238,8 @@ class BitblasQuantizationConfig:
 
 
 class BitblasQuantLinear(BaseQuantLinear):
+    SUPPORTS_BACKENDS = [BACKEND.BITBLAS]
+    SUPPORTS_FORMATS = {FORMAT.BITBLAS: 30, FORMAT.GPTQ: 30}
     SUPPORTS_BITS = BITBLAS_SUPPORTED_BITS
     SUPPORTS_GROUP_SIZE = BITBLAS_SUPPORTED_GROUP_SIZES
     SUPPORTS_DESC_ACT = [False, True]
@@ -255,7 +258,7 @@ class BitblasQuantLinear(BaseQuantLinear):
     SUPPORTS_DTYPES = [torch.float16, torch.bfloat16]
 
     QUANT_TYPE = "gptq_bitblas"
-    SUPPORTS_QUANT_METHODS = ["gptq"]
+    SUPPORTS_METHODS = [METHOD.GPTQ]
 
     OPT_FEATURES = BITBLAS_OPTIMIZE_FEATURES
     TORCH_DTYPE = torch.float16
@@ -325,14 +328,15 @@ class BitblasQuantLinear(BaseQuantLinear):
         self._initialize_buffers(in_features, out_features, bias)
 
     @classmethod
-    def validate(cls, **args) -> Tuple[bool, Optional[Exception]]:
+    def validate_once(cls) -> Tuple[bool, Optional[Exception]]:
         if not BITBLAS_AVAILABLE:
             return False, ValueError(BITBLAS_INSTALL_HINT)
+
         try:
             import_bitblas()
         except Exception as exc:  # pragma: no cover - import errors handled above
             return False, exc
-        return cls._validate(**args)
+        return True, None
 
     def _validate_parameters(self, in_features: int, out_features: int) -> None:
         if in_features % 16 != 0:

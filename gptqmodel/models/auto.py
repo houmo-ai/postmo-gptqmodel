@@ -59,8 +59,9 @@ from typing import Any, Dict, List, Optional, Type, Union  # noqa: E402
 import numpy  # noqa: E402
 import torch  # noqa: E402
 from huggingface_hub import list_repo_files  # noqa: E402
+from packaging.version import Version  # noqa: E402
 from tokenicer import Tokenicer  # noqa: E402
-from transformers import AutoConfig, GenerationConfig, PreTrainedModel, PreTrainedTokenizerBase  # noqa: E402
+from transformers import AutoConfig, GenerationConfig, PreTrainedModel, PreTrainedTokenizerBase, __version__ as TRANSFORMERS_VERSION  # noqa: E402
 
 from ..adapter.adapter import Adapter, Lora, normalize_adapter  # noqa: E402
 from ..nn_modules.qlinear.torch import TorchQuantLinear  # noqa: E402
@@ -70,6 +71,7 @@ from ..utils.eval import EVAL  # noqa: E402
 from ..utils.model import find_modules  # noqa: E402
 from ..utils.torch import CPU, torch_empty_cache  # noqa: E402
 from .base import BaseQModel, QuantizeConfig  # noqa: E402
+from .definitions.afmoe import AfMoeQModel  # noqa: E402
 from .definitions.apertus import ApertusQModel  # noqa: E402
 from .definitions.baichuan import BaiChuanQModel  # noqa: E402
 from .definitions.bailing_moe import BailingMoeQModel  # noqa: E402
@@ -87,6 +89,7 @@ from .definitions.dots1 import Dots1QModel  # noqa: E402
 from .definitions.dream import DreamQModel  # noqa: E402
 from .definitions.ernie4_5 import Ernie4_5QModel  # noqa: E402
 from .definitions.ernie4_5_moe import Ernie4_5_MoeQModel  # noqa: E402
+from .definitions.exaone4 import Exaone4QModel  # noqa: E402
 from .definitions.exaone import ExaOneQModel  # noqa: E402
 from .definitions.falcon_h1 import FalconH1QModel  # noqa: E402
 from .definitions.gemma2 import Gemma2QModel  # noqa: E402
@@ -94,6 +97,7 @@ from .definitions.gemma3 import Gemma3ForConditionalGenerationGPTQ, Gemma3QModel
 from .definitions.glm import GlmQModel  # noqa: E402
 from .definitions.glm4_moe import GLM4MoEGPTQ  # noqa: E402
 from .definitions.glm4_moe_lite import Glm4MoeLiteQModel  # noqa: E402
+from .definitions.glm4v import Glm4vGPTQ  # noqa: E402
 from .definitions.gpt2 import GPT2QModel  # noqa: E402
 from .definitions.gpt_bigcode import GptBigCodeQModel  # noqa: E402
 from .definitions.gpt_neo import GptNeoQModel  # noqa: E402
@@ -108,6 +112,7 @@ from .definitions.internlm import InternLMQModel  # noqa: E402
 from .definitions.internlm2 import InternLM2QModel  # noqa: E402
 from .definitions.klear import KlearQModel  # noqa: E402
 from .definitions.lfm2_moe import LFM2MoeQModel  # noqa: E402
+from .definitions.llada2 import LLaDA2MoeQModel
 from .definitions.llama import LlamaQModel  # noqa: E402
 from .definitions.llama4 import Llama4QModel  # noqa: E402
 from .definitions.llava_qwen2 import LlavaQwen2QModel  # noqa: E402
@@ -116,6 +121,7 @@ from .definitions.mimo import MimoQModel  # noqa: E402
 from .definitions.minicpm import MiniCPMGPTQ  # noqa: E402
 from .definitions.minicpm3 import MiniCpm3QModel  # noqa: E402
 from .definitions.minimax_m2 import MiniMaxM2GPTQ  # noqa: E402
+from .definitions.mistral3 import Mistral3GPTQ
 from .definitions.mixtral import MixtralQModel  # noqa: E402
 from .definitions.mllama import MLlamaQModel  # noqa: E402
 from .definitions.mobilellm import MobileLLMQModel  # noqa: E402
@@ -147,7 +153,17 @@ from .definitions.qwen3_vl import Qwen3_VLQModel
 from .definitions.rw import RwgQModel  # noqa: E402
 from .definitions.starcoder2 import Starcoder2QModel  # noqa: E402
 from .definitions.telechat2 import TeleChat2QModel
+from .definitions.voxtral import VoxtralGPTQ  # noqa: E402
 from .definitions.xverse import XverseQModel  # noqa: E402
+
+TRANSFORMERS_SUPPORTS_QWEN3_5 = Version(TRANSFORMERS_VERSION) >= Version("5.2.0")
+if TRANSFORMERS_SUPPORTS_QWEN3_5:
+    from .definitions.qwen3_5 import Qwen3_5QModel  # noqa: E402
+    from .definitions.qwen3_5_moe import Qwen3_5_MoeQModel  # noqa: E402
+else:
+    Qwen3_5QModel = None
+    Qwen3_5_MoeQModel = None
+
 
 # make quants and inference more determinisitc
 torch.manual_seed(787)
@@ -172,6 +188,7 @@ MODEL_MAP = {
     "chatglm": ChatGLMQModel,
     "glm": GlmQModel,
     "glm4": GlmQModel,
+    "glm4v": Glm4vGPTQ,
     "glm4_moe": GLM4MoEGPTQ,
     "glm4_moe_lite": Glm4MoeLiteQModel,
     "gpt_bigcode": GptBigCodeQModel,
@@ -250,6 +267,7 @@ MODEL_MAP = {
     "deepseek_v3": DeepSeekV3QModel,
     "dots1": Dots1QModel,
     "exaone": ExaOneQModel,
+    "exaone4": Exaone4QModel,
     "grinmoe": GrinMoeQModel,
     "mllama": MLlamaQModel,
     "marin": Qwen3QModel,
@@ -276,7 +294,18 @@ MODEL_MAP = {
     "lfm2_moe": LFM2MoeQModel,
     "deepseek_v2": DeepSeekV2QModel,
     "deepseek_v2_ocr": DeepSeekV2OCRQModel,
+    "llada2_moe": LLaDA2MoeQModel,
+    "mistral3": Mistral3GPTQ,
+    "afmoe": AfMoeQModel,
+    "voxtral": VoxtralGPTQ,
 }
+
+if Qwen3_5QModel is not None:
+    MODEL_MAP["qwen3_5"] = Qwen3_5QModel
+    MODEL_MAP["qwen3_5_text"] = Qwen3_5QModel
+
+if Qwen3_5_MoeQModel is not None:
+    MODEL_MAP["qwen3_5_moe"] = Qwen3_5_MoeQModel
 
 SUPPORTED_MODELS = list(MODEL_MAP.keys())
 
@@ -521,11 +550,11 @@ class GPTQModel:
 
         if isinstance(model_or_id_or_path, str):
             load_backend = backend
-            load_kwargs = {}
-
             if llm_backend == "vllm":
                 disallowed_keys = {"pretrained", "tokenizer", "gptqmodel", "trust_remote_code", "backend", "model_id_or_path"}
                 load_kwargs = {k: v for k, v in model_args.items() if k not in disallowed_keys}
+            else:
+                load_kwargs = model_args
 
             backend_name = load_backend.value if isinstance(load_backend, BACKEND) else str(load_backend)
             log.info(f"Eval: loading using backend = `{backend_name}`")
@@ -563,7 +592,7 @@ class GPTQModel:
 
             model_name = "hf" if llm_backend == "gptqmodel" else llm_backend
 
-            if llm_backend == "gptqmodel":
+            if llm_backend == "gptqmodel" and isinstance(model, BaseQModel) and model.quantized:
                 model_args["gptqmodel"] = True
             model_args["pretrained"] = model_id_or_path
 

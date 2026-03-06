@@ -82,6 +82,7 @@ from .deepseek_v3 import DeepSeekV3QModel
 from .dots1 import Dots1QModel
 from .dream import DreamQModel
 from .exaone import ExaOneQModel
+from .exaone4 import Exaone4QModel
 from .ernie4_5 import Ernie4_5QModel
 from .ernie4_5_moe import Ernie4_5_MoeQModel
 from .gemma2 import Gemma2QModel
@@ -132,3 +133,7 @@ from .klear import KlearQModel
 from .llava_qwen2 import LlavaQwen2QModel
 from .nemotron_h import NemotronHQModel
 from .qwen3_omni_moe import Qwen3OmniMoeGPTQ
+from .mistral3 import Mistral3GPTQ
+from .afmoe import AfMoeQModel
+from .glm4v import Glm4vGPTQ
+from .voxtral import VoxtralGPTQ

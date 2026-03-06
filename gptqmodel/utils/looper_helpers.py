@@ -367,6 +367,7 @@ def forward_batch_worker(
 ):
     processor._set_current_batch_index(batch_index)
     module_device = getattr(module, "_gptqmodule_device_hint", None) or get_device(module)
+    # TODO: rehome was done during cloning, is it still needed there?
     rehome_module_to_device(module, module_device, move_parameters=True, move_buffers=True)
 
     torch_sync() # try to avoid torch.AcceleratorError: CUDA error: unspecified launch failure
@@ -398,6 +399,9 @@ def forward_batch_worker(
     if reuse_kv and prev_kv is not None:
         additional_inputs["kv_last_layer"] = nested_move_to(prev_kv, device=module_device)
 
+    # TODO: some models does not honor generate config.use_cache property so we are forced to hack this to false
+    additional_inputs["use_cache"] = False
+
     module_output = None
     kv_next = None
     try:
@@ -416,4 +420,12 @@ def forward_batch_worker(
         kv_next = module_output[-1]
 
     result_output = module_output if need_output else None
+
+    # Promptly release VRAM to reduce peak memory usage.
+    del inputs
+    del attn_tensor
+    del additional_inputs
+    del keep_mask
+    if module_output is not None:
+        del module_output
     return batch_index, result_output, kv_next
