@@ -890,7 +890,7 @@ class QuantizeConfig():
         elif not isinstance(self.hessian, HessianConfig):
             raise ValueError("QuantizeConfig: `hessian` must be a HessianConfig, dict, or None.")
 
-        if self.gptaq is None:
+        if self.gptaq is None or self.gptaq == False:
             pass
         elif isinstance(self.gptaq, dict):
             self.gptaq = GPTAQConfig(**self.gptaq)
