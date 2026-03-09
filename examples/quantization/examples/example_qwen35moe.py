@@ -4,37 +4,42 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import argparse
+import logging
 import os
 import random
 
 import torch
+from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from gptqmodel import GPTQModel, QuantizeConfig
 
 
-CALIBRATION_TEXTS = [
-    "The Mixture-of-Experts architecture activates only a subset of experts for each token.",
-    "GPTQ quantization compresses model weights while preserving generation quality.",
-    "Linear attention trades exact global attention for better long-context efficiency.",
-    "A sparse router can reduce compute while keeping high model capacity.",
-    "请简要介绍一下为什么 MoE 模型在推理时更高效。",
-    "量化后的模型通常需要重新做一次端到端推理验证来确认可用性。",
-]
+def get_wikitext2(nsamples, seqlen):
+    traindata = load_dataset("wikitext", "wikitext-2-raw-v1", split="train").filter(
+        lambda x: len(x["text"]) >= seqlen)
+
+    return [example["text"] for example in traindata.select(range(nsamples))]
 
 
-def build_calibration_dataset(tokenizer, nsamples: int, max_length: int):
-    dataset = []
-    for i in range(nsamples):
-        text = CALIBRATION_TEXTS[i % len(CALIBRATION_TEXTS)]
-        encoded = tokenizer(text, truncation=True, max_length=max_length, return_tensors="pt")
-        dataset.append(
-            {
-                "input_ids": encoded["input_ids"],
-                "attention_mask": encoded["attention_mask"],
-            }
-        )
-    return dataset
+@torch.inference_mode()
+def calculate_avg_ppl(model, tokenizer):
+    from gptqmodel.utils.perplexity import Perplexity
+
+    ppl = Perplexity(
+        model=model,
+        tokenizer=tokenizer,
+        dataset_path="wikitext",
+        dataset_name="wikitext-2-raw-v1",
+        split="train",
+        text_column="text",
+    )
+
+    all = ppl.calculate(n_ctx=512, n_batch=512)
+
+    avg = sum(all) / len(all)
+
+    return avg
 
 
 def build_chat_inputs(tokenizer, prompt: str, device: str):
@@ -68,8 +73,8 @@ def parse_args():
     parser.add_argument("--bits", type=int, default=4, choices=[2, 3, 4, 5, 8])
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--nsamples", type=int, default=8)
-    parser.add_argument("--max-calib-length", type=int, default=1024)
+    parser.add_argument("--nsamples", type=int, default=256)
+    parser.add_argument("--seqlen", type=int, default=1024, help="minimum sequence length for wikitext2 filtering")
     parser.add_argument("--device", type=str, default="cuda:1", help="quantization device")
     parser.add_argument("--infer-device", type=str, default=None, help="inference device after quantization")
     parser.add_argument("--offload-to-disk", action=argparse.BooleanOptionalAction, default=True)
@@ -109,8 +114,8 @@ def main():
     tokenizer_source = args.model
     if not args.skip_quantize:
         tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True, trust_remote_code=args.trust_remote_code)
-        calibration_dataset = build_calibration_dataset(tokenizer, nsamples=args.nsamples, max_length=args.max_calib_length)
-        print(f"[1/4] Calibration samples: {len(calibration_dataset)}")
+        calibration_dataset = get_wikitext2(nsamples=args.nsamples, seqlen=args.seqlen)
+        print(f"[1/5] Calibration samples (wikitext2): {len(calibration_dataset)}")
 
         quantize_config = QuantizeConfig(
             bits=args.bits,
@@ -121,20 +126,20 @@ def main():
             offload_to_disk_path=args.offload_path if args.offload_to_disk else None,
         )
 
-        print("[2/4] Loading fp model ...")
+        print("[2/5] Loading fp model ...")
         model = GPTQModel.load(args.model, quantize_config, trust_remote_code=args.trust_remote_code)
 
-        print("[3/4] Running GPTQ quantization ...")
+        print("[3/5] Running GPTQ quantization ...")
         model.quantize(calibration_dataset, batch_size=args.batch_size)
         model.save(args.out)
         print(f"Quantized model saved to: {args.out}")
     else:
-        print(f"[1/4] Skip quantization, using existing quantized model: {args.out}")
+        print(f"[1/5] Skip quantization, using existing quantized model: {args.out}")
         tokenizer = AutoTokenizer.from_pretrained(args.out, use_fast=True, trust_remote_code=args.trust_remote_code)
         tokenizer_source = args.out
 
     infer_device = args.infer_device or args.device
-    print(f"[4/4] Loading quantized model on {infer_device} and generating ...")
+    print(f"[4/5] Loading quantized model on {infer_device} and generating ...")
     model = GPTQModel.load(args.out, device=infer_device, trust_remote_code=args.trust_remote_code)
     runtime_device = str(model.device)
     if tokenizer is None:
@@ -151,6 +156,16 @@ def main():
     print("=== Answer ===")
     print(answer)
 
+    print("[5/5] Evaluating perplexity on wikitext2 ...")
+    avg_ppl = calculate_avg_ppl(model, tokenizer)
+    print(f"Quantized model avg PPL (wikitext2): {avg_ppl:.4f}")
+
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        level=logging.INFO,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
     main()
