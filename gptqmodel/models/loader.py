@@ -24,6 +24,7 @@ if ensure_modelscope_available():
 else:
     from huggingface_hub import snapshot_download
 
+import defuser
 from packaging.version import InvalidVersion, Version
 from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
 try:
@@ -57,7 +58,6 @@ from ..utils.model import (
     simple_dispatch_model,
 )
 from ._const import DEVICE, normalize_device
-import defuser
 
 
 log = setup_logger()
@@ -160,6 +160,8 @@ def ModelLoader(cls):
             # Align config metadata with the dtype we will materialize weights in.
             config.torch_dtype = dtype
 
+        cls.before_model_load(cls, load_quantized_model=False)
+
         tokenizer = AutoTokenizer.from_pretrained(pretrained_model_id_or_path, trust_remote_code=trust_remote_code)
 
         # Some models have multiple configurations.
@@ -257,7 +259,6 @@ def ModelLoader(cls):
         model_init_kwargs["_fast_init"] = cls.require_fast_init
         #model_init_kwargs["low_cpu_mem_usage"] = True
 
-        cls.before_model_load(cls, load_quantized_model=False)
         from ..utils.hf import build_shell_model
 
         # XIELUActivation will use some weights when activation init, so can't use init_empty_weights
@@ -272,7 +273,7 @@ def ModelLoader(cls):
 
         if quantize_config.offload_to_disk:
             model = build_shell_model(cls.loader, config=config, **model_init_kwargs)
-            defuser.convert_hf_model(model)
+            defuser.convert_model(model, cleanup_original=False)
             model._model_init_kwargs = model_init_kwargs
             print_module_tree(model=model)
 
@@ -295,7 +296,7 @@ def ModelLoader(cls):
         else:
             print("loading model directly to CPU (not using meta device or turtle_model)-----------")
             model = cls.loader.from_pretrained(model_local_path, config=config, **model_init_kwargs)
-            defuser.convert_hf_model(model)
+            defuser.convert_model(model, cleanup_original=False)
             model._model_init_kwargs = model_init_kwargs
             print_module_tree(model=model)
 
@@ -594,11 +595,12 @@ def ModelLoader(cls):
             model = cls.loader.from_config(
                 config, trust_remote_code=trust_remote_code, dtype=dtype, **args
             )
-            defuser.convert_hf_model(model)
+            defuser.convert_model(model, cleanup_original=True)
             model.checkpoint_file_name = model_save_name
 
+            extract_layers_node = cls.extract_layers_node()
             # Get the first layer to determine layer type
-            layers, _ = get_module_by_name_prefix(model, cls.extract_layers_node())
+            layers, _ = get_module_by_name_prefix(model, extract_layers_node)
 
             modules = find_modules(model)
             ignore_modules = [cls.lm_head] + cls.get_base_modules(model)
@@ -633,6 +635,7 @@ def ModelLoader(cls):
                 except Exception as e:
                     log.warn(f"Loader: failed to inspect checkpoint tensor keys `{model_save_name}`: {e}")
 
+            simple_layer_modules = cls.simple_layer_modules(config, qcfg)
             for name in list(modules.keys()):
                 # allow loading of quantized lm_head
                 if qcfg.lm_head and name == cls.lm_head:
@@ -642,7 +645,9 @@ def ModelLoader(cls):
                     not any(name.startswith(prefix) for prefix in cls.extract_layers_node())
                     or any(name.startswith(ignore_module) for ignore_module in ignore_modules)
                     or all(
-                        not name.endswith(ignore_module) for sublist in cls.simple_layer_modules(config, qcfg) for ignore_module in sublist
+                        not name.endswith(ignore_module)
+                        for sublist in simple_layer_modules
+                        for ignore_module in sublist
                     )
                 )
                 missing_qweight = quantized_module_names is not None and name not in quantized_module_names
@@ -863,7 +868,7 @@ def ModelLoader(cls):
             return device_map
 
         log.info(f"Loader: device = {device}")
-        layers, _ = get_module_by_name_prefix(model, cls.extract_layers_node())
+        layers, _ = get_module_by_name_prefix(model, extract_layers_node)
         num_gpus = 1
         if device is DEVICE.CUDA:
             num_gpus = torch.cuda.device_count()

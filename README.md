@@ -20,7 +20,9 @@
 </p>
 
 ## Latest News
-* 02/28/2026 [main]: ✨Qwen 3.5 model support added.
+* 03/09/2026 [main]: ✨Qwen 3.5 MoE model support added. New HF Kernel support added for AWQ. 
+HF Kernel for both gptq/awq are now used by default for cpu devices for best performance. New INT8 kernel ported from Intel for gptq. 
+* 02/28/2026 [main]: ✨Qwen 3.5 model support added. 
 * 02/09/2026 [5.7.0](https://github.com/ModelCloud/GPTQModel/releases/tag/v5.7.0): ✨New `MoE.Routing` config with `Bypass` and `Override` options to allow multiple brute-force MoE routing controls for higher quality quantization of MoE experts. Combined with `FailSafeStrategy`, GPT-QModel now has three separate control settings for efficient MoE expert quantization.
 `AWQ` `qcfg.zero_point` property has been merged with a unified `sym` symmetry property; `zero_point=True` is now `sym=False`.
 Fixed `AWQ` `sym=True` packing/inference and quantization compatibility with some Qwen3 models. Exaone 4.0 support.
@@ -526,4 +528,27 @@ Models quantized by GPT-QModel are inference compatible with HF Transformers (mi
       journal={arXiv preprint arXiv:2406.09904},
       year={2024}
 }
+```
+
+## Quick Notes
+
+### Limit log level
+
+`GPTQModel` uses a shared `LogBar` logger. Set the level once near process startup:
+
+```python
+from logbar import LogBar
+
+LogBar.shared().setLevel("WARNING")  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+```
+
+### Apply Triton nogil patch early in multi-package scripts
+
+If your script imports multiple Triton users (for example `gptqmodel`, `vllm`, and `sglang`), apply the patch at the very top before other Triton-related imports:
+
+```python
+from gptqmodel import TritonPatch
+
+# Fix Triton crashing under nogil/free-threading Python 3.13+ where the kernel cache storage in Triton is not thread-safe
+TritonPatch.apply()
 ```

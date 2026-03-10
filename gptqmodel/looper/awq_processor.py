@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
+import copy
 import inspect
 import math
 import threading
@@ -23,14 +24,14 @@ from ..models.writer import (PROCESS_LOG_LAYER, PROCESS_LOG_MODULE, PROCESS_LOG_
 from ..nn_modules.qlinear.gemm_awq import AwqGEMMQuantLinear
 from ..nn_modules.qlinear.gemv_awq import AwqGEMVQuantLinear
 from ..nn_modules.qlinear.gemv_fast_awq import AwqGEMVFastQuantLinear, LLMAwqQuantLinear
-from ..nn_modules.qlinear.marlin_awq import AwqMarlinQuantLinear
 from ..quantization.awq.quantize.scale import apply_clip, apply_scale
 from ..quantization.awq.utils.module import append_str_prefix, get_op_name, get_op_by_name
 from ..quantization.awq.utils.utils import get_best_device
 from ..quantization.config import FORMAT, METHOD, QuantizeConfig
+from ..utils.ctx import ctx
+from ..utils.device import get_device
 from ..utils.failsafe import normalize_failsafe
 from ..utils.logger import setup_logger, log_time_block
-from ..utils.ctx import ctx
 from ..utils.model import find_modules, get_module_by_name_prefix, move_to, create_quant_module, pack_module
 from ..utils.module_locks import parent_module_lock
 from ..utils.torch import CPU
@@ -92,8 +93,8 @@ class AWQProcessor(LoopProcessor):
         self._scale_context = threading.local()
         self.gptq_model = gptq_model
 
-        # Select a default AWQ kernel for this processor (per-module overrides can still apply).
-        self.qlinear_kernel = self._select_qlinear_kernel_for_format(qcfg.format)
+        model_kernel = getattr(self.gptq_model, "qlinear_kernel", None)
+        self.qlinear_kernel = model_kernel or self._select_qlinear_kernel_for_format(qcfg.format)
 
         self.model = model
         # Whether to apply clipping to the model during quantization. Some models may perform better with this set to False.
@@ -109,10 +110,65 @@ class AWQProcessor(LoopProcessor):
         self.duo_scaling = True
 
         self._module_forward_kwargs: Dict[str, torch.Tensor] = {}
+        self._rotary_lock = threading.Lock()
+        self._rotary_cache: Dict[str, nn.Module] = {}
+        self._rotary_source_id: Optional[int] = None
         self._initialize_sample_counts()
         self._module_forward_kwargs.setdefault("attention_mask", None)
         # Preserve failsafe preference so AWQ can optionally fall back when no calibration data or activations are available.
         self.failsafe = qcfg.failsafe
+
+    def _get_root_rotary(self) -> Optional[nn.Module]:
+        return getattr(getattr(self.model, "model", self.model), "rotary_emb", None)
+
+    def _get_rotary_device(self, rotary: Optional[nn.Module], fallback: Optional[torch.device] = None) -> Optional[torch.device]:
+        if rotary is None:
+            return fallback
+
+        rotary_device = getattr(getattr(rotary, "inv_freq", None), "device", None)
+        if rotary_device is not None:
+            return rotary_device
+
+        try:
+            return get_device(rotary)
+        except Exception:
+            return fallback
+
+    def _get_rotary_for_device(self, target_device: Optional[torch.device]) -> Optional[nn.Module]:
+        rotary = self._get_root_rotary()
+        if rotary is None or target_device is None:
+            return rotary
+
+        target_device = torch.device(target_device)
+        if self._get_rotary_device(rotary) == target_device:
+            return rotary
+
+        cache_key = str(target_device)
+        with self._rotary_lock:
+            rotary = self._get_root_rotary()
+            if rotary is None:
+                return None
+
+            source_id = id(rotary)
+            if self._rotary_source_id != source_id:
+                self._rotary_cache.clear()
+                self._rotary_source_id = source_id
+
+            if self._get_rotary_device(rotary) == target_device:
+                return rotary
+
+            cached = self._rotary_cache.get(cache_key)
+            if cached is None:
+                try:
+                    cached = copy.deepcopy(rotary)
+                except Exception:
+                    cached = rotary
+
+                move_to(cached, device=target_device)
+                if cached is not rotary:
+                    self._rotary_cache[cache_key] = cached
+
+            return cached
 
     def set_calibration_dataset(self, calibration_dataset):
         raise NotImplementedError("AWQProcessor's calibration_dataset cannot be modified")
@@ -136,6 +192,10 @@ class AWQProcessor(LoopProcessor):
         # Honor per-module dynamic format overrides when present.
         format_override = self.qcfg.dynamic_get(module_name, "format", None) if module_name else None
         target_format = format_override or self.qcfg.format
+        if target_format == self.qcfg.format:
+            model_kernel = getattr(self.gptq_model, "qlinear_kernel", None)
+            if model_kernel is not None:
+                return model_kernel
         return self._select_qlinear_kernel_for_format(target_format)
 
     def _get_layer_state(self, layer_index: int) -> _AWQLayerState:
@@ -176,6 +236,11 @@ class AWQProcessor(LoopProcessor):
         self.nsamples = total_tokens
 
     def _record_input_feature(self, module_name: str, feature: torch.Tensor) -> None:
+        # Preserve a leading sample axis for flattened [seq, hidden] captures so later
+        # concatenation produces [samples, seq, hidden] instead of collapsing into one giant sequence.
+        if feature.dim() <= 2:
+            feature = feature.unsqueeze(0)
+
         if feature.device.type != "cpu":
             feature = feature.detach().cpu()
         else:
@@ -298,7 +363,7 @@ class AWQProcessor(LoopProcessor):
         else:
             refreshed["attention_mask"] = None
 
-        rotary = getattr(getattr(self.model, "model", self.model), "rotary_emb", None)
+        rotary = self._get_root_rotary()
         pos_ids_cache = cache.position_ids[-1] if getattr(cache, "position_ids", None) else None
         hidden_cache = None
         if getattr(cache, "layer_inputs", None):
@@ -313,7 +378,8 @@ class AWQProcessor(LoopProcessor):
             seq_len = x_for_rotary.shape[1] if x_for_rotary.dim() >= 2 else x_for_rotary.shape[0]
             batch = x_for_rotary.shape[0] if x_for_rotary.dim() >= 2 else 1
 
-            target_device = getattr(getattr(rotary, "inv_freq", None), "device", None)
+            rotary = self._get_rotary_for_device(x_for_rotary.device)
+            target_device = self._get_rotary_device(rotary, x_for_rotary.device)
             if target_device is not None and x_for_rotary.device != target_device:
                 x_for_rotary = x_for_rotary.to(target_device)
 
@@ -324,11 +390,19 @@ class AWQProcessor(LoopProcessor):
                 pos_for_rotary = pos_for_rotary.unsqueeze(0).expand(batch, -1)
 
             refreshed["position_ids"] = pos_for_rotary
-            try:
-                pe = rotary(x_for_rotary, pos_for_rotary)
-                refreshed["position_embeddings"] = pe
-            except Exception:
-                pass
+            if rotary is not None:
+                try:
+                    pe = rotary(x_for_rotary, pos_for_rotary)
+                    refreshed["position_embeddings"] = pe
+                except Exception as exc:
+                    # Cache refresh can proceed without precomputed rotary embeddings; log for debugging.
+                    log.debug(
+                        "AWQProcessor: failed to refresh rotary position_embeddings "
+                        "(seq_len=%s, device=%s): %s",
+                        seq_len,
+                        x_for_rotary.device,
+                        exc,
+                    )
         elif pos_ids_cache is not None:
             refreshed["position_ids"] = pos_ids_cache
 
@@ -1057,15 +1131,6 @@ class AWQProcessor(LoopProcessor):
                 if changed:
                     module_kwargs[key] = type(value)(converted)
 
-        seq_len = None
-        batch_dim = None
-        if x.dim() >= 2:
-            batch_dim = x.shape[0]
-            seq_len = x.shape[1]
-        else:
-            batch_dim = 1
-            seq_len = x.shape[0]
-
         supports_position_ids = False
         supports_position_embeddings = False
         try:
@@ -1075,24 +1140,38 @@ class AWQProcessor(LoopProcessor):
         except (ValueError, TypeError):
             pass
 
-        rotary = getattr(getattr(self.model, "model", self.model), "rotary_emb", None)
+        if x.dim() == 2 and (supports_position_ids or supports_position_embeddings):
+            x = x.unsqueeze(0)
+
+        seq_len = None
+        batch_dim = None
+        if x.dim() >= 2:
+            batch_dim = x.shape[0]
+            seq_len = x.shape[1] if x.dim() >= 3 else x.shape[0]
+        else:
+            batch_dim = 1
+            seq_len = x.shape[0]
+
+        rotary = self._get_root_rotary()
         if seq_len is not None and rotary is not None and supports_position_embeddings:
+            rotary = self._get_rotary_for_device(target_device or x.device)
+            rotary_device = self._get_rotary_device(rotary, target_device or x.device)
             pos_ids = module_kwargs.get("position_ids") if supports_position_ids else None
             if not supports_position_ids:
                 pos_ids = None
             if pos_ids is None or pos_ids.shape[-1] != seq_len:
-                pos_values = torch.arange(seq_len, device=target_device or x.device, dtype=torch.long)
+                pos_values = torch.arange(seq_len, device=rotary_device or x.device, dtype=torch.long)
                 if x.dim() >= 2:
                     pos_values = pos_values.unsqueeze(0).expand(batch_dim, -1)
                 if supports_position_ids:
                     module_kwargs["position_ids"] = pos_values
                 pos_for_rotary = pos_values
             else:
-                pos_for_rotary = pos_ids.to(target_device or pos_ids.device)
+                pos_for_rotary = pos_ids.to(rotary_device or pos_ids.device)
                 if supports_position_ids:
                     module_kwargs["position_ids"] = pos_for_rotary
 
-            x_for_rotary = x if target_device is None else x.to(target_device)
+            x_for_rotary = x if rotary_device is None else x.to(rotary_device)
             module_kwargs["position_embeddings"] = rotary(x_for_rotary, pos_for_rotary)
         elif supports_position_ids and seq_len is not None and "position_ids" not in module_kwargs:
             pos_values = torch.arange(seq_len, device=target_device or x.device, dtype=torch.long)
@@ -1100,7 +1179,13 @@ class AWQProcessor(LoopProcessor):
                 pos_values = pos_values.unsqueeze(0).expand(batch_dim, -1)
             module_kwargs["position_ids"] = pos_values
 
-        if self._quant_batch_size is None or self._quant_batch_size <= 1:
+        effective_quant_batch_size = self._quant_batch_size if self._quant_batch_size and self._quant_batch_size > 0 else None
+
+        if (
+                effective_quant_batch_size is None
+                or x.dim() == 0
+                or x.shape[0] <= effective_quant_batch_size
+        ):
             module_output = module(x, **module_kwargs)
             if isinstance(module_output, tuple):
                 module_output = module_output[0]
@@ -1119,7 +1204,7 @@ class AWQProcessor(LoopProcessor):
             return val
 
         outputs = []
-        for x_partial in torch.split(x, self._quant_batch_size, dim=0):
+        for x_partial in torch.split(x, effective_quant_batch_size, dim=0):
             partial_kwargs = {
                 key: _slice_value(value, x_partial.shape[0])
                 for key, value in module_kwargs.items()

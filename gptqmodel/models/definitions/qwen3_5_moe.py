@@ -13,21 +13,16 @@ from ..base import BaseQModel
 class Qwen3_5MoeQModel(BaseQModel):
     loader = AutoModelForImageTextToText
 
-    # Qwen3.5-MoE alternates linear attention and full attention by layer.
     layer_modules_strict = False
 
     require_monkeypatch = False
 
-    # Expand expert module templates using config.text_config.num_experts.
     dynamic_expert_index = "num_experts"
 
-    # AutoModelForCausalLM.from_config does not accept the multimodal wrapper config
-    # in shell-mode loading; use direct from_pretrained path for this model.
     support_offload_to_disk = False
 
     pre_lm_head_norm_module = "model.norm"
 
-    # AWQ scaling requires output projections to align with preceding grouped modules.
     awq_scale_optimize_shape_dependent_modules = ["self_attn.o_proj", "linear_attn.out_proj"]
 
     # MoE lifecycle hooks for gate_proj/up_proj/down_proj pattern.
@@ -139,5 +134,4 @@ class Qwen3_5MoeQModel(BaseQModel):
                 qwen3_5_moe_modeling._gptqmodel_qwen35_skip_expert_init = True
 
 
-# Backward-compatible alias used by conditional imports in models/auto.py.
 Qwen3_5_MoeQModel = Qwen3_5MoeQModel

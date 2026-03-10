@@ -12,6 +12,7 @@ class BACKEND(str, Enum):
 
     # gptq
     TORCH_FUSED = "torch_fused" # optimized for Intel XPU
+    TORCH_INT8 = "torch_int8" # optimized CPU int8 fused kernel
     TORCH = "torch" # GOOD: about 80% of triton
     TRITON = "triton" # VERY GOOD: all-around kernel
     EXLLAMA_V1 = "exllama_v1" # FAST: optimized for batching == 1
@@ -31,7 +32,9 @@ class BACKEND(str, Enum):
     GEMM_TRITON = "gemm_triton"
     GEMV = "gemv"
     GEMV_FAST = "gemv_fast"
+    TORCH_INT8_AWQ = "torch_int8_awq"  # optimized CPU int8 fused kernel for AWQ
     TORCH_FUSED_AWQ = "torch_fused_awq"  # AWQ variant of torch fused kernel
+    HF_KERNEL_AWQ = "hf_kernel_awq"  # AWQ variant of HF kernel
     TORCH_AWQ = "torch_awq"
 
     # external

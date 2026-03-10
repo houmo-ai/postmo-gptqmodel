@@ -49,8 +49,7 @@ class TorchFusedAwqQuantLinear(TorchFusedQuantLinear):
     SUPPORTS_ADAPTERS = TorchFusedQuantLinear.SUPPORTS_ADAPTERS
     REQUIRES_FORMAT_V2 = TorchFusedQuantLinear.REQUIRES_FORMAT_V2
 
-    # AWQ kernels are only accuracy validate for float16 for now
-    SUPPORTS_DTYPES = [torch.float16]
+    SUPPORTS_DTYPES = [torch.float16, torch.bfloat16]
 
     def __init__(
         self,
@@ -79,6 +78,7 @@ class TorchFusedAwqQuantLinear(TorchFusedQuantLinear):
             adapter=adapter,
             # Skip base buffer init, we need to manually init buffers for awq
             register_buffers=False,
+            enable_wf_unsqueeze=kwargs.pop("enable_wf_unsqueeze", False),
             **kwargs,
         )
 
@@ -106,12 +106,13 @@ class TorchFusedAwqQuantLinear(TorchFusedQuantLinear):
                 torch.zeros((group_rows, self.out_features), dtype=torch.float16),
             )
 
-            self.register_buffer("g_idx", torch.arange(self.in_features, dtype=torch.int32) // group_size)
-
             if bias:
                 self.register_buffer("bias", torch.zeros(self.out_features, dtype=torch.float16))
             else:
                 self.bias = None
+
+    def post_init(self):
+        super().post_init()
 
     def prepare_awq_fused_tensors(self, need_zeros: bool = True):
         self.scales.to(torch.float16).contiguous()
@@ -168,23 +169,62 @@ class TorchFusedAwqQuantLinear(TorchFusedQuantLinear):
         return packed.contiguous()
 
     def transform_cpu_awq(self, dtype):
-        self.qweight, self.qzeros, scales, zeros = self.prepare_awq_fused_tensors()
+        # Unpack AWQ weights directly to integer form
+        iweight, izeros = unpack_awq(self.qweight, self.qzeros, self.bits)
+        iweight, izeros = reverse_awq_order(iweight, izeros, self.bits)
+        max_val = (1 << self.bits) - 1
+        iweight = torch.bitwise_and(iweight, max_val)
+        izeros = torch.bitwise_and(izeros, max_val)
 
-        super().transform_cpu(dtype, do_scales_and_zeros=False)
+        # Compute zeros: (zero_offset - izeros) * scales
+        zero_offset = 1 << (self.bits - 1)
+        zeros = (zero_offset - izeros.reshape_as(self.scales)) * self.scales
 
-        self.scales = scales.to(device=self.qweight.device, dtype=dtype).contiguous()
+        # AWQ has no g_idx — weights are already in natural order, just transpose
+        # iweight: (in_features, out_features) -> (out_features, in_features) for int4pack
+        weight = iweight.t().contiguous()
+        self.qweight = torch.ops.aten._convert_weight_to_int4pack_for_cpu(weight.int(), 1).contiguous()
+
+        self.scales = self.scales.to(dtype=dtype).contiguous()
         self.qzeros = zeros.to(device=self.qweight.device, dtype=dtype).contiguous()
         self.scales_and_zeros = pack_scales_and_zeros(self.scales, self.qzeros)
 
     def transform_xpu_awq(self, dtype):
-        self.qweight, self.qzeros, scales, _ = self.prepare_awq_fused_tensors(need_zeros=False)
+        # Unpack AWQ weights directly to integer form
+        iweight, izeros = unpack_awq(self.qweight, self.qzeros, self.bits)
+        iweight, izeros = reverse_awq_order(iweight, izeros, self.bits)
+        max_val = (1 << self.bits) - 1
+        iweight = torch.bitwise_and(iweight, max_val)
+        izeros = torch.bitwise_and(izeros, max_val)
 
-        super().transform_xpu(dtype)
+        self.scales = self.scales.to(dtype).contiguous()
 
-        self.scales = scales.to(device=self.qweight.device, dtype=dtype).contiguous()
+        # AWQ has no g_idx — pack weight directly for XPU without reordering
+        # iweight: (in_features, out_features) -> transpose for XPU packing
+        weight = iweight.t().contiguous()
+        packed = torch.zeros(weight.shape[0], weight.shape[1] // self.pack_factor, dtype=torch.int32, device=weight.device)
+        for col in range(weight.shape[1] // self.pack_factor):
+            for i in range(self.pack_factor):
+                packed_col = weight[:, col * self.pack_factor + i].to(torch.int32)
+                packed[:, col] |= packed_col << (i * self.bits)
+        self.qweight = packed.contiguous()
+        self.qzeros = izeros.contiguous()
 
     def transform_cpu(self, dtype):
         self.transform_cpu_awq(dtype)
+
+    @torch.no_grad()
+    def _fused_op_forward(self, x):
+        # AWQ has no g_idx reordering — skip ret_idx
+        if x.device.type == "xpu":
+            out = torch.ops.aten._weight_int4pack_mm_with_scales_and_zeros(
+                x, self.qweight, self.group_size, self.scales, self.qzeros
+            )
+        elif x.device.type == "cpu":
+            out = self.torch_fused_op(x)
+        else:
+            raise NotImplementedError
+        return out
 
     def awq_weight_dequantize(self, device, dtype):
         return dequantize_gemm(

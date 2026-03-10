@@ -6,16 +6,16 @@ common:
 
 tests:
   test_q4_bitblas.py:
-    - bitblas>=0.1.0.post1
+    - http://10.0.13.31/files/bitblas-0.1.0%2Bubuntu.22.4.cu131-py3-none-any.whl
 
   test_perplexity.py:
-    - bitblas>=0.1.0.post1
+    - http://10.0.13.31/files/bitblas-0.1.0%2Bubuntu.22.4.cu131-py3-none-any.whl
 
   test_inference_speed.py:
-    - bitblas>=0.1.0.post1
+    - http://10.0.13.31/files/bitblas-0.1.0%2Bubuntu.22.4.cu131-py3-none-any.whl
 
   test_save_loaded_quantized_model.py:
-    - bitblas>=0.1.0.post1
+    - http://10.0.13.31/files/bitblas-0.1.0%2Bubuntu.22.4.cu131-py3-none-any.whl
 
   test_olora_finetuning_xpu.py:
     - intel_extension_for_pytorch
@@ -49,6 +49,12 @@ tests:
     - https://github.com/huggingface/transformers
     - https://github.com/huggingface/optimum
 
+  test_awq.py:
+    - peft
+
+  test_asym_gptq_v1.py:
+    - peft
+
   test_bits.py:
     - peft
 
@@ -61,13 +67,16 @@ tests:
   test_eval.py:
     - peft
     - evalplus
-    - vllm
+    - http://10.0.13.31/files/vllm-0.1.dev1+gdc6b57846.d20260309.cu131-cp313-cp313-linux_x86_64.whl
 
   test_evalplus.py:
     - evalplus
 
+  test_lm_eval.py:
+    - peft
+
   test_nemotron_ultra.py:
-    - causal_conv1d
+    - http://10.0.13.31/files/causal_conv1d-1.6.0-cp313-cp313-linux_x86_64.whl
 
 tests/models:
   test_pangu_alpha.py:
@@ -80,7 +89,7 @@ tests/models:
     - jieba
 
   test_hymba.py:
-    - causal_conv1d
+    - http://10.0.13.31/files/causal_conv1d-1.6.0-cp313-cp313-linux_x86_64.whl
     - mamba_ssm
 
   test_internlm.py:
@@ -94,3 +103,9 @@ tests/models:
 
   test_phi_3_moe.py:
     - transformers<=4.44.2
+
+  test_bloom.py:
+    - peft
+
+  test_gptbigcode.py:
+    - peft
