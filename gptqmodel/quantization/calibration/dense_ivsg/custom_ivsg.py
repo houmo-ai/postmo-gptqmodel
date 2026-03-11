@@ -1,7 +1,135 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.generation.utils import GenerationMixin,GenerateBeamEncoderDecoderOutput,GenerateBeamDecoderOnlyOutput
+from transformers.generation.utils import GenerateBeamEncoderDecoderOutput,GenerateBeamDecoderOnlyOutput
+
+
+def register_ivsg_linear_hooks(model):
+    linear_modules = []
+    hidden_dim = 0
+
+    def update_ivsg_state_hook(module, inputs, output):
+        x = inputs[0]
+        if x is None:
+            return
+        if x.ndim == 2:
+            x = x.unsqueeze(1)
+        elif x.ndim != 3:
+            return
+
+        x = x.detach().to(dtype=torch.float32)
+        batch_size, chunk_len, input_dim = x.shape
+
+        count = getattr(module, "ivsg_count", None)
+        mean = getattr(module, "ivsg_mean", None)
+        m2 = getattr(module, "ivsg_m2", None)
+        if count is None or mean is None or m2 is None:
+            module.ivsg_count = torch.zeros(batch_size, dtype=torch.long, device=x.device)
+            module.ivsg_mean = torch.zeros(batch_size, input_dim, dtype=torch.float32, device=x.device)
+            module.ivsg_m2 = torch.zeros(batch_size, input_dim, dtype=torch.float32, device=x.device)
+        elif module.ivsg_count.shape[0] != batch_size:
+            raise RuntimeError(
+                f"IVSG state batch mismatch for linear layer: expected {module.ivsg_count.shape[0]}, got {batch_size}."
+            )
+
+        chunk_count = torch.full((batch_size,), chunk_len, dtype=torch.long, device=x.device)
+        chunk_mean = x.mean(dim=1)
+        centered = x - chunk_mean.unsqueeze(1)
+        chunk_m2 = centered.pow(2).sum(dim=1)
+
+        old_count = module.ivsg_count.to(dtype=torch.float32)
+        new_count = chunk_count.to(dtype=torch.float32)
+        total_count = old_count + new_count
+        safe_total_count = total_count.clamp_min(1.0)
+        delta = chunk_mean - module.ivsg_mean
+
+        module.ivsg_mean = module.ivsg_mean + delta * (new_count / safe_total_count).unsqueeze(-1)
+        module.ivsg_m2 = module.ivsg_m2 + chunk_m2 + delta.pow(2) * (
+            (old_count * new_count / safe_total_count).unsqueeze(-1)
+        )
+        module.ivsg_count = module.ivsg_count + chunk_count
+
+    hook_handles = []
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            linear_modules.append(module)
+            hidden_dim += module.weight.shape[1]
+
+    for module in linear_modules:
+        module.ivsg_input_dim = module.weight.shape[1]
+        module.ivsg_layer_weight = module.weight.shape[1]
+        module.ivsg_count = None
+        module.ivsg_mean = None
+        module.ivsg_m2 = None
+        handle = module.register_forward_hook(update_ivsg_state_hook)
+        hook_handles.append(handle)
+
+    total_hidden_dim = max(hidden_dim, 1)
+    for module in linear_modules:
+        module.ivsg_layer_weight = module.ivsg_layer_weight / total_hidden_dim
+
+    model._ivsg_linear_modules = linear_modules
+    return hook_handles, hidden_dim
+
+
+def reset_ivsg_linear_stats(model):
+    for module in getattr(model, "_ivsg_linear_modules", []):
+        module.ivsg_count = None
+        module.ivsg_mean = None
+        module.ivsg_m2 = None
+
+
+def expand_ivsg_linear_stats(model, expand_size):
+    if expand_size <= 1:
+        return
+
+    for module in getattr(model, "_ivsg_linear_modules", []):
+        count = getattr(module, "ivsg_count", None)
+        mean = getattr(module, "ivsg_mean", None)
+        m2 = getattr(module, "ivsg_m2", None)
+        if count is None or mean is None or m2 is None:
+            continue
+        if count.shape[0] == expand_size:
+            continue
+        if count.shape[0] != 1:
+            raise RuntimeError(f"Cannot expand IVSG state from batch {count.shape[0]} to {expand_size}.")
+        module.ivsg_count = count.repeat(expand_size)
+        module.ivsg_mean = mean.repeat(expand_size, 1)
+        module.ivsg_m2 = m2.repeat(expand_size, 1)
+
+
+def reorder_ivsg_linear_stats(model, beam_idx):
+    for module in getattr(model, "_ivsg_linear_modules", []):
+        count = getattr(module, "ivsg_count", None)
+        mean = getattr(module, "ivsg_mean", None)
+        m2 = getattr(module, "ivsg_m2", None)
+        if count is None or mean is None or m2 is None:
+            continue
+        local_beam_idx = beam_idx.to(device=count.device)
+        module.ivsg_count = count.index_select(0, local_beam_idx)
+        module.ivsg_mean = mean.index_select(0, local_beam_idx)
+        module.ivsg_m2 = m2.index_select(0, local_beam_idx)
+
+
+def compute_ivsg_score(model):
+    scores = []
+    for module in getattr(model, "_ivsg_linear_modules", []):
+        count = getattr(module, "ivsg_count", None)
+        m2 = getattr(module, "ivsg_m2", None)
+        if count is None or m2 is None:
+            continue
+        token_count = count.to(dtype=torch.float32).clamp_min(1.0)
+        trace_h = m2.sum(dim=-1)
+        diversity = trace_h / (token_count * module.ivsg_input_dim)
+        norm_term = torch.sqrt(trace_h.clamp_min(1e-6))
+        raw_penalty = norm_term / (trace_h + 1e-6)
+        div_norm = (diversity - diversity.mean()) / (diversity.std(unbiased=False) + 1e-6)
+        pen_norm = (raw_penalty - raw_penalty.mean()) / (raw_penalty.std(unbiased=False) + 1e-6)
+        combined_score = module.ivsg_layer_weight * (div_norm - 1.2 * pen_norm)
+        scores.append(combined_score.detach().cpu())
+
+    if not scores:
+        return None
+    return torch.stack(scores, dim=0).sum(dim=0)
 
 def _beam_search_ivsg(
         self,
@@ -159,35 +287,9 @@ def _beam_search_ivsg(
             model_inputs = self.prepare_inputs_for_generation(flat_running_sequences, **model_kwargs)
 
             model_outputs = self(**model_inputs, return_dict=True)
-            # IVSG
-            _useless_output= self(flat_running_sequences,return_dict = True)
-            # diag_scores = torch.zeros(num_beams).to('cuda')
-            # r_l2 = torch.zeros(num_beams).to('cuda')
-            scores = []
-            # stretch_scores = []
-            if flat_running_sequences.shape[1]>8:
-                for name, module in self.named_modules():
-                    if isinstance(module, nn.Linear):  
-                        x = module.input
-                        x = x - x.mean(dim=1, keepdim=True)
-                        # 计算多样性指标（trace）
-                        H = torch.bmm(x.transpose(1,2), x)
-                        diversity = torch.mean(x.pow(2),dim=(1,2))
-                        # 计算稳定性惩罚（norm）
-                        trace_H = H.diagonal(dim1=-2, dim2=-1).sum(-1)
-                        norm_term = torch.norm(x, p='fro',dim=(1,2))
-                        # 归一化得分
-                        raw_penalty = norm_term / (trace_H + 1e-6)
-                        div_norm = (diversity - diversity.mean()) / (diversity.std() + 1e-6)
-                        pen_norm = (raw_penalty - raw_penalty.mean()) / (raw_penalty.std() + 1e-6)
-                        # 组合当前层得分
-                        # 核心公式: Normalized Diversity - Beta * Normalized Penalty
-                        layer_weight = module.weight.shape[1] / HIDDEN_DIM
-                        combined_score =layer_weight*( div_norm - 1.2 * pen_norm)
-                        scores.append(combined_score.tolist())
-                        # scores.append((module.weight.shape[1]/hidden_dim*(diversity - 0.5* norm_term)).tolist())
-                final_score = torch.tensor(scores).sum(dim=0)
-                del _useless_output
+            final_score = None
+            if flat_running_sequences.shape[1] > 8:
+                final_score = compute_ivsg_score(self)
             # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
             model_kwargs = self._update_model_kwargs_for_generation(
                 model_outputs,
@@ -234,11 +336,8 @@ def _beam_search_ivsg(
 
             log_probs = self._unflatten_beam_dim(log_probs, batch_size, num_beams)
             log_probs = log_probs + running_beam_scores[:, :, None]
-            if flat_running_sequences.shape[1]>8:
-                
-                # final_score =2* (final_score-final_score.min())/(final_score.max()-final_score.min())-1
-                # combine
-                log_probs = log_probs + final_score.unsqueeze(0).unsqueeze(-1).to(log_probs.device)#+ (10*((diag_scores-diag_scores.min())/
+            if final_score is not None:
+                log_probs = log_probs + final_score.unsqueeze(0).unsqueeze(-1).to(log_probs.device)
             log_probs = torch.reshape(log_probs, (batch_size, num_beams * vocab_size))
 
             # c. Retrieve top-K continuations, i.e. select the next token (greedy or sampling) and then keep the best
@@ -298,12 +397,13 @@ def _beam_search_ivsg(
 
             # pluck the cache from the beam indices that will be used in the next iteration
             # NOTE: we need to check if `self._reorder_cache` exists for special models like RAG, RecurrentGemma etc.
+            beam_idx = self._flatten_beam_dim(running_beam_indices[..., cur_len - decoder_prompt_len])
             if model_kwargs.get("past_key_values", None) is not None:
-                beam_idx = self._flatten_beam_dim(running_beam_indices[..., cur_len - decoder_prompt_len])
                 if hasattr(self, "_reorder_cache"):
                     model_kwargs["past_key_values"] = self._reorder_cache(model_kwargs["past_key_values"], beam_idx)
                 else:
                     model_kwargs["past_key_values"].reorder_cache(beam_idx)
+            reorder_ivsg_linear_stats(self, beam_idx)
 
             cur_len = cur_len + 1
             is_early_stop_heuristic_unsatisfied = self._check_early_stop_heuristic(
