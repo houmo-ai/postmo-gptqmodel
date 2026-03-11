@@ -196,4 +196,5 @@ workdirs
 .worktrees/
 outputs-evalscope
 gptqmodel_offload_*
-GPTQModel
+/GPTQModel
+/auto-round
