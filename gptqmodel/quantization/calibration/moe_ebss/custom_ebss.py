@@ -4,6 +4,26 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.generation.utils import GenerationMixin,GenerateBeamEncoderDecoderOutput,GenerateBeamDecoderOnlyOutput
 
+
+def _get_ebss_moe_mlp(model, layer_num):
+    mlp = getattr(model.layers[layer_num], "mlp", None)
+    if mlp is None:
+        return None
+    required_attrs = ("save_expert_cnt", "top_cnt", "clear_expert_cnt")
+    if all(hasattr(mlp, attr) for attr in required_attrs):
+        return mlp
+    return None
+
+
+def _get_ebss_count_device(mlp):
+    top_cnt = getattr(mlp, "top_cnt", None)
+    if isinstance(top_cnt, torch.Tensor):
+        return top_cnt.device
+    first_param = next(mlp.parameters(), None)
+    if first_param is not None:
+        return first_param.device
+    return torch.device("cpu")
+
 def _beam_search_ebss(
         self,
         input_ids: torch.LongTensor,
@@ -154,9 +174,12 @@ def _beam_search_ebss(
          # init expert cnt
         num_layers = self.model.config.num_hidden_layers
         num_experts = self.model.config.num_experts
-        expert_cnt = torch.zeros(num_layers,num_beams,num_experts)
+        expert_cnt = [None] * num_layers
         for layer_num in range(0,num_layers):
-            self.model.layers[layer_num].mlp.save_expert_cnt=True
+            mlp = _get_ebss_moe_mlp(self.model, layer_num)
+            if mlp is not None:
+                mlp.save_expert_cnt = True
+                expert_cnt[layer_num] = torch.zeros(num_beams, num_experts, device=_get_ebss_count_device(mlp))
         # 4. run the generation loop
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # a. Forward current tokens, obtain the logits
@@ -164,12 +187,12 @@ def _beam_search_ebss(
             model_inputs = self.prepare_inputs_for_generation(flat_running_sequences, **model_kwargs)
             model_outputs = self(**model_inputs, return_dict=True)
             for layer_num in range(0,num_layers):
-                expert_dist = self.model.layers[layer_num].mlp.top_cnt
+                mlp = _get_ebss_moe_mlp(self.model, layer_num)
+                if mlp is None or expert_cnt[layer_num] is None or mlp.top_cnt is None:
+                    continue
+                expert_dist = mlp.top_cnt.to(expert_cnt[layer_num].device)
                 # expert_dist = top_cnt.sum(dim=0)#,keepdim=True)
                 expert_cnt[layer_num] += expert_dist
-            layer_vars = torch.var(expert_cnt, dim=-1)
-            expert_scores = torch.mean(layer_vars, dim=0)
-            expert_scores = expert_scores/(expert_scores.sum())
 
             # synced_gpus: don't waste resources running the code we don't need; kwargs must be updated before skipping
             model_kwargs = self._update_model_kwargs_for_generation(
@@ -182,6 +205,20 @@ def _beam_search_ebss(
 
             # Copy is needed to avoid keeping a hanging ref
             logits = model_outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
+            expert_scores = torch.zeros(num_beams, dtype=torch.float32, device=logits.device)
+            active_layers = 0
+            for layer_cnt in expert_cnt:
+                if layer_cnt is None:
+                    continue
+                expert_scores += torch.var(layer_cnt, dim=-1).to(logits.device)
+                active_layers += 1
+            if active_layers > 0:
+                expert_scores = expert_scores / active_layers
+                expert_score_sum = expert_scores.sum()
+                if expert_score_sum > 0:
+                    expert_scores = expert_scores / expert_score_sum
+                else:
+                    expert_scores.zero_()
 
             # b. Compute log probs -- get log probabilities from logits, process logits with processors (*e.g.*
             # `temperature`, ...), and add new logprobs to existing running logprobs scores.
@@ -222,7 +259,9 @@ def _beam_search_ebss(
             log_probs = torch.reshape(log_probs, (batch_size, num_beams * vocab_size))
 
             for layer_num in range(0,num_layers):
-                self.model.layers[layer_num].mlp.clear_expert_cnt()
+                mlp = _get_ebss_moe_mlp(self.model, layer_num)
+                if mlp is not None:
+                    mlp.clear_expert_cnt()
             # c. Retrieve top-K continuations, i.e. select the next token (greedy or sampling) and then keep the best
             # continuations among all beams based on the accumulated scores.
             topk_log_probs, topk_running_sequences, topk_running_beam_indices = self._get_top_k_continuations(
@@ -286,7 +325,12 @@ def _beam_search_ebss(
                     model_kwargs["past_key_values"] = self._reorder_cache(model_kwargs["past_key_values"], beam_idx)
                 else:
                     model_kwargs["past_key_values"].reorder_cache(beam_idx)
-                expert_cnt = expert_cnt.index_select(1, beam_idx.cpu())
+                for layer_num in range(0, num_layers):
+                    if expert_cnt[layer_num] is None:
+                        continue
+                    expert_cnt[layer_num] = expert_cnt[layer_num].index_select(
+                        0, beam_idx.to(expert_cnt[layer_num].device)
+                    )
 
             cur_len = cur_len + 1
             is_early_stop_heuristic_unsatisfied = self._check_early_stop_heuristic(
@@ -317,7 +361,9 @@ def _beam_search_ebss(
         # step. We can use it to detect the generated length, which may be != `cur_len`  (e.g. selected beam is from a
         # previous decoding iteration)
         for layer_num in range(0,num_layers):
-            self.model.layers[layer_num].mlp.save_expert_cnt=False
+            mlp = _get_ebss_moe_mlp(self.model, layer_num)
+            if mlp is not None:
+                mlp.save_expert_cnt = False
         max_generated_length = ((beam_indices + 1).bool()).sum(dim=1).max()
         output_length = decoder_prompt_len + max_generated_length
         sequences = sequences[:, :output_length]
