@@ -7,12 +7,14 @@ import argparse
 import logging
 import os
 import random
+from datetime import datetime
 
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from gptqmodel import GPTQModel, QuantizeConfig
+from gptqmodel.quantization.config import ExpertsRoutingBypass, ExpertsRoutingOverride, MoEConfig
 
 
 def get_wikitext2(nsamples, seqlen):
@@ -61,21 +63,71 @@ def build_chat_inputs(tokenizer, prompt: str, device: str):
     return tokenizer(text, return_tensors="pt").to(device)
 
 
+def build_moe_config(args):
+    if args.moe_routing == "none":
+        return None
+
+    if args.moe_routing == "bypass":
+        return MoEConfig(routing=ExpertsRoutingBypass(batch_size=args.moe_routing_batch_size))
+
+    return MoEConfig(routing=ExpertsRoutingOverride(num_experts_per_tok=args.moe_num_experts_per_tok))
+
+
+def build_dynamic_quant_config(args):
+    return {
+        r".*\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$": {"bits": args.self_attn_bits},
+        r".*\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$": {"bits": args.expert_bits},
+        r".*\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)$": {"bits": args.shared_expert_bits},
+    }
+
+
+def build_default_output_dir(args):
+    model_name = os.path.basename(os.path.normpath(args.model))
+    bit_profile = f"attn{args.self_attn_bits}-expert{args.expert_bits}-shared{args.shared_expert_bits}-base{args.bits}"
+    time_suffix = datetime.now().strftime("%m%d%H")
+    return os.path.join("work_dirs", f"{model_name}-gptq-{bit_profile}-{args.group_size}g_{time_suffix}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Qwen3.5-MoE GPTQ quantization + generation validation")
     parser.add_argument("--model", type=str, default="/data02/datasets/Qwen3.5-35B-A3B", help="fp model path")
     parser.add_argument(
         "--out",
         type=str,
-        default="/data02/datasets/Qwen3.5-35B-A3B-gptq-4bit",
-        help="quantized model output directory",
+        default=None,
+        help=(
+            "quantized model output directory, defaults to "
+            "work_dirs/<model>-gptq-attn<self-attn>-expert<expert>-shared<shared>-base<bits>-<group_size>g"
+        ),
     )
     parser.add_argument("--bits", type=int, default=4, choices=[2, 3, 4, 5, 8])
+    parser.add_argument(
+        "--self-attn-bits",
+        type=int,
+        default=8,
+        choices=[2, 3, 4, 5, 8],
+        help="bit width for self-attn q/k/v/o projections",
+    )
+    parser.add_argument(
+        "--expert-bits",
+        "--non-shared-expert-bits",
+        type=int,
+        default=4,
+        choices=[2, 3, 4, 5, 8],
+        help="bit width for non-shared MoE experts",
+    )
+    parser.add_argument(
+        "--shared-expert-bits",
+        type=int,
+        default=4,
+        choices=[2, 3, 4, 5, 8],
+        help="bit width for shared MoE expert",
+    )
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--nsamples", type=int, default=256)
+    parser.add_argument("--nsamples", type=int, default=32)
     parser.add_argument("--seqlen", type=int, default=1024, help="minimum sequence length for wikitext2 filtering")
-    parser.add_argument("--device", type=str, default="cuda:1", help="quantization device")
+    parser.add_argument("--device", type=str, default="cuda:0", help="quantization device")
     parser.add_argument("--infer-device", type=str, default=None, help="inference device after quantization")
     parser.add_argument("--offload-to-disk", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -95,6 +147,31 @@ def parse_args():
         help="可选 QuaRot 旋转模式",
     )
     parser.add_argument(
+        "--hessian-mse",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable Hessian MSE assisted optimization",
+    )
+    parser.add_argument(
+        "--moe-routing",
+        type=str,
+        default="none",
+        choices=["none", "bypass", "override"],
+        help="MoE routing mode: none keeps model routing, bypass forwards calibration to all experts, override forces top-k routing",
+    )
+    parser.add_argument(
+        "--moe-routing-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for bypass routing to reduce VRAM pressure",
+    )
+    parser.add_argument(
+        "--moe-num-experts-per-tok",
+        type=str,
+        default="all",
+        help="Override top-k experts per token when --moe-routing=override; accepts a positive integer or 'all'",
+    )
+    parser.add_argument(
         "--skip-quantize",
         action="store_true",
         default=False,
@@ -106,6 +183,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.out = args.out or build_default_output_dir(args)
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -117,11 +195,23 @@ def main():
         calibration_dataset = get_wikitext2(nsamples=args.nsamples, seqlen=args.seqlen)
         print(f"[1/5] Calibration samples (wikitext2): {len(calibration_dataset)}")
 
+        moe_config = build_moe_config(args)
+        dynamic_config = build_dynamic_quant_config(args)
+
+        print(
+            "[config] bits: "
+            f"base={args.bits}, self_attn={args.self_attn_bits}, "
+            f"expert={args.expert_bits}, shared_expert={args.shared_expert_bits}"
+        )
+
         quantize_config = QuantizeConfig(
             bits=args.bits,
+            dynamic=dynamic_config,
             group_size=args.group_size,
             device=args.device,
             rotation=args.rotation,
+            hessian_mse=args.hessian_mse,
+            moe=moe_config,
             offload_to_disk=args.offload_to_disk,
             offload_to_disk_path=args.offload_path if args.offload_to_disk else None,
         )

@@ -499,7 +499,22 @@ def rotate_qwen3_vl_vision_embeddings(model, Q, device) -> None:
 
 
 def get_embeddings(model) -> list[torch.nn.Module]:
-    return [model.model.embed_tokens]
+    candidates = [
+        ("model", "embed_tokens"),
+        ("language_model", "embed_tokens"),
+        ("model", "language_model", "embed_tokens"),
+    ]
+
+    for path in candidates:
+        current = model
+        for attr in path:
+            current = getattr(current, attr, None)
+            if current is None:
+                break
+        if current is not None:
+            return [current]
+
+    raise AttributeError(f"Unable to locate embed_tokens module for rotation on model type {type(model).__name__}")
 
 
 def rotate_embeddings(model, Q, device) -> None:

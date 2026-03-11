@@ -194,3 +194,4 @@ gptqmodel/quantization/diceq/DICEQuant
 .trae
 workdirs
 outputs-evalscope
+gptqmodel_offload_*

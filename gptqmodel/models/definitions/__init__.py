@@ -118,7 +118,7 @@ from .qwen2_moe import Qwen2MoeQModel
 from .qwen2_vl import Qwen2VLQModel
 from .qwen3 import Qwen3QModel
 from .qwen3_5 import Qwen3_5QModel
-from .qwen3_5_moe import Qwen3_5MoeQModel
+from .qwen3_5_moe import Qwen3_5_MoeQModel,Qwen3_5MoeQModel
 from .qwen3_moe import Qwen3MoeQModel
 from .qwen3_vl import Qwen3_VLQModel
 from .rw import RwgQModel

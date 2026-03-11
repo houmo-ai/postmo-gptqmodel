@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Optional
 import torch
 from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeSparseMoeBlock
+import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as qwen3_5_moe_modeling
 
 from gptqmodel.models import BaseQModel
 
@@ -27,8 +28,10 @@ from gptqmodel.looper.module_looper import ModuleLooper
 from gptqmodel.looper.named_module import NamedModule
 from gptqmodel.looper.stage_subset import run_subset_stage
 from gptqmodel.models.definitions.qwen2_moe import Qwen2MoeQModel
+from gptqmodel.models.definitions.qwen3_5_moe import Qwen3_5_MoeQModel
 from gptqmodel.models.definitions.qwen3_moe import Qwen3MoeQModel
 from gptqmodel.nn_modules.hooked_linear import replace_module_with_hooked_legacy
+from gptqmodel.nn_modules.converter import Qwen3_5MoeExpertsNew
 from gptqmodel.quantization import FORMAT, METHOD
 from gptqmodel.quantization.config import QuantizeConfig, VramStrategy
 from gptqmodel.utils.model import find_modules, get_module_by_name_prefix
@@ -109,6 +112,65 @@ def test_qwen2_moe_shared_expert_merges_with_experts():
 
     expert_gate_blocks = [block for block in blocks if "mlp.experts.{expert_index}.gate_proj" in block]
     assert len(expert_gate_blocks) == 1
+
+
+def test_qwen3_5_moe_shared_expert_merges_with_experts():
+    blocks = Qwen3_5_MoeQModel.build_layer_modules(Qwen3_5_MoeQModel.module_tree)
+
+    gate_block = next(block for block in blocks if "mlp.shared_expert.gate_proj" in block)
+    assert gate_block == ["mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj"]
+
+    down_block = next(block for block in blocks if "mlp.shared_expert.down_proj" in block)
+    assert down_block == ["mlp.shared_expert.down_proj"]
+
+    expert_gate_block = next(block for block in blocks if "mlp.experts.{expert_index}.gate_proj" in block)
+    assert expert_gate_block == ["mlp.experts.{expert_index}.gate_proj", "mlp.experts.{expert_index}.up_proj"]
+
+    expert_down_block = next(block for block in blocks if "mlp.experts.{expert_index}.down_proj" in block)
+    assert expert_down_block == ["mlp.experts.{expert_index}.down_proj"]
+
+
+def test_qwen3_5_moe_converter_uses_expert_index_first_layout():
+    config = SimpleNamespace(
+        num_experts=4,
+        hidden_size=16,
+        moe_intermediate_size=32,
+        hidden_act="silu",
+        torch_dtype=torch.float32,
+    )
+
+    experts = Qwen3_5MoeExpertsNew(config)
+    names = {name for name, _ in experts.named_modules() if name}
+
+    assert len(experts) == 4
+    assert "0.gate_proj" in names
+    assert "0.up_proj" in names
+    assert "0.down_proj" in names
+    assert "gate_proj.0" not in names
+    assert "up_proj.0" not in names
+    assert "down_proj.0" not in names
+
+
+def test_qwen3_5_moe_before_model_load_patches_quantized_shell_layout():
+    original_experts_cls = qwen3_5_moe_modeling.Qwen3_5MoeExperts
+    original_init = qwen3_5_moe_modeling.Qwen3_5MoePreTrainedModel._init_weights
+    original_flag = getattr(qwen3_5_moe_modeling, "_gptqmodel_qwen35_skip_expert_init", False)
+
+    try:
+        if hasattr(qwen3_5_moe_modeling, "_gptqmodel_qwen35_skip_expert_init"):
+            delattr(qwen3_5_moe_modeling, "_gptqmodel_qwen35_skip_expert_init")
+
+        Qwen3_5_MoeQModel.before_model_load(Qwen3_5_MoeQModel, load_quantized_model=True)
+
+        assert qwen3_5_moe_modeling.Qwen3_5MoeExperts is Qwen3_5MoeExpertsNew
+        assert getattr(qwen3_5_moe_modeling, "_gptqmodel_qwen35_skip_expert_init", False) is True
+    finally:
+        qwen3_5_moe_modeling.Qwen3_5MoeExperts = original_experts_cls
+        qwen3_5_moe_modeling.Qwen3_5MoePreTrainedModel._init_weights = original_init
+        if original_flag:
+            qwen3_5_moe_modeling._gptqmodel_qwen35_skip_expert_init = original_flag
+        elif hasattr(qwen3_5_moe_modeling, "_gptqmodel_qwen35_skip_expert_init"):
+            delattr(qwen3_5_moe_modeling, "_gptqmodel_qwen35_skip_expert_init")
 
 
 def test_awq_processor_enables_subset_early_stop():

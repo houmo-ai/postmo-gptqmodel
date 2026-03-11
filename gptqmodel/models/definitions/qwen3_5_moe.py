@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: 2024-2025 qubitium@modelcloud.ai
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
-
 from transformers.models.auto import AutoModelForImageTextToText
 
 from gptqmodel.models.moe_lifecycle import GateUpDownMoELifecycleHooks
@@ -10,7 +9,7 @@ from gptqmodel.models.moe_lifecycle import GateUpDownMoELifecycleHooks
 from ..base import BaseQModel
 
 
-class Qwen3_5MoeQModel(BaseQModel):
+class Qwen3_5_MoeQModel(BaseQModel):
     loader = AutoModelForImageTextToText
 
     layer_modules_strict = False
@@ -24,8 +23,10 @@ class Qwen3_5MoeQModel(BaseQModel):
     pre_lm_head_norm_module = "model.norm"
 
     awq_scale_optimize_shape_dependent_modules = ["self_attn.o_proj", "linear_attn.out_proj"]
+    # awq scaling optimizations requires some modules within same subset to strictly match the shape of previous module
+    # the o_proj must match v_proj or else scaling optimizations are skipped (GQA vs MHA)
 
-    # MoE lifecycle hooks for gate_proj/up_proj/down_proj pattern.
+    # MoE lifecycle hooks for gate_proj/up_proj/down_proj pattern
     moe_lifecycle_hooks = GateUpDownMoELifecycleHooks()
 
     module_tree = [
@@ -35,19 +36,11 @@ class Qwen3_5MoeQModel(BaseQModel):
         "#",
         {
             "input_layernorm": ("input_layernorm:!",),
-            "self_attn": (
-                "norm:!",
-                "q_proj:0",
-                "k_proj:0",
-                "v_proj:0",
-                "o_proj:1",
-            ),
+            "self_attn": ("norm:!", "q_proj:0", "k_proj:0", "v_proj:0", "o_proj:1"),
             "linear_attn": (
                 "norm:!",
                 "in_proj_qkv:0",
                 "in_proj_z:1",
-                "in_proj_b:!",
-                "in_proj_a:!",
                 "out_proj:2",
             ),
             "post_attention_layernorm": ("post_attention_layernorm:!",),
@@ -61,28 +54,6 @@ class Qwen3_5MoeQModel(BaseQModel):
             },
         },
     ]
-
-    def __init__(self, *args, **kwargs):
-        model = kwargs.get("model")
-        if model is None and args:
-            model = args[0]
-        self._sync_text_config_attrs(model)
-        super().__init__(*args, **kwargs)
-
-    @staticmethod
-    def _sync_text_config_attrs(model):
-        if model is None:
-            return
-        cfg = getattr(model, "config", None)
-        text_cfg = getattr(cfg, "text_config", None) if cfg is not None else None
-        if cfg is None or text_cfg is None:
-            return
-
-        for key in ("bos_token_id", "eos_token_id", "pad_token_id", "vocab_size"):
-            if hasattr(text_cfg, key):
-                value = getattr(text_cfg, key)
-                if value is not None:
-                    setattr(cfg, key, value)
 
     def before_model_load(self, load_quantized_model=False):
         import transformers.models.qwen3_5_moe.configuration_qwen3_5_moe as qwen3_5_moe_config
@@ -112,26 +83,23 @@ class Qwen3_5MoeQModel(BaseQModel):
 
             qwen3_5_moe_config._gptqmodel_qwen35_cfg_bridge = True
 
-        # from_quantized() builds model from config and must instantiate the converted expert layout.
-        if load_quantized_model:
-            import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as qwen3_5_moe_modeling
+    #     if load_quantized_model:
+    #         import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as qwen3_5_moe_modeling
 
-            from ...nn_modules.converter import Qwen3_5MoeExpertsNew
+    #         from ...nn_modules.converter import Qwen3_5MoeExpertsNew
 
-            qwen3_5_moe_modeling.Qwen3_5MoeExperts = Qwen3_5MoeExpertsNew
+    #         qwen3_5_moe_modeling.Qwen3_5MoeExperts = Qwen3_5MoeExpertsNew
 
-            # In quantized loading path we construct from config and then load packed weights;
-            # expert tensors do not need random initialization.
-            if not getattr(qwen3_5_moe_modeling, "_gptqmodel_qwen35_skip_expert_init", False):
-                original_init_weights = qwen3_5_moe_modeling.Qwen3_5MoePreTrainedModel._init_weights
+    #         if not getattr(qwen3_5_moe_modeling, "_gptqmodel_qwen35_skip_expert_init", False):
+    #             original_init_weights = qwen3_5_moe_modeling.Qwen3_5MoePreTrainedModel._init_weights
 
-                def _patched_init_weights(model_self, module):
-                    if isinstance(module, Qwen3_5MoeExpertsNew):
-                        return
-                    return original_init_weights(model_self, module)
+    #             def _patched_init_weights(model_self, module):
+    #                 if isinstance(module, Qwen3_5MoeExpertsNew):
+    #                     return
+    #                 return original_init_weights(model_self, module)
 
-                qwen3_5_moe_modeling.Qwen3_5MoePreTrainedModel._init_weights = _patched_init_weights
-                qwen3_5_moe_modeling._gptqmodel_qwen35_skip_expert_init = True
+    #             qwen3_5_moe_modeling.Qwen3_5MoePreTrainedModel._init_weights = _patched_init_weights
+    #             qwen3_5_moe_modeling._gptqmodel_qwen35_skip_expert_init = True
 
 
-Qwen3_5_MoeQModel = Qwen3_5MoeQModel
+Qwen3_5MoeQModel = Qwen3_5_MoeQModel

@@ -27,19 +27,21 @@ def _resolve_dtype_from_config(config):
     return None
 
 
-class Qwen3_5MoeExpertsNew(nn.Module):
-    """Qwen3.5-MoE experts rewritten as per-expert Linear modules for GPTQ."""
+class Qwen3_5MoeExpertsNew(nn.ModuleList):
+    """Qwen3.5-MoE experts rewritten as per-expert Linear modules for GPTQ.
+
+    Layout: experts[i].gate_proj / up_proj / down_proj  (expert-index-first),
+    matching the standard MoE convention used by lifecycle hooks and module_tree.
+    """
 
     def __init__(self, config, ori_experts=None):
         super().__init__()
         self.num_experts = config.num_experts
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.moe_intermediate_size
-        self.act_fn = ACT2FN[config.hidden_act]
-
-        self.gate_proj = nn.ModuleList()
-        self.up_proj = nn.ModuleList()
-        self.down_proj = nn.ModuleList()
+        # Store act_fn in __dict__ directly so it is NOT registered as a child
+        # module of the ModuleList – this keeps the integer indices clean.
+        self.__dict__["act_fn"] = ACT2FN[config.hidden_act]
 
         dtype = _resolve_dtype_from_config(config)
         linear_kwargs = {"bias": False}
@@ -50,25 +52,39 @@ class Qwen3_5MoeExpertsNew(nn.Module):
             linear_kwargs["dtype"] = dtype
 
         for _ in range(self.num_experts):
-            self.gate_proj.append(nn.Linear(self.hidden_dim, self.intermediate_dim, **linear_kwargs))
-            self.up_proj.append(nn.Linear(self.hidden_dim, self.intermediate_dim, **linear_kwargs))
-            self.down_proj.append(nn.Linear(self.intermediate_dim, self.hidden_dim, **linear_kwargs))
+            expert = nn.Module()
+            expert.gate_proj = nn.Linear(self.hidden_dim, self.intermediate_dim, **linear_kwargs)
+            expert.up_proj = nn.Linear(self.hidden_dim, self.intermediate_dim, **linear_kwargs)
+            expert.down_proj = nn.Linear(self.intermediate_dim, self.hidden_dim, **linear_kwargs)
+            self.append(expert)
 
         if ori_experts is not None:
             self._load_from_original(ori_experts)
 
     def _load_from_original(self, ori_experts) -> None:
         with torch.no_grad():
+            # Check if experts were already defused (e.g. by defuser library)
+            # into per-expert containers with separate gate_proj/up_proj/down_proj
+            defused = getattr(ori_experts, "_unfused_experts", False) or hasattr(ori_experts, "0")
+
             for i in range(self.num_experts):
-                gate_up = ori_experts.gate_up_proj[i].detach()
-                down = ori_experts.down_proj[i].detach()
+                if defused:
+                    # Defused format: numbered children with separate Linear layers
+                    src_expert = getattr(ori_experts, str(i))
+                    self[i].gate_proj.weight = nn.Parameter(src_expert.gate_proj.weight.detach())
+                    self[i].up_proj.weight = nn.Parameter(src_expert.up_proj.weight.detach())
+                    self[i].down_proj.weight = nn.Parameter(src_expert.down_proj.weight.detach())
+                else:
+                    # Fused format: gate_up_proj (num_experts, 2*intermediate, hidden)
+                    gate_up = ori_experts.gate_up_proj[i].detach()
+                    down = ori_experts.down_proj[i].detach()
 
-                gate_weight = gate_up[: self.intermediate_dim, :]
-                up_weight = gate_up[self.intermediate_dim :, :]
+                    gate_weight = gate_up[: self.intermediate_dim, :]
+                    up_weight = gate_up[self.intermediate_dim :, :]
 
-                self.gate_proj[i].weight = nn.Parameter(gate_weight)
-                self.up_proj[i].weight = nn.Parameter(up_weight)
-                self.down_proj[i].weight = nn.Parameter(down)
+                    self[i].gate_proj.weight = nn.Parameter(gate_weight)
+                    self[i].up_proj.weight = nn.Parameter(up_weight)
+                    self[i].down_proj.weight = nn.Parameter(down)
 
     def forward(
         self,
@@ -90,9 +106,10 @@ class Qwen3_5MoeExpertsNew(nn.Module):
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
 
-            current_hidden_states = self.act_fn(self.gate_proj[expert_idx](current_state))
-            current_hidden_states = current_hidden_states * self.up_proj[expert_idx](current_state)
-            current_hidden_states = self.down_proj[expert_idx](current_hidden_states)
+            expert = self[expert_idx]
+            current_hidden_states = self.act_fn(expert.gate_proj(current_state))
+            current_hidden_states = current_hidden_states * expert.up_proj(current_state)
+            current_hidden_states = expert.down_proj(current_hidden_states)
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
 
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
@@ -229,7 +246,7 @@ def convert_glm4v_mlp_converter(module, config):
 MODULE_CONVERTER_MAP = {
     "llama4": convert_llama4_expert_converter,
     "gpt_oss": convert_gpt_oss_expert_converter,
-    "qwen3_5_moe": convert_qwen3_5_moe_expert_converter,
-    "qwen3_5_moe_text": convert_qwen3_5_moe_expert_converter,
+    # "qwen3_5_moe": convert_qwen3_5_moe_expert_converter,
+    # "qwen3_5_moe_text": convert_qwen3_5_moe_expert_converter,
     "glm4v": convert_glm4v_mlp_converter,
 }
