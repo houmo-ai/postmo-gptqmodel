@@ -193,5 +193,7 @@ diceq_tmp
 gptqmodel/quantization/diceq/DICEQuant
 .trae
 workdirs
+.worktrees/
 outputs-evalscope
 gptqmodel_offload_*
+GPTQModel
