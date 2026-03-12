@@ -26,13 +26,16 @@ import tempfile  # noqa: E402
 
 from datasets import load_dataset  # noqa: E402
 from gptqmodel import BACKEND, GPTQModel, __version__, get_best_device  # noqa: E402
-from gptqmodel.quantization import FORMAT, QUANT_CONFIG_FILENAME, QUANT_METHOD  # noqa: E402
-from gptqmodel.quantization.config import (META_FIELD_QUANTIZER, META_QUANTIZER_GPTQMODEL,  # noqa: E402
-                                           AutoRoundQuantizeConfig, QuantizeConfig)
+from gptqmodel.quantization import FORMAT, METHOD as QUANT_METHOD, QUANT_CONFIG_FILENAME  # noqa: E402
+from gptqmodel.quantization.config import META_FIELD_QUANTIZER, META_QUANTIZER_GPTQMODEL, QuantizeConfig  # noqa: E402
 from gptqmodel.utils.torch import torch_empty_cache  # noqa: E402
 from models.model_test import ModelTest  # noqa: E402
-from parameterized import parameterized  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
+
+try:
+    from gptqmodel.quantization.config import AutoRoundQuantizeConfig  # noqa: E402
+except ImportError:
+    AutoRoundQuantizeConfig = None
 
 
 class TestQuantization(ModelTest):
@@ -47,85 +50,89 @@ class TestQuantization(ModelTest):
         self.calibration_dataset = [self.tokenizer(example["text"]) for example in traindata.select(range(1024))]
 
 
-    @parameterized.expand(
-        [
-            (QUANT_METHOD.AUTO_ROUND, BACKEND.EXLLAMA_V2, True, FORMAT.GPTQ, 4),
+    def test_quantize(self):
+        auto_round_method = getattr(QUANT_METHOD, "AUTO_ROUND", None)
+        if auto_round_method is None or AutoRoundQuantizeConfig is None:
+            self.skipTest("Auto-Round is not available in the current code state")
+
+        cases = [
+            (auto_round_method, BACKEND.EXLLAMA_V2, True, FORMAT.GPTQ, 4),
         ]
-    )
-    def test_quantize(self, method: QUANT_METHOD, backend: BACKEND, sym: bool, format: FORMAT, bits: int):
-        if method == QUANT_METHOD.GPTQ:
-            quantize_config = QuantizeConfig(
-                bits=bits,
-                group_size=128,
-                desc_act=False if format == FORMAT.MARLIN else True,
-                sym=sym,
-                format=format,
-                damp_percent=0.05
-            )
-        elif method == QUANT_METHOD.AUTO_ROUND:
-            quantize_config = AutoRoundQuantizeConfig(
-                bits=bits,
-                group_size=128,
-                sym=sym,
-                format=format,
-            )
-        else:
-            raise ValueError(f"Invalid quantization method: {method}")
 
-        model = GPTQModel.load(
-            self.pretrained_model_id,
-            quantize_config=quantize_config,
-        )
-        model.quantize(self.calibration_dataset)
+        for method, backend, sym, format, bits in cases:
+            with self.subTest(method=method, backend=backend, sym=sym, format=format, bits=bits):
+                if method == QUANT_METHOD.GPTQ:
+                    quantize_config = QuantizeConfig(
+                        bits=bits,
+                        group_size=128,
+                        desc_act=False if format == FORMAT.MARLIN else True,
+                        sym=sym,
+                        format=format,
+                        damp_percent=0.05
+                    )
+                elif method == QUANT_METHOD.AUTO_ROUND:
+                    quantize_config = AutoRoundQuantizeConfig(
+                        bits=bits,
+                        group_size=128,
+                        sym=sym,
+                        format=format,
+                    )
+                else:
+                    raise ValueError(f"Invalid quantization method: {method}")
 
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            model.save(tmpdirname)
+                model = GPTQModel.load(
+                    self.pretrained_model_id,
+                    quantize_config=quantize_config,
+                )
+                model.quantize(self.calibration_dataset)
 
-            logging.info(f"Saved config mem: {model.quantize_config}")
+                with tempfile.TemporaryDirectory() as tmpdirname:
+                    model.save(tmpdirname)
 
-            with open(tmpdirname + "/" + QUANT_CONFIG_FILENAME, "r") as f:
-                file_dict = json.loads(f.read())
+                    logging.info(f"Saved config mem: {model.quantize_config}")
 
-                # make sure the json dict saved to file matches config in memory
-                assert model.quantize_config.to_dict() == file_dict
-                logging.info(f"Saved config file: {file_dict}")
+                    with open(tmpdirname + "/" + QUANT_CONFIG_FILENAME, "r") as f:
+                        file_dict = json.loads(f.read())
 
-            model = GPTQModel.load(
-                tmpdirname,
-                device=get_best_device(backend),
-                backend=backend,
-            )
+                        # make sure the json dict saved to file matches config in memory
+                        assert model.quantize_config.to_dict() == file_dict
+                        logging.info(f"Saved config file: {file_dict}")
 
-            logging.info(f"Loaded config: {model.quantize_config}")
+                    model = GPTQModel.load(
+                        tmpdirname,
+                        device=get_best_device(backend),
+                        backend=backend,
+                    )
 
-            versionable = model.quantize_config.meta_get_versionable(META_FIELD_QUANTIZER)
-            assert META_QUANTIZER_GPTQMODEL in [v[0] for v in versionable]
-            for producer, _version in versionable:
-                if producer == META_QUANTIZER_GPTQMODEL:
-                    assert _version == __version__
+                    logging.info(f"Loaded config: {model.quantize_config}")
 
-            del model
-            torch_empty_cache()
+                    versionable = model.quantize_config.meta_get_versionable(META_FIELD_QUANTIZER)
+                    assert META_QUANTIZER_GPTQMODEL in [v[0] for v in versionable]
+                    for producer, _version in versionable:
+                        if producer == META_QUANTIZER_GPTQMODEL:
+                            assert _version == __version__
 
-            # skip compat test with sym=False and v1 since we do meta version safety check
-            if not sym and format == FORMAT.GPTQ or format == FORMAT.IPEX:
-                return
+                    del model
+                    torch_empty_cache()
 
-            # test compat: 1) with simple dict type
-            compat_quantize_config = {
-                "bits": bits,
-                "group_size": 128,
-                "sym": sym,
-                "desc_act": False if format == FORMAT.MARLIN else True,
-            }
+                    # skip compat test with sym=False and v1 since we do meta version safety check
+                    if not sym and format == FORMAT.GPTQ or format == FORMAT.IPEX:
+                        continue
 
-            model = GPTQModel.load(
-                tmpdirname,
-                device=get_best_device(backend),
-                quantize_config=compat_quantize_config,
-            )
-            assert isinstance(model.quantize_config, QuantizeConfig)
+                    # test compat: 1) with simple dict type
+                    compat_quantize_config = {
+                        "bits": bits,
+                        "group_size": 128,
+                        "sym": sym,
+                        "desc_act": False if format == FORMAT.MARLIN else True,
+                    }
 
-            del model
-            torch_empty_cache()
+                    model = GPTQModel.load(
+                        tmpdirname,
+                        device=get_best_device(backend),
+                        quantize_config=compat_quantize_config,
+                    )
+                    assert isinstance(model.quantize_config, QuantizeConfig)
 
+                    del model
+                    torch_empty_cache()

@@ -95,6 +95,26 @@ def _fuse_norm_into_tensor_last_dim(layernorm: torch.nn.Module, tensor: torch.nn
     tensor.data = (tensor.data.double() * scale).to(dtype)
 
 
+def _fuse_pre_head_norm_if_present(
+    model: PreTrainedModel,
+    pre_lm_head_norm_module_name: str,
+    lm_head_name: str,
+) -> None:
+    if not pre_lm_head_norm_module_name:
+        return
+
+    pre_head_layernorm, _ = get_module_by_name_prefix(model, pre_lm_head_norm_module_name)
+    if pre_head_layernorm is None:
+        log.warn(
+            f"Rotation: skip pre-lm-head norm fusion because `{pre_lm_head_norm_module_name}` was not found."
+        )
+        return
+
+    lm_head, _ = get_module_by_name_prefix(model, lm_head_name)
+    _fuse_norm_into_linears(pre_head_layernorm, [lm_head])
+    _reset_norm_for_fusion(pre_head_layernorm)
+
+
 def fuse_merger_linear(
     layernorm: torch.nn.Module, linear_layers: typing.Iterable[torch.nn.Linear]
 ) -> None:
@@ -258,10 +278,7 @@ def fuse_layer_norms_qwen3_5_moe(
         _reset_norm_for_fusion(post_ln)
         _reset_norm_for_fusion(input_ln)
 
-    pre_head_layernorm, _ = get_module_by_name_prefix(model, pre_lm_head_norm_module_name)
-    lm_head, _ = get_module_by_name_prefix(model, lm_head_name)
-    _fuse_norm_into_linears(pre_head_layernorm, [lm_head])
-    _reset_norm_for_fusion(pre_head_layernorm)
+    _fuse_pre_head_norm_if_present(model, pre_lm_head_norm_module_name, lm_head_name)
 
     return model
 
@@ -307,10 +324,7 @@ def fuse_layer_norms_qwen3_5(
         _reset_norm_for_fusion(post_ln)
         _reset_norm_for_fusion(input_ln)
 
-    pre_head_layernorm, _ = get_module_by_name_prefix(model, pre_lm_head_norm_module_name)
-    lm_head, _ = get_module_by_name_prefix(model, lm_head_name)
-    _fuse_norm_into_linears(pre_head_layernorm, [lm_head])
-    _reset_norm_for_fusion(pre_head_layernorm)
+    _fuse_pre_head_norm_if_present(model, pre_lm_head_norm_module_name, lm_head_name)
 
     return model
 
