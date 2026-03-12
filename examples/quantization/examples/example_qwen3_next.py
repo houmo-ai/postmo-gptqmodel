@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import random
+from contextlib import contextmanager
 from datetime import datetime
 
 import torch
@@ -63,7 +64,7 @@ def build_calibration_dataset(args):
 
 
 @torch.inference_mode()
-def calculate_avg_ppl(model, tokenizer):
+def calculate_avg_ppl(model, tokenizer, device=None):
     from gptqmodel.utils.perplexity import Perplexity
 
     ppl = Perplexity(
@@ -73,6 +74,7 @@ def calculate_avg_ppl(model, tokenizer):
         dataset_name="wikitext-2-raw-v1",
         split="train",
         text_column="text",
+        device=device,
     )
 
     all = ppl.calculate(n_ctx=512, n_batch=512)
@@ -80,6 +82,77 @@ def calculate_avg_ppl(model, tokenizer):
     avg = sum(all) / len(all)
 
     return avg
+
+
+def _get_model_device(model) -> torch.device:
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        device = getattr(model, "device", "cpu")
+        return torch.device(device)
+
+
+@contextmanager
+def temporary_ppl_device(model, target_device: str | None):
+    original_device = _get_model_device(model)
+    active_device = str(original_device)
+    moved = False
+    dispatched = False
+
+    if target_device is None:
+        target_device = str(original_device)
+
+    if original_device.type == "cpu" and target_device != "cpu" and torch.cuda.is_available():
+        if target_device == "auto":
+            if torch.cuda.device_count() > 1:
+                try:
+                    from accelerate import infer_auto_device_map
+                    from accelerate.hooks import remove_hook_from_module
+                    from accelerate.utils import get_balanced_memory
+
+                    from gptqmodel.utils.model import simple_dispatch_model
+
+                    no_split = list(getattr(model, "_no_split_modules", None) or [])
+                    memory_kwargs = {}
+                    if no_split:
+                        memory_kwargs["no_split_module_classes"] = no_split
+
+                    max_memory = get_balanced_memory(model, **memory_kwargs)
+                    device_map = infer_auto_device_map(model, max_memory=max_memory, **memory_kwargs)
+                    print("[ppl] Dispatching model to GPU(s) with accelerate device_map=auto for evaluation ...")
+                    simple_dispatch_model(model, device_map)
+                    active_device = next(
+                        (dev for dev in device_map.values() if dev not in ("cpu", "disk")),
+                        "cuda:0",
+                    )
+                    dispatched = True
+                except Exception as exc:
+                    target_device = "cuda:0"
+                    print(f"[ppl] Accelerate auto dispatch failed ({exc}); falling back to {target_device}.")
+            else:
+                target_device = "cuda:0"
+
+        if not dispatched and target_device != "auto":
+            print(f"[ppl] Moving model from cpu to {target_device} for evaluation ...")
+            model.to(target_device)
+            active_device = target_device
+            moved = True
+
+    try:
+        yield active_device
+    finally:
+        if dispatched:
+            from accelerate.hooks import remove_hook_from_module
+
+            print("[ppl] Moving accelerate-dispatched model back to cpu after evaluation ...")
+            remove_hook_from_module(model, recurse=True)
+            model.to("cpu")
+            model.hf_device_map = {"": "cpu"}
+            torch.cuda.empty_cache()
+        elif moved:
+            print("[ppl] Moving model back to cpu after evaluation ...")
+            model.to("cpu")
+            torch.cuda.empty_cache()
 
 
 def build_chat_inputs(tokenizer, prompt: str, device: str):
@@ -195,7 +268,7 @@ def parse_args():
         default="text",
         help="JSON field name used to read text from --calibration-jsonl",
     )
-    parser.add_argument("--device", type=str, default="cuda:0", help="quantization compute device (single GPU)")
+    parser.add_argument("--device", type=str, default=None, help="quantization compute device (single GPU)")
     parser.add_argument("--infer-device", type=str, default=None, help="inference device after quantization (single GPU)")
     parser.add_argument(
         "--device-map",
@@ -204,7 +277,7 @@ def parse_args():
         choices=["auto", "balanced", "balanced_low_0", "sequential"],
         help="multi-GPU device map strategy; overrides --device/--infer-device when set",
     )
-    parser.add_argument("--offload-to-disk", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--offload-to-disk", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--offload-path",
         type=str,
@@ -220,6 +293,24 @@ def parse_args():
         default=None,
         choices=["random", "hadamard", "block_hadamard"],
         help="可选 QuaRot 旋转模式",
+    )
+    parser.add_argument(
+        "--check-rotation-ppl",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="evaluate wikitext2 perplexity before and after rotation, before quantization starts",
+    )
+    parser.add_argument(
+        "--rotated-out",
+        type=str,
+        default=None,
+        help="optional output dir for the rotated-but-not-yet-quantized fp model",
+    )
+    parser.add_argument(
+        "--stop-after-rotate",
+        action="store_true",
+        default=False,
+        help="apply rotation, optionally save/evaluate it, then exit without quantizing",
     )
     parser.add_argument(
         "--hessian-mse",
@@ -260,6 +351,11 @@ def main():
     args = parse_args()
     args.out = args.out or build_default_output_dir(args)
 
+    if (args.check_rotation_ppl or args.rotated_out or args.stop_after_rotate) and not args.rotation:
+        raise ValueError(
+            "--check-rotation-ppl/--rotated-out/--stop-after-rotate require --rotation to be set."
+        )
+
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -296,6 +392,36 @@ def main():
         if args.device_map:
             load_kwargs["device_map"] = args.device_map
         model = GPTQModel.load(args.model, quantize_config, **load_kwargs)
+
+        rotation_artifact_requested = any(
+            [args.check_rotation_ppl, args.rotated_out is not None, args.stop_after_rotate]
+        )
+        if args.rotation and rotation_artifact_requested:
+            if args.check_rotation_ppl:
+                print("[rotation] Evaluating fp model PPL on wikitext2 before rotation ...")
+                with temporary_ppl_device(model.model, "auto") as ppl_device:
+                    fp_ppl_before = calculate_avg_ppl(model.model, tokenizer, device=ppl_device)
+                print(f"[rotation] FP model avg PPL before rotation: {fp_ppl_before:.4f}")
+
+            print(f"[rotation] Applying {args.rotation} rotation to fp model ...")
+            model.apply_rotation()
+
+            if args.check_rotation_ppl:
+                print("[rotation] Evaluating fp model PPL on wikitext2 after rotation ...")
+                with temporary_ppl_device(model.model, "auto") as ppl_device:
+                    fp_ppl_after = calculate_avg_ppl(model.model, tokenizer, device=ppl_device)
+                print(f"[rotation] FP model avg PPL after rotation: {fp_ppl_after:.4f}")
+                print(f"[rotation] PPL delta: {fp_ppl_after - fp_ppl_before:+.6f}")
+
+            if args.rotated_out:
+                print(f"[rotation] Saving rotated fp model to: {args.rotated_out}")
+                os.makedirs(args.rotated_out, exist_ok=True)
+                model.model.save_pretrained(args.rotated_out)
+                tokenizer.save_pretrained(args.rotated_out)
+
+            if args.stop_after_rotate:
+                print("[rotation] Stop requested after rotation; skipping quantization.")
+                return
 
         print("[3/5] Running GPTQ quantization ...")
         model.quantize(calibration_dataset, batch_size=args.batch_size)

@@ -17,6 +17,12 @@ from .hadamard_utils import apply_exact_had_to_linear, random_hadamard_matrix, r
 
 log = setup_logger()
 
+_ADDITIVE_NORM_CLASSES = {
+    "Qwen3_5MoeRMSNorm",
+    "Qwen3_5RMSNorm",
+    "Qwen3NextRMSNorm",
+}
+
 
 def fuse_ln_linear(
         layernorm: torch.nn.Module, linear_layers: typing.Iterable[torch.nn.Linear]
@@ -57,12 +63,7 @@ def _get_norm_scale(layernorm: torch.nn.Module) -> torch.Tensor:
     uses `(1 + weight) * x`.
     """
     weight = layernorm.weight.data.double()
-    if layernorm.__class__.__name__ in {
-        "Qwen3_5MoeRMSNorm",
-        "Qwen3_5RMSNorm",
-        "Qwen3NextRMSNorm",
-        "Qwen3NextRMSNormGated",
-    }:
+    if layernorm.__class__.__name__ in _ADDITIVE_NORM_CLASSES:
         return 1.0 + weight
     return weight
 
@@ -71,12 +72,7 @@ def _reset_norm_for_fusion(layernorm: torch.nn.Module) -> None:
     """
     Reset a norm module to the identity transform after fusing into linear ops.
     """
-    if layernorm.__class__.__name__ in {
-        "Qwen3_5MoeRMSNorm",
-        "Qwen3_5RMSNorm",
-        "Qwen3NextRMSNorm",
-        "Qwen3NextRMSNormGated",
-    }:
+    if layernorm.__class__.__name__ in _ADDITIVE_NORM_CLASSES:
         layernorm.weight.data.zero_()
         if hasattr(layernorm, "bias"):
             layernorm.bias.data.zero_()
@@ -372,8 +368,12 @@ def fuse_layer_norms_qwen3_next(
                 mlp_inputs.append(mlp.shared_expert_gate)
             experts = getattr(mlp, "experts", None)
             if experts is not None:
-                for expert in experts:
-                    mlp_inputs.extend([expert.gate_proj, expert.up_proj])
+                if hasattr(experts, "gate_up_proj"):
+                    _fuse_norm_into_tensor_last_dim(post_ln, experts.gate_up_proj)
+                else:
+                    for expert in experts:
+                        if hasattr(expert, "gate_proj") and hasattr(expert, "up_proj"):
+                            mlp_inputs.extend([expert.gate_proj, expert.up_proj])
 
         if mlp_inputs:
             _fuse_norm_into_linears(post_ln, mlp_inputs)
@@ -389,10 +389,7 @@ def fuse_layer_norms_qwen3_next(
         _reset_norm_for_fusion(post_ln)
         _reset_norm_for_fusion(input_ln)
 
-    pre_head_layernorm, _ = get_module_by_name_prefix(model, pre_lm_head_norm_module_name)
-    lm_head, _ = get_module_by_name_prefix(model, lm_head_name)
-    _fuse_norm_into_linears(pre_head_layernorm, [lm_head])
-    _reset_norm_for_fusion(pre_head_layernorm)
+    _fuse_pre_head_norm_if_present(model, pre_lm_head_norm_module_name, lm_head_name)
 
     return model
 
@@ -938,8 +935,14 @@ def rotate_mlp_input_qwen3_next(layer, Q, device) -> None:
             mlp_inputs.append(mlp.shared_expert_gate)
         experts = getattr(mlp, "experts", None)
         if experts is not None:
-            for expert in experts:
-                mlp_inputs.extend([expert.gate_proj, expert.up_proj])
+            if hasattr(experts, "gate_up_proj"):
+                dtype = experts.gate_up_proj.dtype
+                gate_up = experts.gate_up_proj.data.to(device=device, dtype=torch.float64)
+                experts.gate_up_proj.data = torch.matmul(gate_up, Q).to(device="cpu", dtype=dtype)
+            else:
+                for expert in experts:
+                    if hasattr(expert, "gate_proj") and hasattr(expert, "up_proj"):
+                        mlp_inputs.extend([expert.gate_proj, expert.up_proj])
 
     for W in mlp_inputs:
         dtype = W.weight.dtype
@@ -957,8 +960,14 @@ def rotate_mlp_output_qwen3_next(layer, Q, device) -> None:
         output_linears.append(mlp.shared_expert.down_proj)
     experts = getattr(mlp, "experts", None)
     if experts is not None:
-        for expert in experts:
-            output_linears.append(expert.down_proj)
+        if hasattr(experts, "down_proj") and isinstance(experts.down_proj, torch.nn.Parameter):
+            dtype = experts.down_proj.dtype
+            down_proj = experts.down_proj.data.to(device=device, dtype=torch.float64)
+            experts.down_proj.data = torch.matmul(Q.T, down_proj).to(device="cpu", dtype=dtype)
+        else:
+            for expert in experts:
+                if hasattr(expert, "down_proj"):
+                    output_linears.append(expert.down_proj)
 
     for W in output_linears:
         dtype = W.weight.data.dtype

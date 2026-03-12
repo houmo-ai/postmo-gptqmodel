@@ -438,6 +438,7 @@ class BaseQModel(nn.Module):
         self._turtle_reload_accum_bytes = 0
         self._turtle_materialized_ids: Set[int] = set()
         self._rotation_preserved_modules: Dict[str, nn.Module] = {}
+        self._rotation_applied = False
 
         self.processor: ProcessorMixin = None
 
@@ -1034,68 +1035,7 @@ class BaseQModel(nn.Module):
                 self.quantize_config.rotation = "hadamard"
 
         if self.quantize_config.rotation:
-            from ..quantization.rotation.model import get_rotation_entry
-            entry = get_rotation_entry(self)
-            if entry is None:
-                from gptqmodel.quantization.rotation.model import MODEL_ROTATION_REGISTRY
-                raise ValueError(
-                    f"rotation only supports: {[e['cls'].__name__ for e in MODEL_ROTATION_REGISTRY]}, "
-                    f"current model is {self.__class__.__name__}"
-                )
-
-            if self.turtle_model is not None:
-                synced = alias_all_from_turtle_if_meta(shell_model=self.model, turtle_model=self.turtle_model)
-                if synced:
-                    log.info("Rotation: synced %s meta leaf modules from turtle model before applying rotation.", synced)
-
-            if self.model.config.tie_word_embeddings:
-                log.info("Rotation requires word embeddings to be untied. Untying.")
-                self.model.config.tie_word_embeddings = False
-                if hasattr(self.model.config, "text_config"):
-                    self.model.config.text_config.tie_word_embeddings = False
-                lm_head, _ = get_module_by_name_prefix(self.model, self.lm_head)
-                lm_head.weight = nn.Parameter(lm_head.weight.data.clone())
-
-            module_name_args = {
-                "layers_node": self.extract_layers_node(),
-                "lm_head_name": self.lm_head
-            }
-            # demo(self.model, self.processor)
-            if self.quantize_config.rotation_vision:
-                self.model = entry["fuse_vision_norm"](model=self.model,
-                                                       pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
-                                                       **module_name_args)
-            self.model = entry["fuse_norm"](model=self.model,
-                                          pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
-                                          **module_name_args)
-            # MPS does not support float64.
-            rotation_device = self.quantize_config.device if self.quantize_config.device != DEVICE.MPS else DEVICE.CPU
-
-            diceq_q = None
-            if hasattr(self, '_run_diceq_pipeline'):
-                diceq_q = self._run_diceq_pipeline(
-                    rotation_device=rotation_device,
-                )
-            # self.model, _ = rotate_model(model=self.model, rotate_mode=self.quantize_config.rotation,
-            #                                 device=rotation_device, **module_name_args)
-            if self.quantize_config.rotation_vision:
-                self.model, _ = entry['rotate_vision_fn'](model=self.model, rotate_mode=self.quantize_config.rotation_vision,
-                                                device=rotation_device, **module_name_args)
-            self.model, _ = entry["rotate_fn"](model=self.model, rotate_mode=self.quantize_config.rotation,
-                                            device=rotation_device, Q=diceq_q, **module_name_args)
-            converted = materialize_inference_tensors(self.model)
-            if converted:
-                log.info("Rotation: materialized %s inference tensors for eager forward compatibility.", converted)
-            self._rotation_preserved_modules = capture_rotation_preserved_modules(
-                self.model,
-                pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
-                lm_head_name=self.lm_head,
-            )
-            if self._rotation_preserved_modules:
-                log.info(
-                    "Rotation: preserved %s modules for save-time restore.",
-                    len(self._rotation_preserved_modules),
-                )
+            self.apply_rotation()
 
         # Mix precision search
         if self.quantize_config.mix_precision_search:
@@ -1480,6 +1420,91 @@ class BaseQModel(nn.Module):
     def post_quantize(self, module: nn.Module) -> nn.Module:
         #return self.offload_to_disk(module=module)
         return move_to(module, device=CPU)
+
+    def apply_rotation(self) -> bool:
+        if self.quantize_config is None or not self.quantize_config.rotation:
+            return False
+
+        if self._rotation_applied:
+            log.info("Rotation: already applied, skipping duplicate invocation.")
+            return False
+
+        from ..quantization.rotation.model import MODEL_ROTATION_REGISTRY, get_rotation_entry
+
+        entry = get_rotation_entry(self)
+        if entry is None:
+            raise ValueError(
+                f"rotation only supports: {[e['cls'].__name__ for e in MODEL_ROTATION_REGISTRY]}, "
+                f"current model is {self.__class__.__name__}"
+            )
+
+        if self.turtle_model is not None:
+            synced = alias_all_from_turtle_if_meta(shell_model=self.model, turtle_model=self.turtle_model)
+            if synced:
+                log.info("Rotation: synced %s meta leaf modules from turtle model before applying rotation.", synced)
+
+        if self.model.config.tie_word_embeddings:
+            log.info("Rotation requires word embeddings to be untied. Untying.")
+            self.model.config.tie_word_embeddings = False
+            if hasattr(self.model.config, "text_config"):
+                self.model.config.text_config.tie_word_embeddings = False
+            lm_head, _ = get_module_by_name_prefix(self.model, self.lm_head)
+            lm_head.weight = nn.Parameter(lm_head.weight.data.clone())
+
+        module_name_args = {
+            "layers_node": self.extract_layers_node(),
+            "lm_head_name": self.lm_head,
+        }
+        if self.quantize_config.rotation_vision:
+            self.model = entry["fuse_vision_norm"](
+                model=self.model,
+                pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
+                **module_name_args,
+            )
+        self.model = entry["fuse_norm"](
+            model=self.model,
+            pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
+            **module_name_args,
+        )
+
+        rotation_device = self.quantize_config.device if self.quantize_config.device != DEVICE.MPS else DEVICE.CPU
+
+        diceq_q = None
+        if hasattr(self, "_run_diceq_pipeline"):
+            diceq_q = self._run_diceq_pipeline(
+                rotation_device=rotation_device,
+            )
+
+        if self.quantize_config.rotation_vision:
+            self.model, _ = entry["rotate_vision_fn"](
+                model=self.model,
+                rotate_mode=self.quantize_config.rotation_vision,
+                device=rotation_device,
+                **module_name_args,
+            )
+        self.model, _ = entry["rotate_fn"](
+            model=self.model,
+            rotate_mode=self.quantize_config.rotation,
+            device=rotation_device,
+            Q=diceq_q,
+            **module_name_args,
+        )
+        converted = materialize_inference_tensors(self.model)
+        if converted:
+            log.info("Rotation: materialized %s inference tensors for eager forward compatibility.", converted)
+        self._rotation_preserved_modules = capture_rotation_preserved_modules(
+            self.model,
+            pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
+            lm_head_name=self.lm_head,
+        )
+        if self._rotation_preserved_modules:
+            log.info(
+                "Rotation: preserved %s modules for save-time restore.",
+                len(self._rotation_preserved_modules),
+            )
+
+        self._rotation_applied = True
+        return True
 
     def move_embed(self, device: str):
         for embed_module_name in self.get_base_modules(self.model):
