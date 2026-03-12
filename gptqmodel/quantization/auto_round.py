@@ -431,6 +431,34 @@ def auto_round_loss(
     *,
     qcfg: QuantizeConfig,
 ) -> torch.Tensor:
+    if pred.dim() == 0 or ref.dim() == 0:
+        raise ValueError("Auto-Round loss expects tensor outputs, not scalars.")
+
+    if pred.shape[-1] != ref.shape[-1]:
+        raise ValueError(
+            "Auto-Round loss expects matching feature dimensions, "
+            f"got {tuple(pred.shape)} and {tuple(ref.shape)}."
+        )
+
+    if pred.dim() == 1:
+        pred = pred.unsqueeze(0)
+    else:
+        pred = pred.reshape(-1, pred.shape[-1])
+
+    if ref.dim() == 1:
+        ref = ref.unsqueeze(0)
+    else:
+        ref = ref.reshape(-1, ref.shape[-1])
+
+    if pred.shape[0] != ref.shape[0]:
+        # Calibration hooks can capture padded token blocks or squeeze the batch
+        # dimension. Compare the common token prefix after flattening to
+        # [tokens, hidden] so AutoRound can keep optimizing instead of failing
+        # on padding-only tails.
+        trim = min(pred.shape[0], ref.shape[0])
+        pred = pred.narrow(0, 0, trim)
+        ref = ref.narrow(0, 0, trim)
+
     pred_f = pred.to(torch.float32)
     ref_f = ref.to(torch.float32)
     diff = pred_f - ref_f

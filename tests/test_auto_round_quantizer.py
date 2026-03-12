@@ -116,6 +116,40 @@ def test_auto_round_loss_uses_versioned_behavior():
     assert loss_v2.item() == 1.0
 
 
+def test_auto_round_loss_aligns_trimmed_sequence_prefix():
+    pred = torch.tensor([[[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]], dtype=torch.float32)
+    ref = torch.tensor([[[0.0, 0.0], [1.0, 0.0]]], dtype=torch.float32)
+    cfg = QuantizeConfig(
+        auto_round_enabled=True,
+        bits=4,
+        group_size=4,
+        sym=True,
+        format=FORMAT.GPTQ,
+        auto_round_version=AutoRoundVersion.V1,
+    )
+
+    loss = auto_round_loss(pred, ref, qcfg=cfg)
+
+    assert torch.isclose(loss, torch.tensor(0.5, dtype=torch.float32))
+
+
+def test_auto_round_loss_aligns_rank_mismatch_after_flatten():
+    pred = torch.tensor([[[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]]], dtype=torch.float32)
+    ref = torch.tensor([[0.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+    cfg = QuantizeConfig(
+        auto_round_enabled=True,
+        bits=4,
+        group_size=4,
+        sym=True,
+        format=FORMAT.GPTQ,
+        auto_round_version=AutoRoundVersion.V1,
+    )
+
+    loss = auto_round_loss(pred, ref, qcfg=cfg)
+
+    assert torch.isclose(loss, torch.tensor(0.5, dtype=torch.float32))
+
+
 def test_clamp_auto_round_state_respects_version_scale_bounds():
     weight = torch.randn(2, 8, dtype=torch.float32)
     cfg_v1 = QuantizeConfig(auto_round_enabled=True, bits=4, group_size=4, sym=True, format=FORMAT.GPTQ, auto_round_version=AutoRoundVersion.V1)

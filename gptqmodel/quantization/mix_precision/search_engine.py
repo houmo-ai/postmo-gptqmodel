@@ -4,12 +4,14 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import json
+from itertools import islice
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from ...utils.logger import setup_logger
@@ -80,12 +82,23 @@ class MixPrecisionSearchEngine:
             moe_unified=config.get("moe_unified", True),
         )
         self.metric = MetricFactory.create(config.get("metric", "kl"))
+        self.metric_name = str(config.get("metric", "kl")).lower()
         
         self.weight_bits = config.get("weight_bits", [4, 8])
         self.policy = config.get("policy", "topk")
         self.topk = config.get("topk", 0.1)
         self.threshold = config.get("threshold", 1e-6)
         self.moe_unified = config.get("moe_unified", True)
+        self.output_reduction = config.get("output_reduction", "last_token")
+        self.store_baseline_on_cpu = bool(config.get("store_baseline_on_cpu", True))
+
+        max_batches = config.get("max_calibration_batches")
+        if isinstance(max_batches, int) and max_batches > 0:
+            self.calibration_data = list(islice(self.calibration_data, max_batches))
+            log.info(
+                "Mix precision search: limiting calibration batches to %s",
+                len(self.calibration_data),
+            )
         
         self._baseline_outputs = {}
     
@@ -103,6 +116,7 @@ class MixPrecisionSearchEngine:
         log.info(f"Found {len(candidates)} candidates for mix precision search")
         log.info(f"MoE groups: {len(selection_result.moe_groups)}")
         log.info(f"Fixed bits layers: {len(selection_result.fixed_bits)}")
+        log.info("Sensitivity metric: %s", self._describe_metric())
         
         self._run_baseline()
         
@@ -129,29 +143,23 @@ class MixPrecisionSearchEngine:
         self.model.eval()
         self._baseline_outputs = {}
         
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch_idx, batch in enumerate(tqdm(
                 self.calibration_data,
                 desc="Baseline forward",
                 leave=False,
             )):
                 try:
-                    if isinstance(batch, dict):
-                        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                        output = self.model(**batch)
-                    elif isinstance(batch, torch.Tensor):
-                        batch = batch.to(self.device)
-                        output = self.model(batch)
-                    elif isinstance(batch, (list, tuple)):
-                        batch = [b.to(self.device) if isinstance(b, torch.Tensor) else b for b in batch]
-                        output = self.model(*batch)
-                    else:
-                        log.warning(f"Unsupported batch type: {type(batch)}")
-                        continue
-                    
-                    self._baseline_outputs[batch_idx] = self._extract_output(output)
+                    output, prepared_batch = self._run_forward(batch)
+                    self._baseline_outputs[batch_idx] = self._prepare_output_for_metric(
+                        self._extract_output(output),
+                        prepared_batch,
+                        move_to_cpu=self.store_baseline_on_cpu,
+                    )
                 except Exception as e:
                     log.warning(f"Baseline forward failed for batch {batch_idx}: {e}")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
     
     def _extract_output(self, output: Any) -> torch.Tensor:
         """从模型输出中提取主要张量
@@ -240,11 +248,15 @@ class MixPrecisionSearchEngine:
             
             try:
                 quant_output = self._run_quantized_forward_group(modules, batch)
+                if baseline_output.device != quant_output.device:
+                    baseline_output = baseline_output.to(quant_output.device)
                 sensitivity = self.metric.compute(baseline_output, quant_output)
                 total_sensitivity += sensitivity
                 valid_batches += 1
             except Exception as e:
                 log.debug(f"Sensitivity computation failed for {candidate} batch {batch_idx}: {e}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         return total_sensitivity / max(valid_batches, 1)
     
@@ -271,20 +283,14 @@ class MixPrecisionSearchEngine:
                     original_weights[module_name] = module.weight.data.clone()
                     quantized_weight = self._quantize_weight(module.weight.data, self.weight_bits[0])
                     module.weight.data.copy_(quantized_weight)
-            
-            if isinstance(batch, dict):
-                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                output = self.model(**batch)
-            elif isinstance(batch, torch.Tensor):
-                batch = batch.to(self.device)
-                output = self.model(batch)
-            elif isinstance(batch, (list, tuple)):
-                batch = [b.to(self.device) if isinstance(b, torch.Tensor) else b for b in batch]
-                output = self.model(*batch)
-            else:
-                raise ValueError(f"Unsupported batch type: {type(batch)}")
-            
-            return self._extract_output(output)
+
+            with torch.inference_mode():
+                output, prepared_batch = self._run_forward(batch)
+            return self._prepare_output_for_metric(
+                self._extract_output(output),
+                prepared_batch,
+                move_to_cpu=self.store_baseline_on_cpu,
+            )
         finally:
             for module_name, original_weight in original_weights.items():
                 module = self._get_module(module_name)
@@ -311,11 +317,15 @@ class MixPrecisionSearchEngine:
             
             try:
                 quant_output = self._run_quantized_forward(module_name, batch)
+                if baseline_output.device != quant_output.device:
+                    baseline_output = baseline_output.to(quant_output.device)
                 sensitivity = self.metric.compute(baseline_output, quant_output)
                 total_sensitivity += sensitivity
                 valid_batches += 1
             except Exception as e:
                 log.debug(f"Sensitivity computation failed for {module_name} batch {batch_idx}: {e}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         return total_sensitivity / max(valid_batches, 1)
     
@@ -342,20 +352,14 @@ class MixPrecisionSearchEngine:
         try:
             quantized_weight = self._quantize_weight(module.weight.data, self.weight_bits[0])
             module.weight.data.copy_(quantized_weight)
-            
-            if isinstance(batch, dict):
-                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                output = self.model(**batch)
-            elif isinstance(batch, torch.Tensor):
-                batch = batch.to(self.device)
-                output = self.model(batch)
-            elif isinstance(batch, (list, tuple)):
-                batch = [b.to(self.device) if isinstance(b, torch.Tensor) else b for b in batch]
-                output = self.model(*batch)
-            else:
-                raise ValueError(f"Unsupported batch type: {type(batch)}")
-            
-            return self._extract_output(output)
+
+            with torch.inference_mode():
+                output, prepared_batch = self._run_forward(batch)
+            return self._prepare_output_for_metric(
+                self._extract_output(output),
+                prepared_batch,
+                move_to_cpu=self.store_baseline_on_cpu,
+            )
         finally:
             module.weight.data.copy_(original_weight)
     
@@ -401,6 +405,7 @@ class MixPrecisionSearchEngine:
         if bits >= 16:
             return weight
         
+        origin_dtype = weight.dtype
         weight = weight.float()
         
         min_val = weight.min()
@@ -414,7 +419,107 @@ class MixPrecisionSearchEngine:
         
         dequantized = (quantized - zero_point) * scale
         
-        return dequantized.to(weight.dtype)
+        return dequantized.to(origin_dtype)
+
+    def _prepare_batch(self, batch: Union[List, Dict, torch.Tensor]) -> Union[List, Dict, torch.Tensor]:
+        if isinstance(batch, dict):
+            prepared = {
+                k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+            prepared.setdefault("use_cache", False)
+            return prepared
+        if isinstance(batch, torch.Tensor):
+            return batch.to(self.device)
+        if isinstance(batch, (list, tuple)):
+            return [b.to(self.device) if isinstance(b, torch.Tensor) else b for b in batch]
+        raise ValueError(f"Unsupported batch type: {type(batch)}")
+
+    def _run_forward(self, batch: Union[List, Dict, torch.Tensor]) -> Any:
+        prepared = self._prepare_batch(batch)
+        if isinstance(prepared, dict):
+            return self.model(**prepared), prepared
+        if isinstance(prepared, torch.Tensor):
+            return self.model(prepared), prepared
+        return self.model(*prepared), prepared
+
+    def _prepare_output_for_metric(
+        self,
+        output: torch.Tensor,
+        batch: Union[List, Dict, torch.Tensor],
+        move_to_cpu: bool = True,
+    ) -> torch.Tensor:
+        tensor = output.detach()
+
+        if self.metric_name in {"ppl", "perplexity"}:
+            tensor = self._compute_batch_perplexity(tensor, batch)
+        else:
+            if self.output_reduction == "last_token" and tensor.dim() >= 3:
+                tensor = tensor[:, -1, :]
+            elif self.output_reduction == "mean_tokens" and tensor.dim() >= 3:
+                tensor = tensor.mean(dim=1)
+
+        if move_to_cpu and tensor.device.type != "cpu":
+            tensor = tensor.to("cpu")
+
+        return tensor
+
+    def _compute_batch_perplexity(
+        self,
+        logits: torch.Tensor,
+        batch: Union[List, Dict, torch.Tensor],
+    ) -> torch.Tensor:
+        input_ids, attention_mask = self._extract_labels_from_batch(batch)
+        if input_ids is None:
+            raise ValueError("PPL metric requires `input_ids` in calibration batch.")
+        if logits.dim() < 3:
+            raise ValueError("PPL metric requires full logits with shape [batch, seq, vocab].")
+
+        shift_logits = logits[:, :-1, :].float().contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.reshape(-1),
+            reduction="none",
+        ).view_as(shift_labels)
+
+        if attention_mask is not None:
+            shift_mask = attention_mask[:, 1:].to(loss.device).float()
+            valid_tokens = shift_mask.sum().clamp_min(1.0)
+            loss = (loss * shift_mask).sum() / valid_tokens
+        else:
+            loss = loss.mean()
+
+        return torch.exp(loss).reshape(1)
+
+    def _extract_labels_from_batch(
+        self,
+        batch: Union[List, Dict, torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if isinstance(batch, dict):
+            return batch.get("input_ids"), batch.get("attention_mask")
+
+        if isinstance(batch, torch.Tensor):
+            return batch, None
+
+        if isinstance(batch, (list, tuple)) and len(batch) > 0:
+            input_ids = batch[0] if isinstance(batch[0], torch.Tensor) else None
+            attention_mask = None
+            if len(batch) > 1 and isinstance(batch[1], torch.Tensor):
+                attention_mask = batch[1]
+            return input_ids, attention_mask
+
+        return None, None
+
+    def _describe_metric(self) -> str:
+        if self.metric_name in {"ppl", "perplexity"}:
+            return "ppl (quant_ppl - fp_ppl, larger => more sensitive)"
+
+        if self.output_reduction:
+            return f"{self.metric_name} [output_reduction={self.output_reduction}] (larger => more sensitive)"
+
+        return f"{self.metric_name} (larger => more sensitive)"
     
     def _allocate_bits(
         self,

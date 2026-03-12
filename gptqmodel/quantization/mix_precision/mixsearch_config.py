@@ -21,7 +21,7 @@ Mix Precision config (returned by `build()`) is a dict:
     "policy": str,                      # "topk" or "threshold"
     "topk": float,                      # 0.1
     "threshold": float,                  # 1e-6
-    "metric": str,                      # "kl", "sqnr", "l1", "mse"
+    "metric": str,                      # "kl", "sqnr", "l1", "mse", "ppl"
     "layer_include": Optional[List[str]],
     "layer_exclude": Optional[List[str]],
     "group_by_path": Optional[Dict[str, str]],  # {"path_pattern": "group_name"}
@@ -163,7 +163,7 @@ def validate_mix_precision_config(config: Dict[str, Any]) -> None:
             f"got {config.get('policy')}"
         )
 
-    valid_metrics = ["kl", "sqnr", "l1", "mse"]
+    valid_metrics = ["kl", "sqnr", "l1", "mse", "ppl", "perplexity"]
     if config.get("metric") not in valid_metrics:
         raise ValueError(
             f"mix_precision.metric must be one of {valid_metrics}, "

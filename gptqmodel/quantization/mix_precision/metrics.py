@@ -190,6 +190,23 @@ class MaxAbsDiffMetric(MetricBase):
         return diff.max().item()
 
 
+class PerplexityMetric(MetricBase):
+    """Perplexity delta metric.
+
+    Expects ``fp_output`` and ``qt_output`` to already be per-batch perplexity
+    scalars. The sensitivity is defined as ``quant_ppl - fp_ppl`` so larger
+    values indicate larger degradation after quantization.
+    """
+
+    def compute(
+        self,
+        fp_output: torch.Tensor,
+        qt_output: torch.Tensor,
+        **kwargs,
+    ) -> float:
+        return (qt_output.float().mean() - fp_output.float().mean()).item()
+
+
 class MetricFactory:
     """度量标准工厂
     
@@ -208,6 +225,8 @@ class MetricFactory:
         "cosine": CosineSimilarityMetric,
         "cos_sim": CosineSimilarityMetric,
         "max_abs": MaxAbsDiffMetric,
+        "ppl": PerplexityMetric,
+        "perplexity": PerplexityMetric,
     }
     
     @classmethod

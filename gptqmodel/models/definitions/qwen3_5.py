@@ -3,9 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
-from transformers.models.qwen3_5 import Qwen3_5TextConfig
+
 
 from . import LlamaQModel
+
+try:
+    from transformers.models.qwen3_5 import Qwen3_5TextConfig
+except ImportError:
+    Qwen3_5TextConfig = None
 
 
 class Qwen3_5QModel(LlamaQModel):
@@ -13,7 +18,7 @@ class Qwen3_5QModel(LlamaQModel):
     Qwen3.5 inherits the Llama-style layout but introduces linear-attention
     layers and Q/K norm helper modules that should be tracked but not quantized.
     """
-
+    
     config_class = Qwen3_5TextConfig
 
     # Qwen3.5 alternates linear-attention and full-attention by layer.
@@ -106,7 +111,12 @@ class Qwen3_5QModel(LlamaQModel):
                     setattr(cfg, key, value)
 
     def before_model_load(self, load_quantized_model=False):
-        import transformers.models.qwen3_5.configuration_qwen3_5 as qwen3_5_config
+        try:
+            import transformers.models.qwen3_5.configuration_qwen3_5 as qwen3_5_config
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Qwen3.5 requires a transformers version with qwen3_5 support."
+            ) from exc
 
         # Tokenizer and some loading paths resolve from root config fields; bridge
         # missing text attributes from text_config.

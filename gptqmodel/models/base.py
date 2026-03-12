@@ -1101,13 +1101,43 @@ class BaseQModel(nn.Module):
         if self.quantize_config.mix_precision_search:
             from ..quantization.mix_precision import run_mix_precision_pipeline
             mix_precision_device = self.quantize_config.device if self.quantize_config.device != DEVICE.MPS else DEVICE.CPU
-            run_mix_precision_pipeline(
-                model=self.model,
-                quantize_config=self.quantize_config,
-                calibration_data=calibration,
-                device=mix_precision_device,
-                mix_precision_config_template=self.mix_precision_config_template(),
-            )
+            restore_search_device = None
+            moved_for_mix_precision_search = False
+            target_search_device = torch.device(mix_precision_device)
+
+            for tensor_iterator in (self.model.parameters(), self.model.buffers()):
+                for tensor in tensor_iterator:
+                    restore_search_device = tensor.device
+                    break
+                if restore_search_device is not None:
+                    break
+
+            try:
+                if restore_search_device is not None and restore_search_device != target_search_device:
+                    log.info(
+                        "Mix precision search: moving model from %s to %s",
+                        restore_search_device,
+                        target_search_device,
+                    )
+                    self.model = self.model.to(target_search_device)
+                    moved_for_mix_precision_search = True
+
+                run_mix_precision_pipeline(
+                    model=self.model,
+                    quantize_config=self.quantize_config,
+                    calibration_data=calibration,
+                    device=mix_precision_device,
+                    mix_precision_config_template=self.mix_precision_config_template(),
+                )
+            finally:
+                if moved_for_mix_precision_search and restore_search_device is not None:
+                    log.info(
+                        "Mix precision search: restoring model to %s for quantization",
+                        restore_search_device,
+                    )
+                    self.model = self.model.to(restore_search_device)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         # init processor with default GPTQ processor
         from ..looper.tensorparallel_weight_processor import TensorParallelWeightProcessor

@@ -145,8 +145,6 @@ from .definitions.qwen2_5_vl import Qwen2_5_VLQModel  # noqa: E402
 from .definitions.qwen2_moe import Qwen2MoeQModel  # noqa: E402
 from .definitions.qwen2_vl import Qwen2VLQModel  # noqa: E402
 from .definitions.qwen3 import Qwen3QModel  # noqa: E402
-from .definitions.qwen3_5 import Qwen3_5QModel  # noqa: E402
-from .definitions.qwen3_5_moe import Qwen3_5MoeQModel  # noqa: E402
 from .definitions.qwen3_moe import Qwen3MoeQModel  # noqa: E402
 from .definitions.qwen3_next import Qwen3NextGPTQ  # noqa: E402
 from .definitions.qwen3_omni_moe import Qwen3OmniMoeGPTQ
@@ -157,14 +155,20 @@ from .definitions.telechat2 import TeleChat2QModel
 from .definitions.voxtral import VoxtralGPTQ  # noqa: E402
 from .definitions.xverse import XverseQModel  # noqa: E402
 
-
 TRANSFORMERS_SUPPORTS_QWEN3_5 = Version(TRANSFORMERS_VERSION) >= Version("5.2.0")
+Qwen3_5QModel = None
+Qwen3_5MoeQModel = None
 if TRANSFORMERS_SUPPORTS_QWEN3_5:
-    from .definitions.qwen3_5 import Qwen3_5QModel  # noqa: E402
-    from .definitions.qwen3_5_moe import Qwen3_5_MoeQModel  # noqa: E402
-else:
-    Qwen3_5QModel = None
-    Qwen3_5_MoeQModel = None
+    try:
+        try:
+            from .definitions.qwen3_5 import Qwen3_5QModel  # noqa: E402
+            from .definitions.qwen3_5_moe import Qwen3_5MoeQModel  # noqa: E402
+        except ImportError:
+            Qwen3_5QModel = None
+            Qwen3_5MoeQModel = None
+    except ImportError:
+        Qwen3_5QModel = None
+        Qwen3_5MoeQModel = None
 
 
 # make quants and inference more determinisitc
@@ -230,10 +234,6 @@ MODEL_MAP = {
     "minimax": MiniMaxM2GPTQ,
     "minimax_m2": MiniMaxM2GPTQ,
     "qwen2_moe": Qwen2MoeQModel,
-    "qwen3_5": Qwen3_5QModel,
-    "qwen3_5_text": Qwen3_5QModel,
-    "qwen3_5_moe": Qwen3_5MoeQModel,
-    "qwen3_5_moe_text": Qwen3_5MoeQModel,
     "qwen3_moe": Qwen3MoeQModel,
     "qwen3_next": Qwen3NextGPTQ,
     "qwen2_vl": Qwen2VLQModel,
@@ -306,8 +306,9 @@ if Qwen3_5QModel is not None:
     MODEL_MAP["qwen3_5"] = Qwen3_5QModel
     MODEL_MAP["qwen3_5_text"] = Qwen3_5QModel
 
-if Qwen3_5_MoeQModel is not None:
-    MODEL_MAP["qwen3_5_moe"] = Qwen3_5_MoeQModel
+if Qwen3_5MoeQModel is not None:
+    MODEL_MAP["qwen3_5_moe"] = Qwen3_5MoeQModel
+    MODEL_MAP["qwen3_5_moe_text"] = Qwen3_5MoeQModel
 
 SUPPORTED_MODELS = list(MODEL_MAP.keys())
 
