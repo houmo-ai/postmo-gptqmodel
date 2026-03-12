@@ -21,6 +21,21 @@ class StopForward(Exception):
 
 STOP_FORWARD_EXCEPTION = StopForward("Forwarding stopped")
 
+
+def _materialize_hook_input(input: torch.Tensor, target_device: torch.device) -> torch.Tensor:
+    with torch.inference_mode(False):
+        prepared = input.to(device=target_device).clone()
+    return prepared
+
+
+def _materialize_hook_tensor(tensor: Union[torch.Tensor, None], target_device: torch.device):
+    if tensor is None:
+        return None
+    with torch.inference_mode(False):
+        prepared = tensor.to(device=target_device).clone()
+    return prepared
+
+
 # Models using conv1d: gpt2
 class HookedConv1D(transformers.Conv1D):
     def __init__(self, nf: int, nx: int) -> None:
@@ -38,13 +53,20 @@ class HookedConv1D(transformers.Conv1D):
         custom.bias = m.bias
         return custom
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         original_device = input.device
         target_device = self.weight.data.device
-        if original_device != target_device:
-            input = input.to(device=target_device)
-        output = super().forward(input)
+        input = _materialize_hook_input(input, target_device)
+        weight = _materialize_hook_tensor(self.weight, target_device)
+        bias = _materialize_hook_tensor(self.bias, target_device)
+        with torch.inference_mode(False):
+            size_out = input.size()[:-1] + (self.nf,)
+            output = torch.addmm(
+                bias if bias is not None else torch.zeros(self.nf, device=input.device, dtype=input.dtype),
+                input.view(-1, input.size(-1)),
+                weight,
+            ).view(size_out)
 
         if self.forward_hook:
             self.forward_hook(self, (input,), output)
@@ -102,13 +124,15 @@ class HookedConv1d(torch.nn.Conv1d):
         custom.bias = m.bias
         return custom
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         original_device = input.device
         target_device = self.weight.data.device
-        if original_device != target_device:
-            input = input.to(device=target_device)
-        output = super().forward(input)
+        input = _materialize_hook_input(input, target_device)
+        weight = _materialize_hook_tensor(self.weight, target_device)
+        bias = _materialize_hook_tensor(self.bias, target_device)
+        with torch.inference_mode(False):
+            output = self._conv_forward(input, weight, bias)
         if self.forward_hook:
             self.forward_hook(self, (input,), output)
             if self.forward_hook_last:
@@ -165,13 +189,15 @@ class HookedConv2d(torch.nn.Conv2d):
         custom.bias = m.bias
         return custom
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         original_device = input.device
         target_device = self.weight.data.device
-        if original_device != target_device:
-            input = input.to(device=target_device)
-        output = super().forward(input)
+        input = _materialize_hook_input(input, target_device)
+        weight = _materialize_hook_tensor(self.weight, target_device)
+        bias = _materialize_hook_tensor(self.bias, target_device)
+        with torch.inference_mode(False):
+            output = self._conv_forward(input, weight, bias)
         if self.forward_hook:
             self.forward_hook(self, (input,), output)
             if self.forward_hook_last:
@@ -196,13 +222,20 @@ class HookedTransformerConv1D(transformers.Conv1D):
         custom.bias = conv1d.bias
         return custom
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         original_device = input.device
         target_device = self.weight.data.device
-        if original_device != target_device:
-            input = input.to(device=target_device)
-        output = super().forward(input)
+        input = _materialize_hook_input(input, target_device)
+        weight = _materialize_hook_tensor(self.weight, target_device)
+        bias = _materialize_hook_tensor(self.bias, target_device)
+        with torch.inference_mode(False):
+            size_out = input.shape[:-1] + (weight.shape[1],)
+            output = torch.addmm(
+                bias if bias is not None else torch.zeros(weight.shape[1], device=input.device, dtype=input.dtype),
+                input.reshape(-1, input.shape[-1]),
+                weight,
+            ).view(size_out)
         if self.forward_hook:
             self.forward_hook(self, (input,), output)
             if self.forward_hook_last:
@@ -228,13 +261,15 @@ class HookedLinear(torch.nn.Linear):
         custom_linear.bias = linear.bias
         return custom_linear
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         original_device = input.device
         target_device = self.weight.data.device
-        if original_device != target_device:
-            input = input.to(device=target_device)
-        output = super().forward(input)
+        input = _materialize_hook_input(input, target_device)
+        weight = _materialize_hook_tensor(self.weight, target_device)
+        bias = _materialize_hook_tensor(self.bias, target_device)
+        with torch.inference_mode(False):
+            output = torch.nn.functional.linear(input, weight, bias)
         if self.forward_hook:
             self.forward_hook(self, (input,), output)
             if self.forward_hook_last:

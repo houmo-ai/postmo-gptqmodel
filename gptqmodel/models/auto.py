@@ -322,6 +322,7 @@ def _is_supported_quantization_config(config: AutoConfig) -> bool:
         METHOD.GPTQ,
         METHOD.AWQ,
         METHOD.QQQ,
+        METHOD.AUTO_ROUND,
     ):
         return True
 
@@ -330,6 +331,7 @@ def _is_supported_quantization_config(config: AutoConfig) -> bool:
         METHOD.GPTQ,
         METHOD.AWQ,
         METHOD.QQQ,
+        METHOD.AUTO_ROUND,
     ):
         return True
 

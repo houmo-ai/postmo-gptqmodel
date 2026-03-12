@@ -1,131 +1,112 @@
-# Copyright 2024-2025 ModelCloud.ai
-# Copyright 2024-2025 qubitium@modelcloud.ai
-# Contact: qubitium@modelcloud.ai, x.com/qubitium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+import json
+import tempfile
 
-# -- do not touch
-import os
+import torch
+from transformers import LlamaConfig, LlamaForCausalLM
 
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-# -- end do not touch
-
-import json  # noqa: E402
-import logging  # noqa: E402
-import tempfile  # noqa: E402
-
-from datasets import load_dataset  # noqa: E402
-from gptqmodel import BACKEND, GPTQModel, __version__, get_best_device  # noqa: E402
-from gptqmodel.quantization import FORMAT, QUANT_CONFIG_FILENAME, QUANT_METHOD  # noqa: E402
-from gptqmodel.quantization.config import (META_FIELD_QUANTIZER, META_QUANTIZER_GPTQMODEL,  # noqa: E402
-                                           AutoRoundQuantizeConfig, QuantizeConfig)
-from gptqmodel.utils.torch import torch_empty_cache  # noqa: E402
-from models.model_test import ModelTest  # noqa: E402
-from parameterized import parameterized  # noqa: E402
-from transformers import AutoTokenizer  # noqa: E402
+from gptqmodel import BACKEND, GPTQModel, __version__
+from gptqmodel.quantization import FORMAT, QUANT_CONFIG_FILENAME
+from gptqmodel.quantization.config import (
+    META_FIELD_QUANTIZER,
+    META_QUANTIZER_GPTQMODEL,
+    AutoRoundQuantizeConfig,
+    METHOD as QUANT_METHOD,
+    QuantizeConfig,
+)
+from gptqmodel.utils.torch import torch_empty_cache
 
 
-class TestQuantization(ModelTest):
-
-    @classmethod
-    def setUpClass(self):
-        self.pretrained_model_id = "/monster/data/model/TinyLlama-1.1B-intermediate-step-1431k-3T"
-
-        self.tokenizer = AutoTokenizer.from_pretrained(self.pretrained_model_id, use_fast=True)
-
-        traindata = load_dataset("wikitext", "wikitext-2-raw-v1", split="train").filter(lambda x: len(x['text']) >= 512)
-        self.calibration_dataset = [self.tokenizer(example["text"]) for example in traindata.select(range(1024))]
-
-
-    @parameterized.expand(
-        [
-            (QUANT_METHOD.AUTO_ROUND, BACKEND.EXLLAMA_V2, True, FORMAT.GPTQ, 4),
-        ]
+def _build_tiny_llama():
+    cfg = LlamaConfig(
+        vocab_size=128,
+        hidden_size=32,
+        intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        num_hidden_layers=1,
+        max_position_embeddings=64,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
     )
-    def test_quantize(self, method: QUANT_METHOD, backend: BACKEND, sym: bool, format: FORMAT, bits: int):
-        if method == QUANT_METHOD.GPTQ:
-            quantize_config = QuantizeConfig(
-                bits=bits,
-                group_size=128,
-                desc_act=False if format == FORMAT.MARLIN else True,
-                sym=sym,
-                format=format,
-                damp_percent=0.05
-            )
-        elif method == QUANT_METHOD.AUTO_ROUND:
-            quantize_config = AutoRoundQuantizeConfig(
-                bits=bits,
-                group_size=128,
-                sym=sym,
-                format=format,
-            )
-        else:
-            raise ValueError(f"Invalid quantization method: {method}")
+    model = LlamaForCausalLM(cfg).eval()
+    calibration = [
+        {
+            "input_ids": torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]], dtype=torch.long),
+            "attention_mask": torch.ones((1, 12), dtype=torch.long),
+        },
+        {
+            "input_ids": torch.tensor([[12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1]], dtype=torch.long),
+            "attention_mask": torch.ones((1, 12), dtype=torch.long),
+        },
+    ]
+    return cfg, model, calibration
 
-        model = GPTQModel.load(
-            self.pretrained_model_id,
-            quantize_config=quantize_config,
+
+def test_auto_round_quantize_config_roundtrips_on_saved_model():
+    torch.manual_seed(0)
+    cfg, model, calibration = _build_tiny_llama()
+
+    with tempfile.TemporaryDirectory() as native_dir:
+        model.save_pretrained(native_dir)
+
+        quantize_config = AutoRoundQuantizeConfig(
+            bits=4,
+            group_size=16,
+            sym=True,
+            format=FORMAT.GPTQ,
+            desc_act=False,
+            iters=1,
+            lr=0.05,
+            minmax_lr=0.05,
+            device="cpu",
+            offload_to_disk=False,
         )
-        model.quantize(self.calibration_dataset)
+        model = GPTQModel.load(native_dir, quantize_config=quantize_config)
+        model.quantize(calibration, batch_size=1)
 
         with tempfile.TemporaryDirectory() as tmpdirname:
             model.save(tmpdirname)
 
-            logging.info(f"Saved config mem: {model.quantize_config}")
+            with open(f"{tmpdirname}/{QUANT_CONFIG_FILENAME}", "r", encoding="utf-8") as handle:
+                file_dict = json.load(handle)
 
-            with open(tmpdirname + "/" + QUANT_CONFIG_FILENAME, "r") as f:
-                file_dict = json.loads(f.read())
+            assert model.quantize_config.to_dict() == file_dict
+            assert file_dict["quant_method"] == QUANT_METHOD.AUTO_ROUND
+            assert file_dict["checkpoint_format"] == FORMAT.GPTQ
 
-                # make sure the json dict saved to file matches config in memory
-                assert model.quantize_config.to_dict() == file_dict
-                logging.info(f"Saved config file: {file_dict}")
-
-            model = GPTQModel.load(
+            reloaded = GPTQModel.load(
                 tmpdirname,
-                device=get_best_device(backend),
-                backend=backend,
+                device="cpu",
+                backend=BACKEND.TORCH,
             )
 
-            logging.info(f"Loaded config: {model.quantize_config}")
-
-            versionable = model.quantize_config.meta_get_versionable(META_FIELD_QUANTIZER)
-            assert META_QUANTIZER_GPTQMODEL in [v[0] for v in versionable]
-            for producer, _version in versionable:
+            versionable = reloaded.quantize_config.meta_get_versionable(META_FIELD_QUANTIZER)
+            assert META_QUANTIZER_GPTQMODEL in [producer for producer, _ in versionable]
+            for producer, producer_version in versionable:
                 if producer == META_QUANTIZER_GPTQMODEL:
-                    assert _version == __version__
+                    assert producer_version == __version__
 
-            del model
-            torch_empty_cache()
+            output = reloaded.model(
+                input_ids=torch.tensor([[1, 2, 3, 4]], dtype=torch.long),
+                attention_mask=torch.ones((1, 4), dtype=torch.long),
+            )
+            assert tuple(output.logits.shape) == (1, 4, cfg.vocab_size)
+            assert torch.isfinite(output.logits).all()
 
-            # skip compat test with sym=False and v1 since we do meta version safety check
-            if not sym and format == FORMAT.GPTQ or format == FORMAT.IPEX:
-                return
-
-            # test compat: 1) with simple dict type
             compat_quantize_config = {
-                "bits": bits,
-                "group_size": 128,
-                "sym": sym,
-                "desc_act": False if format == FORMAT.MARLIN else True,
+                "bits": 4,
+                "group_size": 16,
+                "sym": True,
+                "desc_act": False,
             }
-
-            model = GPTQModel.load(
+            compat_loaded = GPTQModel.load(
                 tmpdirname,
-                device=get_best_device(backend),
+                device="cpu",
                 quantize_config=compat_quantize_config,
             )
-            assert isinstance(model.quantize_config, QuantizeConfig)
+            assert isinstance(compat_loaded.quantize_config, QuantizeConfig)
 
-            del model
+            del compat_loaded
+            del reloaded
             torch_empty_cache()
-

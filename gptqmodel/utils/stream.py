@@ -203,9 +203,18 @@ def stream_tensor_dict_to_cpu(
             store_callback(host_map)
         return host_map
 
+    # Async record_stream/copy only works when every source tensor lives on the
+    # same CUDA device. Mixed CPU/CUDA payloads can appear in quantization state
+    # (for example GPU scales with a CPU g_idx), so fall back to the safe sync path.
+    copy_device = first.device
+    if any(tensor.device.type != "cuda" or tensor.device != copy_device for tensor in filtered.values()):
+        host_map = {name: tensor.detach().to("cpu") for name, tensor in filtered.items()}
+        with state_lock:
+            store_callback(host_map)
+        return host_map
+
     host_map: Dict[str, torch.Tensor] = {}
 
-    copy_device = first.device
     compute_stream = torch.cuda.current_stream(device=copy_device)
     copy_stream = _get_cached_copy_stream(copy_device)
     done_event = torch.cuda.Event(enable_timing=False, blocking=False)

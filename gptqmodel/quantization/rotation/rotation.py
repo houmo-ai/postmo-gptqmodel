@@ -420,6 +420,13 @@ def get_orthogonal_matrix(size, mode, device):
         raise ValueError(f"Unknown mode {mode}")
 
 
+def _resolve_attention_head_dim(config, hidden_size: int, num_heads: int) -> int:
+    head_dim = getattr(config, "head_dim", None)
+    if head_dim is not None:
+        return int(head_dim)
+    return hidden_size // num_heads
+
+
 def rotate_conv(layer, Q_v, embed_dims, device):
     dtype = layer.weight.dtype
     weight_shape = layer.weight.data.shape
@@ -902,7 +909,7 @@ def rotate_model(model: PreTrainedModel, rotate_mode: str, device: torch.device,
     config = model.config
     num_heads = config.num_attention_heads
     model_dim = config.hidden_size
-    head_dim = model_dim // num_heads
+    head_dim = _resolve_attention_head_dim(config, model_dim, num_heads)
 
     rotate_embeddings(model, Q_block, device)
     rotate_head(model, Q_block, device, lm_head_name)
@@ -934,7 +941,7 @@ def rotate_model_qwen2_5_vl(model: PreTrainedModel, rotate_mode: str, device: to
     config = model.config
     num_heads = config.text_config.num_attention_heads
     model_dim = config.text_config.hidden_size
-    head_dim = model_dim // num_heads
+    head_dim = _resolve_attention_head_dim(config.text_config, model_dim, num_heads)
 
     rotate_qwen2_5_vl_embeddings(model, Q_block, device)
     rotate_head(model, Q_block, device, lm_head_name)
@@ -965,7 +972,7 @@ def rotate_model_qwen3_vl(model: PreTrainedModel, rotate_mode: str, device: torc
     config = model.config
     num_heads = config.text_config.num_attention_heads
     model_dim = config.text_config.hidden_size
-    head_dim = model_dim // num_heads
+    head_dim = _resolve_attention_head_dim(config.text_config, model_dim, num_heads)
 
     rotate_qwen3_vl_embeddings(model, Q_block, device)
     rotate_head(model, Q_block, device, lm_head_name)
@@ -996,7 +1003,7 @@ def rotate_model_moe(model: PreTrainedModel, rotate_mode: str, device: torch.dev
     config = model.config
     num_heads = config.num_attention_heads
     model_dim = config.hidden_size
-    head_dim = model_dim // num_heads
+    head_dim = _resolve_attention_head_dim(config, model_dim, num_heads)
 
     rotate_embeddings(model, Q_block, device)
     rotate_head(model, Q_block, device, lm_head_name)
@@ -1747,4 +1754,3 @@ def rotate_model_deepseekv2_mla_moe(
             rotate_mlp_output(layer, q_block_layer.to(device=device, dtype=torch.float64), device)
 
     return model, Q_block
-

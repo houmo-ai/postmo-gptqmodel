@@ -54,7 +54,11 @@ from ..utils.hf import autofix_hf_model_config
 from ..utils.importer import select_quant_linear
 from ..utils.logger import QuantizationRegionTimer, setup_logger
 from ..utils.model import MODALITY, find_modules, get_module_by_name_prefix, move_to
-from ..utils.structure import alias_from_turtle_for_submodule
+from ..utils.structure import (
+    alias_all_from_turtle_if_meta,
+    alias_from_turtle_for_submodule,
+    capture_rotation_preserved_modules,
+)
 from ..utils.torch import TORCH_HAS_COMPILE, torch_compile
 from ._const import (
     CPU,
@@ -108,6 +112,31 @@ def generate_node_for_awq_scaling(inp, prev_op, module_kwargs, nodes_size, subse
 
 def check_support_param_buffer_assignment(*args, **kwargs):
     return False
+
+
+def materialize_inference_tensors(module: nn.Module) -> int:
+    converted = 0
+
+    for submodule in module.modules():
+        for name, param in list(submodule._parameters.items()):
+            if param is None or not hasattr(param, "is_inference") or not param.is_inference():
+                continue
+
+            setattr(
+                submodule,
+                name,
+                nn.Parameter(param.detach().clone(), requires_grad=param.requires_grad),
+            )
+            converted += 1
+
+        for name, buffer in list(submodule._buffers.items()):
+            if buffer is None or not hasattr(buffer, "is_inference") or not buffer.is_inference():
+                continue
+
+            submodule._buffers[name] = buffer.detach().clone()
+            converted += 1
+
+    return converted
 
 
 def apply_module_tree_override(module_tree, override):
@@ -408,6 +437,7 @@ class BaseQModel(nn.Module):
         self._turtle_reload_threshold_bytes = self._resolve_turtle_reload_threshold()
         self._turtle_reload_accum_bytes = 0
         self._turtle_materialized_ids: Set[int] = set()
+        self._rotation_preserved_modules: Dict[str, nn.Module] = {}
 
         self.processor: ProcessorMixin = None
 
@@ -1013,6 +1043,11 @@ class BaseQModel(nn.Module):
                     f"current model is {self.__class__.__name__}"
                 )
 
+            if self.turtle_model is not None:
+                synced = alias_all_from_turtle_if_meta(shell_model=self.model, turtle_model=self.turtle_model)
+                if synced:
+                    log.info("Rotation: synced %s meta leaf modules from turtle model before applying rotation.", synced)
+
             if self.model.config.tie_word_embeddings:
                 log.info("Rotation requires word embeddings to be untied. Untying.")
                 self.model.config.tie_word_embeddings = False
@@ -1048,6 +1083,19 @@ class BaseQModel(nn.Module):
                                                 device=rotation_device, **module_name_args)
             self.model, _ = entry["rotate_fn"](model=self.model, rotate_mode=self.quantize_config.rotation,
                                             device=rotation_device, Q=diceq_q, **module_name_args)
+            converted = materialize_inference_tensors(self.model)
+            if converted:
+                log.info("Rotation: materialized %s inference tensors for eager forward compatibility.", converted)
+            self._rotation_preserved_modules = capture_rotation_preserved_modules(
+                self.model,
+                pre_lm_head_norm_module_name=self.pre_lm_head_norm_module,
+                lm_head_name=self.lm_head,
+            )
+            if self._rotation_preserved_modules:
+                log.info(
+                    "Rotation: preserved %s modules for save-time restore.",
+                    len(self._rotation_preserved_modules),
+                )
 
         # Mix precision search
         if self.quantize_config.mix_precision_search:
@@ -1070,6 +1118,13 @@ class BaseQModel(nn.Module):
             quantize_processor = [
                 TensorParallelWeightProcessor(**args),
                 QQQProcessor(**args),
+            ]
+        elif self.quantize_config.quant_method == METHOD.AUTO_ROUND:
+            from ..looper.auto_round_processor import AutoRoundProcessor
+
+            quantize_processor = [
+                TensorParallelWeightProcessor(**args),
+                AutoRoundProcessor(**args),
             ]
         elif self.quantize_config.quant_method == METHOD.AWQ:
             from ..looper.awq_processor import AWQProcessor

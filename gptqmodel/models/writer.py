@@ -55,7 +55,7 @@ from ..utils.model import (
     make_quant,
     streaming_state_dict_to_shards,
 )
-from ..utils.structure import alias_all_from_turtle_if_meta
+from ..utils.structure import alias_all_from_turtle_if_meta, restore_rotation_preserved_modules
 from ..utils.torch import torch_empty_cache
 from ..version import __version__
 from ._const import DEFAULT_MAX_SHARD_SIZE, DEVICE
@@ -305,6 +305,12 @@ def ModelWriter(cls):
 
         # Due to shell/turtle state, we need to sync the modules from turtle to shell
         if not self.load_quantized_model:
+            restored = restore_rotation_preserved_modules(
+                shell_model=self.model,
+                preserved_modules=getattr(self, "_rotation_preserved_modules", None),
+            )
+            if restored:
+                log.info("Rotation: restored %s preserved modules before turtle sync.", restored)
             alias_all_from_turtle_if_meta(shell_model=self.model, turtle_model=self.turtle_model)
 
         offload_root = self.quantize_config.offload_to_disk_path if getattr(self.quantize_config, "offload_to_disk", False) else None
