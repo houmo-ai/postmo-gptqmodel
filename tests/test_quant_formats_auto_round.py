@@ -25,7 +25,6 @@ from gptqmodel.quantization import FORMAT, QUANT_CONFIG_FILENAME
 from gptqmodel.quantization.config import (
     META_FIELD_QUANTIZER,
     META_QUANTIZER_GPTQMODEL,
-    AutoRoundQuantizeConfig,
     METHOD as QUANT_METHOD,
     QuantizeConfig,
 )
@@ -66,7 +65,7 @@ def test_auto_round_quantize_config_roundtrips_on_saved_model():
     with tempfile.TemporaryDirectory() as native_dir:
         model.save_pretrained(native_dir)
 
-        quantize_config = AutoRoundQuantizeConfig(
+        quantize_config = QuantizeConfig(auto_round_enabled=True, 
             bits=4,
             group_size=16,
             sym=True,

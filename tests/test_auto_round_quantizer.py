@@ -12,7 +12,7 @@ from gptqmodel.quantization.auto_round import (
     quant_tensor_sym_gptq,
     search_scales,
 )
-from gptqmodel.quantization.config import AutoRoundQuantizeConfig, AutoRoundVersion, FORMAT
+from gptqmodel.quantization.config import AutoRoundVersion, FORMAT, QuantizeConfig
 
 
 def test_search_scales_returns_per_group_scale():
@@ -106,8 +106,8 @@ def test_build_qparams_from_best_params_uses_hessian_init_scale():
 def test_auto_round_loss_uses_versioned_behavior():
     pred = torch.tensor([[1.0, 2.0, 0.0, 0.0]], dtype=torch.float32)
     ref = torch.zeros_like(pred)
-    cfg_v1 = AutoRoundQuantizeConfig(bits=4, group_size=4, sym=True, format=FORMAT.GPTQ, auto_round_version=AutoRoundVersion.V1)
-    cfg_v2 = AutoRoundQuantizeConfig(bits=4, group_size=4, sym=True, format=FORMAT.GPTQ, auto_round_version=AutoRoundVersion.V2)
+    cfg_v1 = QuantizeConfig(auto_round_enabled=True, bits=4, group_size=4, sym=True, format=FORMAT.GPTQ, auto_round_version=AutoRoundVersion.V1)
+    cfg_v2 = QuantizeConfig(auto_round_enabled=True, bits=4, group_size=4, sym=True, format=FORMAT.GPTQ, auto_round_version=AutoRoundVersion.V2)
 
     loss_v1 = auto_round_loss(pred, ref, qcfg=cfg_v1)
     loss_v2 = auto_round_loss(pred, ref, qcfg=cfg_v2)
@@ -118,8 +118,8 @@ def test_auto_round_loss_uses_versioned_behavior():
 
 def test_clamp_auto_round_state_respects_version_scale_bounds():
     weight = torch.randn(2, 8, dtype=torch.float32)
-    cfg_v1 = AutoRoundQuantizeConfig(bits=4, group_size=4, sym=True, format=FORMAT.GPTQ, auto_round_version=AutoRoundVersion.V1)
-    cfg_v2 = AutoRoundQuantizeConfig(bits=4, group_size=4, sym=True, format=FORMAT.GPTQ, auto_round_version=AutoRoundVersion.V2)
+    cfg_v1 = QuantizeConfig(auto_round_enabled=True, bits=4, group_size=4, sym=True, format=FORMAT.GPTQ, auto_round_version=AutoRoundVersion.V1)
+    cfg_v2 = QuantizeConfig(auto_round_enabled=True, bits=4, group_size=4, sym=True, format=FORMAT.GPTQ, auto_round_version=AutoRoundVersion.V2)
 
     state_v1 = init_auto_round_state(weight, cfg_v1)
     state_v2 = init_auto_round_state(weight, cfg_v2)

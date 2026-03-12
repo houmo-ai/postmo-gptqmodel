@@ -6,7 +6,7 @@ from gptqmodel.looper.auto_round_processor import AutoRoundProcessor
 from gptqmodel.looper.named_module import NamedModule
 from gptqmodel.nn_modules.converter import Qwen3_5MoeExpertsNew
 from gptqmodel.quantization import FORMAT
-from gptqmodel.quantization.config import AutoRoundQuantizeConfig, AutoRoundVersion
+from gptqmodel.quantization.config import AutoRoundVersion, QuantizeConfig
 
 
 def _prepare_dataset_func(**kwargs):
@@ -14,7 +14,7 @@ def _prepare_dataset_func(**kwargs):
 
 
 def _make_processor(hessian_mse: bool = False, version: AutoRoundVersion = AutoRoundVersion.V1) -> AutoRoundProcessor:
-    qcfg = AutoRoundQuantizeConfig(
+    qcfg = QuantizeConfig(auto_round_enabled=True, 
         bits=4,
         group_size=4,
         sym=True,

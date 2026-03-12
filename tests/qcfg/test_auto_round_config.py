@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import torch
 
 from gptqmodel.quantization import FORMAT, QUANT_METHOD
-from gptqmodel.quantization.config import AutoRoundQuantizeConfig, AutoRoundVersion, METHOD, QuantizeConfig
+from gptqmodel.quantization.config import AutoRoundVersion, METHOD, QuantizeConfig
 from gptqmodel.utils import BACKEND
 from gptqmodel.utils.importer import select_quant_linear
 from gptqmodel.models.auto import _is_supported_quantization_config
@@ -14,7 +14,7 @@ from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
 
 
 def test_autoround_alias_and_config_roundtrip():
-    cfg = AutoRoundQuantizeConfig(
+    cfg = QuantizeConfig(auto_round_enabled=True, 
         bits=4,
         group_size=128,
         sym=True,

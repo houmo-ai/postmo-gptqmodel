@@ -16,7 +16,7 @@
 
 import torch
 from gptqmodel import GPTQModel
-from gptqmodel.quantization.config import AutoRoundQuantizeConfig  # noqa: E402
+from gptqmodel.quantization.config import QuantizeConfig  # noqa: E402
 from transformers import AutoTokenizer
 
 pretrained_model_id = "/monster/data/model/TinyLlama-1.1B-Chat-v1.0" # "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
@@ -30,7 +30,7 @@ def main():
         )
     ]
 
-    quantize_config = AutoRoundQuantizeConfig(
+    quantize_config = QuantizeConfig(auto_round_enabled=True, 
         bits=4,
         group_size=128
     )

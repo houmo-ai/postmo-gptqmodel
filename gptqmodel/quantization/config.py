@@ -59,6 +59,7 @@ META_FIELD_ACT_GROUP_AWARE = "act_group_aware"
 META_FIELD_GPTAQ_ENABLED = "gptaq"
 META_FIELD_AUTO_ROUND = "auto_round"
 AUTO_ROUND_VERSION_FIELD = "auto_round_version"
+AUTO_ROUND_ENABLED_FIELD = "auto_round_enabled"
 
 ADAPTER_FIELD = "adapter"
 
@@ -672,6 +673,7 @@ class QuantizeConfig():
     mse: float = field(default=0.0)
 
     # AutoRound-specific options
+    auto_round_enabled: Optional[bool] = field(default=None)
     iters: int = field(default=200)
     lr: Optional[float] = field(default=None)
     minmax_lr: Optional[float] = field(default=None)
@@ -794,6 +796,28 @@ class QuantizeConfig():
                     raise ValueError(f"QuantizeConfig: Unsupported `pack_dtype`: {self.pack_dtype}")
             else:
                 raise ValueError(f"QuantizeConfig: Unsupported `pack_dtype`: {self.pack_dtype}")
+
+        if isinstance(self.quant_method, str):
+            try:
+                self.quant_method = METHOD(self.quant_method.lower())
+            except ValueError as exc:
+                raise ValueError(
+                    f"QuantizeConfig: Unsupported `quant_method`: {self.quant_method}"
+                ) from exc
+        elif not isinstance(self.quant_method, METHOD):
+            raise ValueError(f"QuantizeConfig: Unsupported `quant_method`: {self.quant_method}")
+
+        if self.auto_round_enabled is not None and not isinstance(self.auto_round_enabled, bool):
+            raise ValueError("QuantizeConfig: `auto_round_enabled` must be a bool or None.")
+
+        if self.auto_round_enabled is True and self.quant_method != METHOD.AUTO_ROUND:
+            self.quant_method = METHOD.AUTO_ROUND
+        elif self.auto_round_enabled is False and self.quant_method == METHOD.AUTO_ROUND:
+            log.info("QuantizeConfig: `auto_round_enabled=False`, auto-switch quant_method to `gptq`.")
+            self.quant_method = METHOD.GPTQ
+
+        if self.auto_round_enabled is None:
+            self.auto_round_enabled = self.quant_method == METHOD.AUTO_ROUND
 
         # validate quant method and format is matched
         valid_formats = QUANT_METHOD_FORMAT_MAPPING.get(self.quant_method, None)
@@ -933,6 +957,7 @@ class QuantizeConfig():
                 )
 
         if self.quant_method == METHOD.AUTO_ROUND:
+            self.auto_round_enabled = True
             if self.auto_round_version is None:
                 self.auto_round_version = AutoRoundVersion.V2 if self.enable_alg_ext else AutoRoundVersion.V1
 
@@ -953,8 +978,8 @@ class QuantizeConfig():
                 self.minmax_lr = self.lr
             if self.auto_round_version == AutoRoundVersion.V2 and self.disable_opt_rtn is None:
                 self.disable_opt_rtn = True
-        elif self.auto_round_version is not None:
-            raise ValueError("QuantizeConfig: `auto_round_version` is only valid when `quant_method` is `auto_round`.")
+        else:
+            self.auto_round_enabled = False
 
         if self.hessian is None:
             self.hessian = HessianConfig()
@@ -1144,6 +1169,7 @@ class QuantizeConfig():
     def from_quant_config(cls, quantize_cfg, format: str = None):
         valid_formats = {FORMAT.GPTQ, FORMAT.GPTQ_V2, FORMAT.MARLIN, FORMAT.BITBLAS}
         format_auto_inferred = False
+        quant_method_explicit = False
         # compat: format can be passed in via from_quantized() if field missing from json
         if format:
             if format not in valid_formats:
@@ -1181,6 +1207,7 @@ class QuantizeConfig():
                 else:
                     raise ValueError(f"QuantizeConfig: Unknown quantization format: `{val}`.")
             elif key == QUANT_METHOD_FIELD:
+                quant_method_explicit = True
                 val = val.lower()
                 # compat: some hf models use quant_method=marlin or bitblas
                 if val == FORMAT.MARLIN:
@@ -1249,10 +1276,13 @@ class QuantizeConfig():
             normalized["hessian"] = meta_payload.get("hessian")
         if "gptaq" not in normalized and isinstance(meta_payload, dict) and "gptaq" in meta_payload:
             normalized["gptaq"] = meta_payload.get("gptaq")
-        if META_FIELD_AUTO_ROUND not in normalized and isinstance(meta_payload, dict) and META_FIELD_AUTO_ROUND in meta_payload:
+        auto_round_meta_present = False
+        if isinstance(meta_payload, dict) and META_FIELD_AUTO_ROUND in meta_payload:
             auto_round_payload = meta_payload.get(META_FIELD_AUTO_ROUND) or {}
             if isinstance(auto_round_payload, dict):
+                auto_round_meta_present = True
                 for key in (
+                    AUTO_ROUND_ENABLED_FIELD,
                     AUTO_ROUND_VERSION_FIELD,
                     "iters",
                     "lr",
@@ -1264,6 +1294,12 @@ class QuantizeConfig():
                 ):
                     if key not in normalized and key in auto_round_payload:
                         normalized[key] = auto_round_payload.get(key)
+                if AUTO_ROUND_ENABLED_FIELD not in normalized and "enabled" in auto_round_payload:
+                    normalized[AUTO_ROUND_ENABLED_FIELD] = auto_round_payload.get("enabled")
+        if auto_round_meta_present:
+            normalized.setdefault(AUTO_ROUND_ENABLED_FIELD, True)
+            if not quant_method_explicit and normalized.get(QUANT_METHOD_FIELD) == METHOD.GPTQ:
+                normalized[QUANT_METHOD_FIELD] = METHOD.AUTO_ROUND
         if "gc_mode" not in normalized and isinstance(meta_payload, dict) and "gc_mode" in meta_payload:
             normalized["gc_mode"] = meta_payload.get("gc_mode")
         if (
@@ -1368,6 +1404,7 @@ class QuantizeConfig():
         meta_payload[META_FIELD_HESSIAN_MSE] = self.hessian_mse
         if self.quant_method == METHOD.AUTO_ROUND:
             meta_payload[META_FIELD_AUTO_ROUND] = {
+                AUTO_ROUND_ENABLED_FIELD: self.auto_round_enabled,
                 AUTO_ROUND_VERSION_FIELD: (
                     self.auto_round_version.value
                     if isinstance(self.auto_round_version, AutoRoundVersion)
@@ -1414,10 +1451,13 @@ class QuantizeConfig():
             # ADAPTER_FIELD: self.adapter.to_dict() if self.adapter else None,
             # DO NOT EXPORT compute_device_filter since functions are not serializable
         }
+        if self.auto_round_enabled:
+            out[AUTO_ROUND_ENABLED_FIELD] = True
 
         if self.quant_method == METHOD.AUTO_ROUND:
             out.update(
                 {
+                    AUTO_ROUND_ENABLED_FIELD: self.auto_round_enabled,
                     AUTO_ROUND_VERSION_FIELD: (
                         self.auto_round_version.value
                         if isinstance(self.auto_round_version, AutoRoundVersion)
@@ -1497,8 +1537,3 @@ class BaseQuantizeConfig(QuantizeConfig):
         super().__init__(**kwargs)
         log.warn("QuantizeConfig: BaseQuantizeConfig is re-named and pending deprecation. Please use `QuantizeConfig` instead.")
 
-
-class AutoRoundQuantizeConfig(QuantizeConfig):
-    def __init__(self, **kwargs):
-        kwargs["quant_method"] = METHOD.AUTO_ROUND
-        super().__init__(**kwargs)

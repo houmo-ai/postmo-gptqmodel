@@ -7,7 +7,7 @@ from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 from gptqmodel import BACKEND, GPTQModel
 from gptqmodel.nn_modules.qlinear.torch import TorchQuantLinear
 from gptqmodel.quantization import FORMAT
-from gptqmodel.quantization.config import AutoRoundQuantizeConfig, AutoRoundVersion, ExpertsRoutingBypass, METHOD, MoEConfig
+from gptqmodel.quantization.config import AutoRoundVersion, ExpertsRoutingBypass, METHOD, MoEConfig, QuantizeConfig
 
 
 def _build_tiny_qwen3_moe():
@@ -46,7 +46,7 @@ def test_auto_round_quantizes_tiny_qwen3_moe_end_to_end(version):
     with tempfile.TemporaryDirectory() as native_dir:
         model.save_pretrained(native_dir)
 
-        qcfg = AutoRoundQuantizeConfig(
+        qcfg = QuantizeConfig(auto_round_enabled=True, 
             bits=4,
             group_size=16,
             sym=True,
@@ -105,7 +105,7 @@ def test_auto_round_quantizes_tiny_qwen3_moe_with_rotation():
     with tempfile.TemporaryDirectory() as native_dir:
         model.save_pretrained(native_dir)
 
-        qcfg = AutoRoundQuantizeConfig(
+        qcfg = QuantizeConfig(auto_round_enabled=True, 
             bits=4,
             group_size=16,
             sym=True,

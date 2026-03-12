@@ -1,7 +1,7 @@
 import pytest
 
 from gptqmodel.quantization import METHOD, QUANT_METHOD
-from gptqmodel.quantization.config import AutoRoundVersion, FORMAT, AutoRoundQuantizeConfig, QuantizeConfig
+from gptqmodel.quantization.config import AutoRoundVersion, FORMAT, QuantizeConfig
 
 
 def test_quant_method_alias_exports_auto_round():
@@ -10,7 +10,7 @@ def test_quant_method_alias_exports_auto_round():
 
 
 def test_auto_round_quantize_config_defaults_method():
-    cfg = AutoRoundQuantizeConfig(bits=4, group_size=128, sym=True, format=FORMAT.GPTQ)
+    cfg = QuantizeConfig(auto_round_enabled=True, bits=4, group_size=128, sym=True, format=FORMAT.GPTQ)
 
     assert cfg.quant_method == METHOD.AUTO_ROUND
     assert cfg.group_size == 128
@@ -18,8 +18,8 @@ def test_auto_round_quantize_config_defaults_method():
 
 
 def test_auto_round_quantize_config_derives_default_learning_rates():
-    cfg = AutoRoundQuantizeConfig(bits=4, group_size=128, sym=True, format=FORMAT.GPTQ, iters=200)
-    rtn_cfg = AutoRoundQuantizeConfig(bits=4, group_size=128, sym=True, format=FORMAT.GPTQ, iters=0)
+    cfg = QuantizeConfig(auto_round_enabled=True, bits=4, group_size=128, sym=True, format=FORMAT.GPTQ, iters=200)
+    rtn_cfg = QuantizeConfig(auto_round_enabled=True, bits=4, group_size=128, sym=True, format=FORMAT.GPTQ, iters=0)
 
     assert cfg.lr == pytest.approx(1.0 / 200)
     assert cfg.minmax_lr == pytest.approx(1.0 / 200)
@@ -28,15 +28,15 @@ def test_auto_round_quantize_config_derives_default_learning_rates():
 
 
 def test_auto_round_quantize_config_standardizes_version_switch():
-    cfg_v1 = AutoRoundQuantizeConfig(bits=4, group_size=128, sym=True, format=FORMAT.GPTQ)
-    cfg_v2 = AutoRoundQuantizeConfig(
+    cfg_v1 = QuantizeConfig(auto_round_enabled=True, bits=4, group_size=128, sym=True, format=FORMAT.GPTQ)
+    cfg_v2 = QuantizeConfig(auto_round_enabled=True, 
         bits=4,
         group_size=128,
         sym=True,
         format=FORMAT.GPTQ,
         auto_round_version=AutoRoundVersion.V2,
     )
-    legacy_v2 = AutoRoundQuantizeConfig(
+    legacy_v2 = QuantizeConfig(auto_round_enabled=True, 
         bits=4,
         group_size=128,
         sym=True,
@@ -54,7 +54,7 @@ def test_auto_round_quantize_config_standardizes_version_switch():
 
 def test_auto_round_v2_requires_symmetric_quantization():
     with pytest.raises(ValueError, match="requires `sym=True`"):
-        AutoRoundQuantizeConfig(
+        QuantizeConfig(auto_round_enabled=True, 
             bits=4,
             group_size=128,
             sym=False,
@@ -64,7 +64,7 @@ def test_auto_round_v2_requires_symmetric_quantization():
 
 
 def test_auto_round_quantize_config_to_dict_roundtrip():
-    cfg = AutoRoundQuantizeConfig(
+    cfg = QuantizeConfig(auto_round_enabled=True, 
         bits=4,
         group_size=128,
         sym=False,
@@ -88,6 +88,7 @@ def test_auto_round_quantize_config_to_dict_roundtrip():
     assert payload["sym"] is False
     assert payload["group_size"] == 128
     assert payload["meta"]["auto_round"] == {
+        "auto_round_enabled": True,
         "auto_round_version": "v1",
         "iters": 123,
         "lr": 0.02,

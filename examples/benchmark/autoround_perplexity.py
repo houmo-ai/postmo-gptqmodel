@@ -18,7 +18,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from gptqmodel import BACKEND, GPTQModel
 from gptqmodel.quantization import FORMAT
-from gptqmodel.quantization.config import AutoRoundQuantizeConfig, AutoRoundVersion
+from gptqmodel.quantization.config import AutoRoundVersion, QuantizeConfig
 from gptqmodel.utils.perplexity import Perplexity
 from gptqmodel.utils.torch import torch_empty_cache
 
@@ -149,7 +149,7 @@ def build_quantize_config(args, version: AutoRoundVersion, rotation_label: str):
     if args.offload_to_disk and offload_path is not None:
         offload_path = str(Path(offload_path) / f"{version.value}-{rotation_label}")
 
-    return AutoRoundQuantizeConfig(
+    return QuantizeConfig(auto_round_enabled=True, 
         bits=args.bits,
         group_size=args.group_size,
         sym=args.sym,

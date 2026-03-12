@@ -4,7 +4,6 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 from .config import (
-                     AutoRoundQuantizeConfig,
                      AutoRoundVersion,
                      FORMAT,
                      FORMAT_FIELD_CHECKPOINT,
