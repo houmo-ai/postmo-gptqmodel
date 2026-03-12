@@ -27,11 +27,11 @@ Notes:
 import copy
 from typing import Dict, Iterable, Optional, Set, Tuple
 
-import pcre as re
 import torch
 from torch import nn
 
 from ..utils.logger import setup_logger
+from ..utils.regex_compat import re
 
 
 # =========================

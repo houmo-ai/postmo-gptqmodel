@@ -13,7 +13,6 @@ import shutil
 from os.path import isfile, join
 from typing import Any, Dict, Optional, Union
 
-import pcre as re
 import torch
 import transformers
 from safetensors import safe_open
@@ -55,6 +54,7 @@ from ..utils.model import (
     make_quant,
     streaming_state_dict_to_shards,
 )
+from ..utils.regex_compat import re
 from ..utils.structure import alias_all_from_turtle_if_meta, restore_rotation_preserved_modules
 from ..utils.torch import torch_empty_cache
 from ..version import __version__

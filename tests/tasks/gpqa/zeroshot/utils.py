@@ -6,7 +6,7 @@
 import random
 
 import datasets
-import pcre as re
+from gptqmodel.utils.regex_compat import re
 
 
 def preprocess(text):

@@ -10,13 +10,13 @@ from enum import Enum
 from os.path import join
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import pcre as re
 import torch
 from packaging import version
 
 from ..adapter.adapter import Lora, normalize_adapter
 from ..utils.logger import setup_logger
 from ..utils.random_str import get_random_string
+from ..utils.regex_compat import re
 
 
 log = setup_logger()

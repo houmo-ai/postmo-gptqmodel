@@ -6,7 +6,7 @@
 import sys
 import unicodedata
 
-import pcre as re
+from gptqmodel.utils.regex_compat import re
 from lm_eval.filters.extraction import RegexFilter
 
 
