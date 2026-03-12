@@ -49,10 +49,13 @@ def iter_quant_linear_kernels() -> List[Type[BaseQuantLinear]]:
 
 
 def infer_quant_methods(cls: Type[BaseQuantLinear]) -> List[METHOD]:
-    return [
+    methods = [
         METHOD(method) if isinstance(method, METHOD) else METHOD(str(method).lower())
         for method in cls.SUPPORTS_METHODS
     ]
+    if METHOD.GPTQ in methods and METHOD.AUTO_ROUND not in methods:
+        methods.append(METHOD.AUTO_ROUND)
+    return methods
 
 
 def get_kernel_backends(cls: Type[BaseQuantLinear]) -> List[BACKEND]:
@@ -70,7 +73,7 @@ def get_kernel_for_backend(backend: BACKEND, quant_method: METHOD, fmt: FORMAT) 
     for cls in iter_quant_linear_kernels():
         if backend not in get_kernel_backends(cls):
             continue
-        if quant_method not in cls.SUPPORTS_METHODS:
+        if quant_method not in infer_quant_methods(cls):
             continue
         if fmt not in cls.SUPPORTS_FORMATS:
             continue

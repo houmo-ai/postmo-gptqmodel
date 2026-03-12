@@ -818,7 +818,7 @@ def pack_module(
 
         if (
             quantize_config is not None
-            and quantize_config.quant_method == METHOD.GPTQ
+            and quantize_config.quant_method in [METHOD.GPTQ, METHOD.AUTO_ROUND]
             and quantize_config.format == FORMAT.GPTQ
             and getattr(quant_linear_cls, "REQUIRES_FORMAT_V2", False)
         ):

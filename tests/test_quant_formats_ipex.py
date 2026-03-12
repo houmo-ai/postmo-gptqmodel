@@ -26,8 +26,9 @@ import tempfile  # noqa: E402
 
 from datasets import load_dataset  # noqa: E402
 from gptqmodel import BACKEND, GPTQModel, __version__, get_best_device  # noqa: E402
-from gptqmodel.quantization import FORMAT, METHOD as QUANT_METHOD, QUANT_CONFIG_FILENAME  # noqa: E402
-from gptqmodel.quantization.config import META_FIELD_QUANTIZER, META_QUANTIZER_GPTQMODEL, QuantizeConfig  # noqa: E402
+from gptqmodel.quantization import FORMAT, QUANT_CONFIG_FILENAME  # noqa: E402
+from gptqmodel.quantization.config import (META_FIELD_QUANTIZER, META_QUANTIZER_GPTQMODEL,  # noqa: E402
+                                           METHOD as QUANT_METHOD, QuantizeConfig)
 from gptqmodel.utils.torch import torch_empty_cache  # noqa: E402
 from models.model_test import ModelTest  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
@@ -78,7 +79,6 @@ class TestQuantization(ModelTest):
                     with open(tmpdirname + "/" + QUANT_CONFIG_FILENAME, "r") as f:
                         file_dict = json.loads(f.read())
 
-                        # make sure the json dict saved to file matches config in memory
                         assert model.quantize_config.to_dict() == file_dict
                         logging.info(f"Saved config file: {file_dict}")
 

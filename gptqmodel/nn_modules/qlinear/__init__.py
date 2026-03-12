@@ -95,6 +95,8 @@ class BaseQuantLinear(nn.Module):
         self.adapter =  copy.deepcopy(adapter)
 
         self.optimized = False
+        if not bias:
+            self.bias = None
 
         if self.pack_dtype == t.int8:
             self.pack_dtype_bits = 8

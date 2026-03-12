@@ -24,6 +24,7 @@ Notes:
 - Collapsing is generic: any numeric-indexed ModuleList whose qualified name matches `experts-regex`.
 """
 
+import copy
 from typing import Dict, Iterable, Optional, Set, Tuple
 
 import pcre as re
@@ -603,6 +604,72 @@ def _module_all_meta(mod: nn.Module) -> bool:
 
 def _is_leaf(mod: nn.Module) -> bool:
     return next(mod.named_children(), None) is None
+
+def _rotation_preserve_paths(
+    shell_model: nn.Module,
+    pre_lm_head_norm_module_name: Optional[str],
+    lm_head_name: Optional[str],
+) -> list[str]:
+    candidates = [
+        "model.embed_tokens",
+        "language_model.embed_tokens",
+        "model.language_model.embed_tokens",
+        pre_lm_head_norm_module_name,
+        lm_head_name,
+    ]
+    resolved: list[str] = []
+    seen: Set[str] = set()
+
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        try:
+            shell_model.get_submodule(path)
+        except AttributeError:
+            continue
+        resolved.append(path)
+        seen.add(path)
+
+    return resolved
+
+def capture_rotation_preserved_modules(
+    shell_model: nn.Module,
+    pre_lm_head_norm_module_name: Optional[str],
+    lm_head_name: Optional[str],
+) -> Dict[str, nn.Module]:
+    preserved: Dict[str, nn.Module] = {}
+
+    for path in _rotation_preserve_paths(shell_model, pre_lm_head_norm_module_name, lm_head_name):
+        module = shell_model.get_submodule(path)
+        if _module_all_meta(module):
+            continue
+        preserved[path] = copy.deepcopy(module).to(device="cpu")
+
+    return preserved
+
+def restore_rotation_preserved_modules(
+    shell_model: nn.Module,
+    preserved_modules: Optional[Dict[str, nn.Module]],
+) -> int:
+    if not preserved_modules:
+        return 0
+
+    restored = 0
+    for path, preserved in preserved_modules.items():
+        try:
+            current = shell_model.get_submodule(path)
+        except AttributeError:
+            continue
+
+        if not _module_all_meta(current):
+            continue
+
+        parent, leaf = _get_parent_and_leaf_by_path(shell_model, path)
+        setattr(parent, leaf, copy.deepcopy(preserved))
+        restored += 1
+        log.info(f"Rotation: Restored preserved module {path} before save")
+
+    return restored
 
 def alias_all_from_turtle_if_meta(
     shell_model: nn.Module,

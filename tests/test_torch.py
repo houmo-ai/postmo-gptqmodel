@@ -169,6 +169,24 @@ def test_gptq_post_init_creates_wf_unpack_buffers():
     assert module.wf_unsqueeze_neg_one is not None
 
 
+def test_biasless_torch_quant_linear_has_none_bias_when_buffers_are_deferred():
+    module = TorchQuantLinear(
+        bits=4,
+        group_size=32,
+        sym=True,
+        desc_act=False,
+        in_features=32,
+        out_features=32,
+        bias=False,
+        pack_dtype=torch.int32,
+        adapter=None,
+        register_buffers=False,
+    )
+
+    assert hasattr(module, "bias")
+    assert module.bias is None
+
+
 def test_cached_forward_matches_baseline():
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     module = _make_module(device)

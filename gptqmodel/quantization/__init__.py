@@ -4,6 +4,8 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 from .config import (
+                     AutoRoundQuantizeConfig,
+                     AutoRoundVersion,
                      FORMAT,
                      FORMAT_FIELD_CHECKPOINT,
                      FORMAT_FIELD_CODE,
@@ -29,3 +31,5 @@ from .config import (
 from .gptaq import GPTAQ
 from .gptq import GPTQ
 from .quantizer import Quantizer, quantize
+
+QUANT_METHOD = METHOD

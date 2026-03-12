@@ -57,6 +57,8 @@ META_FIELD_HESSIAN_MSE = "hessian_mse"
 META_FIELD_ACT_GROUP_AWARE = "act_group_aware"
 
 META_FIELD_GPTAQ_ENABLED = "gptaq"
+META_FIELD_AUTO_ROUND = "auto_round"
+AUTO_ROUND_VERSION_FIELD = "auto_round_version"
 
 ADAPTER_FIELD = "adapter"
 
@@ -80,6 +82,12 @@ class METHOD(str, Enum):
     GPTQ = "gptq"
     QQQ = "qqq"
     AWQ = "awq"
+    AUTO_ROUND = "auto_round"
+
+
+class AutoRoundVersion(str, Enum):
+    V1 = "v1"
+    V2 = "v2"
 
 
 class VramStrategy(str, Enum):
@@ -459,6 +467,12 @@ QUANT_METHOD_FORMAT_MAPPING = {
         FORMAT.MARLIN,
         FORMAT.BITBLAS,
     },
+    METHOD.AUTO_ROUND: {
+        FORMAT.GPTQ,
+        FORMAT.GPTQ_V2,
+        FORMAT.MARLIN,
+        FORMAT.BITBLAS,
+    },
     METHOD.QQQ: {
         FORMAT.QQQ,
     },
@@ -656,6 +670,16 @@ class QuantizeConfig():
     # mean square error calculation: may reduce error loss for some models
     hessian_mse: bool = field(default=False)
     mse: float = field(default=0.0)
+
+    # AutoRound-specific options
+    iters: int = field(default=200)
+    lr: Optional[float] = field(default=None)
+    minmax_lr: Optional[float] = field(default=None)
+    enable_minmax_tuning: bool = field(default=True)
+    enable_alg_ext: bool = field(default=False)
+    not_use_best_mse: bool = field(default=False)
+    disable_opt_rtn: Optional[bool] = field(default=None)
+    auto_round_version: Optional[AutoRoundVersion] = field(default=None)
 
     # properties that do not directly contributes to quantization or quant inference should be placed in meta
     # i.e. quantizer tool (producer) + version, timestamp, entity who made the quant, etc
@@ -872,16 +896,65 @@ class QuantizeConfig():
                     if key == "bits" and value not in fields_info[0].metadata["choices"]:
                         raise ValueError(f"QuantizeConfig: Layer `{layer}` only support quantization of  `{fields_info[0].metadata['choices']}` bits.")
                     elif key == "group_size" and value != -1 and value <= 0:
-                        raise ValueError("QuantizeConfig: `group_size` must be one of `[-1, 16, 32, 64, 128, 256, 512, 1024]`.")
+                        raise ValueError("QuantizeConfig: `group_size` must be -1 or a positive integer.")
 
-        if self.group_size != 64:
-            raise ValueError("QuantizeConfig: `group_size` must be 64.")
+        if self.group_size != -1 and self.group_size <= 0:
+            raise ValueError("QuantizeConfig: `group_size` must be -1 or a positive integer.")
 
         if not (0 < self.damp_percent < 1):
             raise ValueError("QuantizeConfig: `damp_percent` must between 0 and 1.")
 
         if self.damp_auto_increment < 0:
             raise ValueError("QuantizeConfig:: `damp_auto_increment` must greater than 0.")
+
+        if not isinstance(self.iters, int) or self.iters < 0:
+            raise ValueError("QuantizeConfig: `iters` must be a non-negative integer.")
+
+        if self.lr is not None and self.lr <= 0:
+            raise ValueError("QuantizeConfig: `lr` must be positive when provided.")
+
+        if self.minmax_lr is not None and self.minmax_lr <= 0:
+            raise ValueError("QuantizeConfig: `minmax_lr` must be positive when provided.")
+
+        if self.disable_opt_rtn is not None and not isinstance(self.disable_opt_rtn, bool):
+            raise ValueError("QuantizeConfig: `disable_opt_rtn` must be a bool or None.")
+
+        if self.auto_round_version is not None:
+            if isinstance(self.auto_round_version, str):
+                try:
+                    self.auto_round_version = AutoRoundVersion(self.auto_round_version.lower())
+                except ValueError as exc:
+                    raise ValueError(
+                        f"QuantizeConfig: `auto_round_version` must be one of {[v.value for v in AutoRoundVersion]}."
+                    ) from exc
+            elif not isinstance(self.auto_round_version, AutoRoundVersion):
+                raise ValueError(
+                    f"QuantizeConfig: `auto_round_version` must be one of {[v.value for v in AutoRoundVersion]}."
+                )
+
+        if self.quant_method == METHOD.AUTO_ROUND:
+            if self.auto_round_version is None:
+                self.auto_round_version = AutoRoundVersion.V2 if self.enable_alg_ext else AutoRoundVersion.V1
+
+            self.enable_alg_ext = self.auto_round_version == AutoRoundVersion.V2
+
+            if self.auto_round_version == AutoRoundVersion.V2 and not self.sym:
+                raise ValueError("QuantizeConfig: `auto_round_version='v2'` currently requires `sym=True`.")
+
+            if self.iters == 0:
+                self.lr = 5e-3 if self.lr is None else self.lr
+            elif self.lr is None:
+                if self.iters >= 1000 and self.bits <= 3:
+                    self.lr = 2.0 / self.iters
+                else:
+                    self.lr = 1.0 / self.iters
+
+            if self.minmax_lr is None:
+                self.minmax_lr = self.lr
+            if self.auto_round_version == AutoRoundVersion.V2 and self.disable_opt_rtn is None:
+                self.disable_opt_rtn = True
+        elif self.auto_round_version is not None:
+            raise ValueError("QuantizeConfig: `auto_round_version` is only valid when `quant_method` is `auto_round`.")
 
         if self.hessian is None:
             self.hessian = HessianConfig()
@@ -1114,7 +1187,7 @@ class QuantizeConfig():
                     normalized[FORMAT_FIELD_CODE] = FORMAT.MARLIN
                 elif val == FORMAT.BITBLAS:
                     normalized[FORMAT_FIELD_CODE] = FORMAT.BITBLAS
-                elif val not in {METHOD.GPTQ, METHOD.QQQ, METHOD.AWQ}:
+                elif val not in {METHOD.GPTQ, METHOD.QQQ, METHOD.AWQ, METHOD.AUTO_ROUND}:
                     raise ValueError(f"QuantizeConfig: Unknown quantization method: `{val}`.")
                 else:
                     normalized[QUANT_METHOD_FIELD] = val
@@ -1147,7 +1220,7 @@ class QuantizeConfig():
                 elif fmt == FORMAT.QQQ:
                     new_method = METHOD.QQQ
                 elif fmt == FORMAT.MARLIN:
-                    new_method = method if method in {METHOD.GPTQ, METHOD.AWQ} else METHOD.GPTQ
+                    new_method = method if method in {METHOD.GPTQ, METHOD.AWQ, METHOD.AUTO_ROUND} else METHOD.GPTQ
                 else:
                     new_method = allowed_methods[0] if allowed_methods else METHOD.GPTQ
                 if new_method != method:
@@ -1170,10 +1243,27 @@ class QuantizeConfig():
         meta_payload = normalized.get(META_FIELD)
         if "failsafe" not in normalized and isinstance(meta_payload, dict) and "failsafe" in meta_payload:
             normalized["failsafe"] = meta_payload.get("failsafe")
+        if "hessian_mse" not in normalized and isinstance(meta_payload, dict) and META_FIELD_HESSIAN_MSE in meta_payload:
+            normalized["hessian_mse"] = meta_payload.get(META_FIELD_HESSIAN_MSE)
         if "hessian" not in normalized and isinstance(meta_payload, dict) and "hessian" in meta_payload:
             normalized["hessian"] = meta_payload.get("hessian")
         if "gptaq" not in normalized and isinstance(meta_payload, dict) and "gptaq" in meta_payload:
             normalized["gptaq"] = meta_payload.get("gptaq")
+        if META_FIELD_AUTO_ROUND not in normalized and isinstance(meta_payload, dict) and META_FIELD_AUTO_ROUND in meta_payload:
+            auto_round_payload = meta_payload.get(META_FIELD_AUTO_ROUND) or {}
+            if isinstance(auto_round_payload, dict):
+                for key in (
+                    AUTO_ROUND_VERSION_FIELD,
+                    "iters",
+                    "lr",
+                    "minmax_lr",
+                    "enable_minmax_tuning",
+                    "enable_alg_ext",
+                    "not_use_best_mse",
+                    "disable_opt_rtn",
+                ):
+                    if key not in normalized and key in auto_round_payload:
+                        normalized[key] = auto_round_payload.get(key)
         if "gc_mode" not in normalized and isinstance(meta_payload, dict) and "gc_mode" in meta_payload:
             normalized["gc_mode"] = meta_payload.get("gc_mode")
         if (
@@ -1275,6 +1365,22 @@ class QuantizeConfig():
                 "alpha": self.gptaq.alpha,
                 "device": device_value,
             }
+        meta_payload[META_FIELD_HESSIAN_MSE] = self.hessian_mse
+        if self.quant_method == METHOD.AUTO_ROUND:
+            meta_payload[META_FIELD_AUTO_ROUND] = {
+                AUTO_ROUND_VERSION_FIELD: (
+                    self.auto_round_version.value
+                    if isinstance(self.auto_round_version, AutoRoundVersion)
+                    else self.auto_round_version
+                ),
+                "iters": self.iters,
+                "lr": self.lr,
+                "minmax_lr": self.minmax_lr,
+                "enable_minmax_tuning": self.enable_minmax_tuning,
+                "enable_alg_ext": self.enable_alg_ext,
+                "not_use_best_mse": self.not_use_best_mse,
+                "disable_opt_rtn": self.disable_opt_rtn,
+            }
         meta_payload["offload_to_disk"] = self.offload_to_disk
         meta_payload["offload_to_disk_path"] = self.offload_to_disk_path
         meta_payload["pack_impl"] = self.pack_impl
@@ -1308,6 +1414,26 @@ class QuantizeConfig():
             # ADAPTER_FIELD: self.adapter.to_dict() if self.adapter else None,
             # DO NOT EXPORT compute_device_filter since functions are not serializable
         }
+
+        if self.quant_method == METHOD.AUTO_ROUND:
+            out.update(
+                {
+                    AUTO_ROUND_VERSION_FIELD: (
+                        self.auto_round_version.value
+                        if isinstance(self.auto_round_version, AutoRoundVersion)
+                        else self.auto_round_version
+                    ),
+                    "iters": self.iters,
+                    "lr": self.lr,
+                    "minmax_lr": self.minmax_lr,
+                    "enable_minmax_tuning": self.enable_minmax_tuning,
+                    "enable_alg_ext": self.enable_alg_ext,
+                    "not_use_best_mse": self.not_use_best_mse,
+                    "disable_opt_rtn": self.disable_opt_rtn,
+                    FORMAT_FIELD_CODE: self.format,
+                    "sym": self.sym,
+                }
+            )
 
         if self.quant_method == METHOD.AWQ:
             out["zero_point"] = not self.sym
@@ -1370,3 +1496,9 @@ class BaseQuantizeConfig(QuantizeConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         log.warn("QuantizeConfig: BaseQuantizeConfig is re-named and pending deprecation. Please use `QuantizeConfig` instead.")
+
+
+class AutoRoundQuantizeConfig(QuantizeConfig):
+    def __init__(self, **kwargs):
+        kwargs["quant_method"] = METHOD.AUTO_ROUND
+        super().__init__(**kwargs)

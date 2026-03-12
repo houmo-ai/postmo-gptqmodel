@@ -86,3 +86,36 @@ def test_stream_tensor_dict_to_cpu_cuda_background_release_preserves_events():
     with state_lock:
         assert not state.get("streaming_events"), "stream_sync should clear pending tickets"
         assert "tensor" not in state.get("streaming_event_map", {}), "event map entry should be removed after sync"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for mixed payload test")
+def test_stream_tensor_dict_to_cpu_mixed_cpu_cuda_payload_falls_back_to_sync_copy():
+    device = torch.device("cuda", 0)
+    torch.cuda.set_device(device)
+
+    payload = {
+        "q_scales": torch.randn(8, 8, device=device, dtype=torch.float16),
+        "q_zeros": torch.randn(8, 8, device=device, dtype=torch.float16),
+        "q_g_idx": torch.arange(64, dtype=torch.int32).reshape(8, 8),
+    }
+    state: dict[str, object] = {}
+    state_lock = threading.RLock()
+    stored: dict[str, torch.Tensor] = {}
+
+    result = stream_tensor_dict_to_cpu(
+        payload,
+        store_callback=lambda items: stored.update(items),
+        state=state,
+        state_lock=state_lock,
+    )
+
+    assert set(result.keys()) == set(payload.keys())
+    assert all(t.device.type == "cpu" for t in result.values())
+    torch.testing.assert_close(result["q_scales"], payload["q_scales"].cpu())
+    torch.testing.assert_close(result["q_zeros"], payload["q_zeros"].cpu())
+    torch.testing.assert_close(result["q_g_idx"], payload["q_g_idx"].cpu())
+
+    with state_lock:
+        assert not state.get("streaming_events")
+        assert not state.get("streaming_event_map")
+    assert stored == result
