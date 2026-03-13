@@ -76,7 +76,7 @@ def calculate_avg_ppl(model, tokenizer, device=None):
         text_column="text",
         device=device,
     )
-    all = ppl.calculate(n_ctx=2048, n_batch=512)
+    all = ppl.calculate(n_ctx=512, n_batch=512)
     return sum(all) / len(all)
 
 
