@@ -22,12 +22,6 @@ MODEL_ROTATION_REGISTRY = [
         "rotate_fn": rotate_model_qwen3_5,
     },
     {
-        "cls": LlamaQModel,
-        "vision": False,
-        "fuse_norm": fuse_layer_norms,
-        "rotate_fn": rotate_model,
-    },
-    {
         "cls": Qwen2QModel,
         "vision": False,
         "fuse_norm": fuse_layer_norms,
@@ -96,6 +90,12 @@ MODEL_ROTATION_REGISTRY = [
         "vision": False,
         "fuse_norm": fuse_layer_norms_deepseekv3_mla_moe,
         "rotate_fn": rotate_model_deepseekv3_mla_moe,
+    },
+    {
+        "cls": LlamaQModel,
+        "vision": False,
+        "fuse_norm": fuse_layer_norms,
+        "rotate_fn": rotate_model,
     },
 ]
 
