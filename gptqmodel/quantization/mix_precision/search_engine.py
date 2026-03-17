@@ -36,7 +36,7 @@ class SearchResult:
     bit_allocation: Dict[str, Dict[str, int]]
     sensitivities: Dict[str, float]
     statistics: Dict[str, Any]
-    fixed_bits: Dict[str, int]
+    fixed_bits: Dict[str, Optional[int]]
 
 
 class MixPrecisionSearchEngine:
@@ -725,7 +725,7 @@ def expand_bit_allocation_to_modules(
     bit_allocation: Dict[str, Dict[str, int]],
     model: nn.Module,
     config: Dict[str, Any],
-    fixed_bits: Optional[Dict[str, int]] = None,
+    fixed_bits: Optional[Dict[str, Optional[int]]] = None,
 ) -> Dict[str, Dict[str, int]]:
     """将比特分配展开到所有模块
     

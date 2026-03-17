@@ -98,6 +98,10 @@ class Glm4MoeLiteQModel(BaseQModel):
     @classmethod
     def diceq_config_template(cls) -> Dict[str, Any]:
         class Glm4MoeLiteDiceQConfig(DiceQConfigBase):
+            # GLM-4.7-Flash mixed-precision flow defaults to pure GPTQ/mix-search.
+            # DiceQ can still be re-enabled by explicit extension override.
+            enabled: bool = False
+
             def build_layer_config(self) -> Dict[str, Any]:
                 # Weight-training mode by default for this model config.
                 base_weight = {"data_type": "weight", "debug": True}
@@ -238,9 +242,13 @@ class Glm4MoeLiteQModel(BaseQModel):
     def mix_precision_config_template(cls) -> Dict[str, Any]:
         """Return mix precision config template for GLM-4.7-Flash MoE model.
 
-        This model has MoE structure, so we enable MoE-specific settings:
-        - moe_unified=True: Each MoE layer's routed experts use the same bit
-        - Shared experts: Always independent (each linear gets its own bit)
+        The search space is restricted to modules that are actually quantized by
+        the GLM-4.7-Flash path:
+        - self attention projections
+        - routed/shared experts
+        - dense MLP projections on non-MoE layers
+
+        Router gates and lm_head are excluded from search.
         """
         class Glm4MoeLiteMixPrecisionConfig(MixPrecisionConfigBase):
             enabled: bool = True
@@ -250,6 +258,18 @@ class Glm4MoeLiteQModel(BaseQModel):
             threshold: float = 1e-6
             metric: str = "kl"
             moe_unified: bool = True
+            layer_include: List[str] = [
+                r"\.self_attn\.(?:q_proj|q_a_proj|q_b_proj|q_absorbed_proj|q_rope_proj|kv_a_proj_with_mqa|kv_a_proj_latent|kv_a_proj_rope|kv_b_proj|o_proj)$",
+                r"\.mlp\.shared_experts\.(?:gate_proj|up_proj|down_proj)$",
+                r"\.mlp\.experts\.(?:gate_proj|up_proj|down_proj)\.\d+$",
+                r"\.mlp\.(?:gate_proj|up_proj|down_proj)$",
+            ]
+            layer_exclude: List[str] = [
+                r"\.mlp\.gate$",
+            ]
+            fixed_bits: Dict[str, Optional[int]] = {
+                "lm_head": None,
+            }
 
         return Glm4MoeLiteMixPrecisionConfig().build()
 

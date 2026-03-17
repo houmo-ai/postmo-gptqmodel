@@ -23,14 +23,14 @@ class LayerSelectionResult:
         moe_groups: MoE组映射 {moe_group_key: [module_names]}
         moe_layers: MoE层映射 {moe_layer_key: {"experts": [...], "shared_experts": [...]}}
         regular_modules: 普通模块列表（非MoE）
-        fixed_bits: 固定bit配置的层 {module_name: bits}
+        fixed_bits: 固定bit配置的层 {module_name: bits or None}
         group_mapping: 分组映射 {module_name: group_name}
     """
     candidates: List[str]
     moe_groups: Dict[str, List[str]]
     moe_layers: Dict[str, Dict[str, List[str]]]
     regular_modules: List[str]
-    fixed_bits: Dict[str, int] = field(default_factory=dict)
+    fixed_bits: Dict[str, Optional[int]] = field(default_factory=dict)
     group_mapping: Dict[str, str] = field(default_factory=dict)
 
 
@@ -99,25 +99,25 @@ class LayerSelector:
         """
         return fnmatch.fnmatch(name, pattern)
     
-    def _get_fixed_bits_for_module(self, module_name: str) -> Optional[int]:
+    def _get_fixed_bits_for_module(self, module_name: str) -> tuple[bool, Optional[int]]:
         """获取模块的固定bit配置
-        
+
         优先精确匹配，其次通配符匹配
-        
+
         Args:
             module_name: 模块名称
-            
+
         Returns:
-            固定bit值，如果没有配置则返回None
+            (是否匹配, 固定bit值)
         """
         if module_name in self.fixed_bits:
-            return self.fixed_bits[module_name]
-        
+            return True, self.fixed_bits[module_name]
+
         for pattern, bits in self.fixed_bits.items():
             if self._match_path_pattern(module_name, pattern):
-                return bits
-        
-        return None
+                return True, bits
+
+        return False, None
     
     def _get_group_for_module(self, module_name: str) -> Optional[str]:
         """获取模块的分组名称
@@ -167,8 +167,8 @@ class LayerSelector:
             if not self._should_include(name):
                 continue
             
-            fixed_bits = self._get_fixed_bits_for_module(name)
-            if fixed_bits is not None:
+            fixed_bits_matched, fixed_bits = self._get_fixed_bits_for_module(name)
+            if fixed_bits_matched:
                 fixed_bits_map[name] = fixed_bits
                 continue
             
