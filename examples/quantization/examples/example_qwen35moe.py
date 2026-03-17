@@ -76,6 +76,7 @@ def build_moe_config(args):
 def build_dynamic_quant_config(args):
     return {
         r".*\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$": {"bits": args.self_attn_bits},
+        r".*\.linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$": {"bits": args.self_attn_bits},
         r".*\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$": {"bits": args.expert_bits},
         r".*\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)$": {"bits": args.shared_expert_bits},
     }

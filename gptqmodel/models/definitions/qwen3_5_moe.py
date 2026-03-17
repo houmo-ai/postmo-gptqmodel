@@ -20,7 +20,7 @@ class Qwen3_5_MoeQModel(BaseQModel):
 
     support_offload_to_disk = False
 
-    pre_lm_head_norm_module = "model.norm"
+    pre_lm_head_norm_module = "model.language_model.norm"
 
     awq_scale_optimize_shape_dependent_modules = ["self_attn.o_proj", "linear_attn.out_proj"]
     # awq scaling optimizations requires some modules within same subset to strictly match the shape of previous module
