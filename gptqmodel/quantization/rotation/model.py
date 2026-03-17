@@ -8,6 +8,7 @@ from gptqmodel.models.definitions.qwen2_5_vl import Qwen2_5_VLQModel
 from gptqmodel.models.definitions.qwen3_5 import Qwen3_5QModel
 from gptqmodel.models.definitions.qwen3_5_moe import Qwen3_5MoeQModel
 from gptqmodel.models.definitions.qwen3_moe import Qwen3MoeQModel
+from gptqmodel.models.definitions.qwen3_next import Qwen3NextGPTQ
 from gptqmodel.models.definitions.glm4_moe_lite import Glm4MoeLiteQModel
 from gptqmodel.models.definitions.deepseek_v2 import DeepSeekV2QModel
 from gptqmodel.models.definitions.deepseek_v2_ocr import DeepSeekV2OCRQModel
@@ -19,12 +20,6 @@ MODEL_ROTATION_REGISTRY = [
         "vision": False,
         "fuse_norm": fuse_layer_norms,
         "rotate_fn": rotate_model_qwen3_5,
-    },
-    {
-        "cls": LlamaQModel,
-        "vision": False,
-        "fuse_norm": fuse_layer_norms,
-        "rotate_fn": rotate_model,
     },
     {
         "cls": Qwen2QModel,
@@ -49,6 +44,12 @@ MODEL_ROTATION_REGISTRY = [
         "vision": False,
         "fuse_norm": fuse_layer_norms_qwen3_5_moe,
         "rotate_fn": rotate_model_qwen3_5_moe,
+    },
+    {
+        "cls": Qwen3NextGPTQ,
+        "vision": False,
+        "fuse_norm": fuse_layer_norms_qwen3_next,
+        "rotate_fn": rotate_model_qwen3_next,
     },
     {
         "cls": Qwen2_5_VLQModel,
@@ -89,6 +90,12 @@ MODEL_ROTATION_REGISTRY = [
         "vision": False,
         "fuse_norm": fuse_layer_norms_deepseekv3_mla_moe,
         "rotate_fn": rotate_model_deepseekv3_mla_moe,
+    },
+    {
+        "cls": LlamaQModel,
+        "vision": False,
+        "fuse_norm": fuse_layer_norms,
+        "rotate_fn": rotate_model,
     },
 ]
 

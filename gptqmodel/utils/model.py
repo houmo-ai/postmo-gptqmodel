@@ -21,7 +21,6 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import accelerate
-import pcre as re
 import torch
 import torch.nn as nn
 import transformers
@@ -57,6 +56,7 @@ from .ctx import ctx
 from .device import get_device
 from .importer import select_quant_linear
 from .logger import log_time_block, setup_logger
+from .regex_compat import re
 from .torch import HAS_CUDA, torch_empty_cache
 
 

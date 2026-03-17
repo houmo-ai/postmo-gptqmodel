@@ -42,5 +42,5 @@ class TestQwen3Next(ModelTest):
     # CALIB_NOISE_PERCENT = 0.025
     # USE_FLASH_ATTN = True
 
-    def test_mimo(self):
+    def test_qwen3_next(self):
         self.quant_lm_eval()

@@ -9,13 +9,13 @@ import os
 import random
 import time
 
-import pcre as re
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 
 from ..utils.logger import setup_logger
+from ..utils.regex_compat import re
 
 
 choices = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P"]
@@ -294,4 +294,3 @@ def mmlupro(model: PreTrainedModel,
         summary = file.read()
 
     return summary
-

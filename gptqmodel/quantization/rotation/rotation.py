@@ -17,6 +17,12 @@ from .hadamard_utils import apply_exact_had_to_linear, random_hadamard_matrix, r
 
 log = setup_logger()
 
+_ADDITIVE_NORM_CLASSES = {
+    "Qwen3_5MoeRMSNorm",
+    "Qwen3_5RMSNorm",
+    "Qwen3NextRMSNorm",
+}
+
 
 def fuse_ln_linear(
         layernorm: torch.nn.Module, linear_layers: typing.Iterable[torch.nn.Linear]
@@ -57,7 +63,7 @@ def _get_norm_scale(layernorm: torch.nn.Module) -> torch.Tensor:
     uses `(1 + weight) * x`.
     """
     weight = layernorm.weight.data.double()
-    if layernorm.__class__.__name__ in {"Qwen3_5MoeRMSNorm", "Qwen3_5RMSNorm"}:
+    if layernorm.__class__.__name__ in _ADDITIVE_NORM_CLASSES:
         return 1.0 + weight
     return weight
 
@@ -66,7 +72,7 @@ def _reset_norm_for_fusion(layernorm: torch.nn.Module) -> None:
     """
     Reset a norm module to the identity transform after fusing into linear ops.
     """
-    if layernorm.__class__.__name__ in {"Qwen3_5MoeRMSNorm", "Qwen3_5RMSNorm"}:
+    if layernorm.__class__.__name__ in _ADDITIVE_NORM_CLASSES:
         layernorm.weight.data.zero_()
         if hasattr(layernorm, "bias"):
             layernorm.bias.data.zero_()
@@ -318,6 +324,65 @@ def fuse_layer_norms_qwen3_5(
                     layer.linear_attn.in_proj_a,
                 ]
             )
+        if attn_inputs:
+            _fuse_norm_into_linears(input_ln, attn_inputs)
+
+        _reset_norm_for_fusion(post_ln)
+        _reset_norm_for_fusion(input_ln)
+
+    _fuse_pre_head_norm_if_present(model, pre_lm_head_norm_module_name, lm_head_name)
+
+    return model
+
+
+def fuse_layer_norms_qwen3_next(
+    model: PreTrainedModel,
+    pre_lm_head_norm_module_name: str,
+    layers_node: str,
+    lm_head_name: str,
+):
+    """
+    Qwen3-Next specific LN fusion.
+
+    Qwen3-Next uses `(1 + weight)` RMSNorm scaling, mixes full and linear token
+    mixers by layer, and alternates between dense and sparse-MoE MLP blocks.
+    """
+    layers, _ = get_module_by_name_prefix(model, layers_node)
+
+    for layer in layers:
+        post_ln = layer.post_attention_layernorm
+        input_ln = layer.input_layernorm
+        mlp = layer.mlp
+
+        mlp_inputs = []
+        if hasattr(mlp, "gate_proj") and hasattr(mlp, "up_proj"):
+            mlp_inputs.extend([mlp.gate_proj, mlp.up_proj])
+        else:
+            if hasattr(mlp, "gate") and hasattr(mlp.gate, "weight"):
+                gate_dtype = mlp.gate.weight.dtype
+                gate_w = mlp.gate.weight.data.double()
+                mlp.gate.weight.data = (gate_w * _get_norm_scale(post_ln)).to(gate_dtype)
+            if hasattr(mlp, "shared_expert"):
+                mlp_inputs.extend([mlp.shared_expert.gate_proj, mlp.shared_expert.up_proj])
+            if hasattr(mlp, "shared_expert_gate"):
+                mlp_inputs.append(mlp.shared_expert_gate)
+            experts = getattr(mlp, "experts", None)
+            if experts is not None:
+                if hasattr(experts, "gate_up_proj"):
+                    _fuse_norm_into_tensor_last_dim(post_ln, experts.gate_up_proj)
+                else:
+                    for expert in experts:
+                        if hasattr(expert, "gate_proj") and hasattr(expert, "up_proj"):
+                            mlp_inputs.extend([expert.gate_proj, expert.up_proj])
+
+        if mlp_inputs:
+            _fuse_norm_into_linears(post_ln, mlp_inputs)
+
+        attn_inputs = []
+        if hasattr(layer, "self_attn"):
+            attn_inputs.extend([layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj])
+        if hasattr(layer, "linear_attn"):
+            attn_inputs.extend([layer.linear_attn.in_proj_qkvz, layer.linear_attn.in_proj_ba])
         if attn_inputs:
             _fuse_norm_into_linears(input_ln, attn_inputs)
 
@@ -824,6 +889,95 @@ def rotate_mlp_output_qwen3_5(layer, Q, device) -> None:
         W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
 
 
+def rotate_attention_inputs_qwen3_next(layer, Q, device) -> None:
+    projections = []
+    if hasattr(layer, "self_attn"):
+        projections.extend([layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj])
+    if hasattr(layer, "linear_attn"):
+        projections.extend([layer.linear_attn.in_proj_qkvz, layer.linear_attn.in_proj_ba])
+
+    for W in projections:
+        dtype = W.weight.dtype
+        W_ = W.weight.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+
+def rotate_attention_output_qwen3_next(layer, Q, device) -> None:
+    if hasattr(layer, "self_attn"):
+        W = layer.self_attn.o_proj
+    elif hasattr(layer, "linear_attn"):
+        W = layer.linear_attn.out_proj
+    else:
+        return
+
+    dtype = W.weight.data.dtype
+    W_ = W.weight.data.to(device=device, dtype=torch.float64)
+    W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+    if W.bias is not None:
+        b = W.bias.data.to(device=device, dtype=torch.float64)
+        W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+
+def rotate_mlp_input_qwen3_next(layer, Q, device) -> None:
+    mlp = layer.mlp
+    mlp_inputs = []
+
+    if hasattr(mlp, "gate_proj") and hasattr(mlp, "up_proj"):
+        mlp_inputs.extend([mlp.gate_proj, mlp.up_proj])
+    else:
+        if hasattr(mlp, "gate") and hasattr(mlp.gate, "weight"):
+            gate_dtype = mlp.gate.weight.dtype
+            gate_w = mlp.gate.weight.data.to(device=device, dtype=torch.float64)
+            mlp.gate.weight.data = torch.matmul(gate_w, Q).to(device="cpu", dtype=gate_dtype)
+        if hasattr(mlp, "shared_expert"):
+            mlp_inputs.extend([mlp.shared_expert.gate_proj, mlp.shared_expert.up_proj])
+        if hasattr(mlp, "shared_expert_gate"):
+            mlp_inputs.append(mlp.shared_expert_gate)
+        experts = getattr(mlp, "experts", None)
+        if experts is not None:
+            if hasattr(experts, "gate_up_proj"):
+                dtype = experts.gate_up_proj.dtype
+                gate_up = experts.gate_up_proj.data.to(device=device, dtype=torch.float64)
+                experts.gate_up_proj.data = torch.matmul(gate_up, Q).to(device="cpu", dtype=dtype)
+            else:
+                for expert in experts:
+                    if hasattr(expert, "gate_proj") and hasattr(expert, "up_proj"):
+                        mlp_inputs.extend([expert.gate_proj, expert.up_proj])
+
+    for W in mlp_inputs:
+        dtype = W.weight.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+
+def rotate_mlp_output_qwen3_next(layer, Q, device) -> None:
+    mlp = layer.mlp
+    output_linears = []
+
+    if hasattr(mlp, "down_proj") and hasattr(mlp, "gate_proj"):
+        output_linears.append(mlp.down_proj)
+    if hasattr(mlp, "shared_expert"):
+        output_linears.append(mlp.shared_expert.down_proj)
+    experts = getattr(mlp, "experts", None)
+    if experts is not None:
+        if hasattr(experts, "down_proj") and isinstance(experts.down_proj, torch.nn.Parameter):
+            dtype = experts.down_proj.dtype
+            down_proj = experts.down_proj.data.to(device=device, dtype=torch.float64)
+            experts.down_proj.data = torch.matmul(Q.T, down_proj).to(device="cpu", dtype=dtype)
+        else:
+            for expert in experts:
+                if hasattr(expert, "down_proj"):
+                    output_linears.append(expert.down_proj)
+
+    for W in output_linears:
+        dtype = W.weight.data.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(Q.T, W_).to(device="cpu", dtype=dtype)
+        if W.bias is not None:
+            b = W.bias.data.to(device=device, dtype=torch.float64)
+            W.bias.data = torch.matmul(Q.T, b).to(device="cpu", dtype=dtype)
+
+
 @torch.inference_mode()
 def rotate_model_qwen3_5_moe(
     model: PreTrainedModel,
@@ -905,6 +1059,46 @@ def rotate_model_qwen3_5(
         rotate_attention_output_qwen3_5(layer, q_layer, device)
         rotate_mlp_input_qwen3_5(layer, q_layer, device)
         rotate_mlp_output_qwen3_5(layer, q_layer, device)
+
+    return model, Q_block
+
+
+@torch.inference_mode()
+def rotate_model_qwen3_next(
+    model: PreTrainedModel,
+    rotate_mode: str,
+    device: torch.device,
+    lm_head_name: str,
+    layers_node: str,
+    Q=None,
+):
+    q_block_spec = Q
+    if isinstance(Q, dict):
+        q_block_spec = Q.get("Q_block", Q.get("Q"))
+
+    text_config = getattr(model.config, "text_config", model.config)
+    hidden_size = getattr(text_config, "hidden_size", None)
+    if hidden_size is None:
+        raise ValueError("Qwen3-Next rotation requires `hidden_size` in model config.")
+
+    Q_block = _resolve_rotation_matrix(q_block_spec, 0, "Q_block")
+    if Q_block is None:
+        Q_block = get_orthogonal_matrix(hidden_size, rotate_mode, device)
+
+    rotate_embeddings(model, Q_block, device)
+    rotate_head(model, Q_block, device, lm_head_name)
+    torch_empty_cache()
+
+    layers, _ = get_module_by_name_prefix(model, layers_node)
+    for idx, layer in enumerate(log.pb(layers).title("Rotating Qwen3-Next")):
+        q_layer = _resolve_rotation_matrix(q_block_spec, idx, "Q_block")
+        if q_layer is None:
+            q_layer = Q_block
+
+        rotate_attention_inputs_qwen3_next(layer, q_layer, device)
+        rotate_attention_output_qwen3_next(layer, q_layer, device)
+        rotate_mlp_input_qwen3_next(layer, q_layer, device)
+        rotate_mlp_output_qwen3_next(layer, q_layer, device)
 
     return model, Q_block
 

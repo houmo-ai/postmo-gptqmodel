@@ -4,7 +4,6 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 
-import pcre as re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -12,6 +11,7 @@ import safetensors
 import torch
 
 from ..utils.logger import setup_logger
+from ..utils.regex_compat import re
 from .peft import LoraConfig
 from .remote import resolve_path
 

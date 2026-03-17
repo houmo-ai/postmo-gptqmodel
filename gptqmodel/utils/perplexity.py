@@ -26,6 +26,7 @@ class Perplexity:
             dataset_name=None,
             split="test",
             text_column="text",
+            device=None,
     ):
         """
         Calculate perplexity using the same method as seen in llama.cpp.
@@ -54,6 +55,7 @@ class Perplexity:
         self._dataset_name = dataset_name
         self._split = split
         self._text_column = text_column
+        self._device = device
         self._text = self._prepare_data()
 
     def _get_device(self):
@@ -97,6 +99,25 @@ class Perplexity:
 
         return "".join(datas)
 
+    def _resolve_runtime_device(self):
+        if self._device is not None:
+            return self._device
+
+        hf_device_map = getattr(self._model, "hf_device_map", None)
+        if isinstance(hf_device_map, dict):
+            for mapped_device in hf_device_map.values():
+                if mapped_device not in ("cpu", "disk"):
+                    return mapped_device
+
+        model_device = getattr(self._model, "device", None)
+        if model_device is not None:
+            return model_device
+
+        try:
+            return next(self._model.parameters()).device
+        except StopIteration:
+            return self._get_device()
+
     @staticmethod
     def softmax(logits):
         """
@@ -133,7 +154,8 @@ class Perplexity:
         """
         # Tokenize the text
         self._tokenizer.model_max_length = sys.maxsize
-        tokens = self._tokenizer(self._text, truncation=False, return_tensors="pt").input_ids.to(self._model.device)
+        runtime_device = self._resolve_runtime_device()
+        tokens = self._tokenizer(self._text, truncation=False, return_tensors="pt").input_ids.to(runtime_device)
 
         nll = 0.0  # Negative log likelihood
         count = 0  # Counter for processed tokens

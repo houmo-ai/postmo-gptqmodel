@@ -10,7 +10,6 @@ packaging>=24.2
 device-smi>=0.5.2
 protobuf>=6.32.0
 pillow>=11.3.0
-pypcre>=0.2.12
 hf_transfer>=0.1.9; python_version < "3.14"
 # for Qwen-Omni model
 soundfile==0.13.1

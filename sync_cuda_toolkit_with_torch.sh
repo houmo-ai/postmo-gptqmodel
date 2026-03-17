@@ -79,7 +79,7 @@ config_output=$({ printf '\n'; } | ${SUDO} update-alternatives --config cuda 2>&
 
 selection=$(CONFIG_OUTPUT="${config_output}" "${python_cmd}" - "${target_version}" <<'PY'
 import os
-import pcre as re
+import re
 import sys
 
 target = sys.argv[1]

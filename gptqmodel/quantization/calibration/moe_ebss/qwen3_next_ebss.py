@@ -34,12 +34,9 @@ def patch_qwen3_next_sparse_moe_block():
     def patched_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
-        router_logits = self.gate(hidden_states_reshaped)
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(hidden_states_reshaped.dtype)
+        # gate returns (router_logits, routing_weights, selected_experts)
+        # routing_weights are already softmax + topk + norm applied inside the router
+        router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
 
         if self.save_expert_cnt:
             if (
@@ -49,7 +46,7 @@ def patch_qwen3_next_sparse_moe_block():
             ):
                 self.top_cnt = torch.zeros(
                     batch_size,
-                    self.num_experts,
+                    self.gate.num_experts,
                     dtype=torch.float32,
                     device=hidden_states_reshaped.device,
                 )
@@ -62,19 +59,7 @@ def patch_qwen3_next_sparse_moe_block():
             )
             self.top_cnt += step_cnt
 
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, hidden_dim),
-            dtype=hidden_states_reshaped.dtype,
-            device=hidden_states_reshaped.device,
-        )
-        expert_mask = torch.nn.functional.one_hot(selected_experts, num_classes=self.num_experts).permute(2, 1, 0)
-        expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-        for expert_idx in expert_hit:
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx].squeeze(0))
-            current_state = hidden_states_reshaped[None, top_x].reshape(-1, hidden_dim)
-            current_hidden_states = expert_layer(current_state) * routing_weights[top_x, idx, None]
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states_reshaped.dtype))
+        final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
 
         shared_expert_output = self.shared_expert(hidden_states_reshaped)
         shared_expert_output = torch.sigmoid(self.shared_expert_gate(hidden_states_reshaped)) * shared_expert_output
