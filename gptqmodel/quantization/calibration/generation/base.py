@@ -4,7 +4,7 @@ from typing import Dict
 class CalibrationProviderBase:
     name = ""
 
-    def generate(self, model, tokenizer, cfg) -> str:
+    def generate(self, model, tokenizer, cfg):
         raise NotImplementedError()
 
 

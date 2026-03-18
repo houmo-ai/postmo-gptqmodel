@@ -21,5 +21,17 @@ def resolve_calibration_source(model, tokenizer, quantize_config, calibration):
 
     _register_default_providers()
     provider = get_calibration_provider(cfg.provider)
-    generated_path = provider.generate(model=model, tokenizer=tokenizer, cfg=cfg)
-    return load_calibration_jsonl(generated_path)
+    generated = provider.generate(model=model, tokenizer=tokenizer, cfg=cfg)
+
+    if isinstance(generated, dict):
+        rows = generated.get("rows")
+        if rows is not None:
+            return rows
+        output_path = generated.get("output_path")
+        if output_path:
+            return load_calibration_jsonl(output_path)
+
+    if isinstance(generated, str):
+        return load_calibration_jsonl(generated)
+
+    raise ValueError("Calibration generation: provider returned unsupported artifact.")

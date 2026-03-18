@@ -100,6 +100,24 @@ log_probs = torch.reshape(log_probs, (batch_size, num_beams * vocab_size))
 
 
 ## 面向MOE的校准集生成
+
+### 当前主路径：仓库内原生 EBSS 集成
+
+当前仓库已经支持通过量化配置直接启用 EBSS 校准集生成，并优先走进程内原生路径：
+
+- 不再以 subprocess 脚本调用作为主路径
+- 运行时优先直接返回内存中的 calibration rows
+- 如配置了 output_path，仍可额外导出 JSONL 用于复现与调试
+- beam search 采用实例级绑定方式，避免全局 monkey patch transformers.GenerationMixin
+
+推荐入口：
+
+- QuantizeConfig.calibration_generation.enabled=True
+- QuantizeConfig.calibration_generation.provider="moe_ebss"
+
+### 兼容路径：旧脚本
+
+下面的 qwen3_moe_gen.py / qwen3_next_gen.py 保留作为兼容与调试工具，便于单独分析生成质量或导出外部 JSONL；但仓库内量化流程不再依赖它们作为主执行路径。
 使用说明：以Qwen3-30B-A3B为例,
 
 ```

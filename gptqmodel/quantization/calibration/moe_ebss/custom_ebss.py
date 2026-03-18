@@ -173,7 +173,11 @@ def _beam_search_ebss(
         beam_indices = running_beam_indices.detach().clone()
          # init expert cnt
         num_layers = self.model.config.num_hidden_layers
-        num_experts = self.model.config.num_experts
+        num_experts = getattr(self.model.config, "num_experts", None)
+        if num_experts is None:
+            num_experts = getattr(self.model.config, "n_routed_experts", None)
+        if num_experts is None:
+            raise ValueError("EBSS beam search: unable to resolve number of experts from model config.")
         expert_cnt = [None] * num_layers
         for layer_num in range(0,num_layers):
             mlp = _get_ebss_moe_mlp(self.model, layer_num)
