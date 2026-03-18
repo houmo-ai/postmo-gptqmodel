@@ -350,6 +350,43 @@ class GPTAQConfig:
 
 
 @dataclass
+class CalibrationGenerationConfig:
+    enabled: bool = False
+    provider: str = "moe_ebss"
+    output_path: Optional[str] = None
+    nsamples: int = 128
+    seqlen: int = 2048
+    num_beams: int = 4
+    seed: Optional[int] = None
+    overwrite: bool = False
+    model_patch: Optional[str] = None
+    allow_override: bool = False
+
+    def __post_init__(self):
+        self.enabled = bool(self.enabled)
+
+        if self.provider is None:
+            self.provider = ""
+        self.provider = str(self.provider).strip().lower()
+
+        if self.output_path is not None:
+            self.output_path = str(self.output_path)
+
+        if not isinstance(self.nsamples, int) or self.nsamples <= 0:
+            raise ValueError("QuantizeConfig: `calibration_generation.nsamples` must be a positive integer.")
+        if not isinstance(self.seqlen, int) or self.seqlen <= 0:
+            raise ValueError("QuantizeConfig: `calibration_generation.seqlen` must be a positive integer.")
+        if not isinstance(self.num_beams, int) or self.num_beams <= 0:
+            raise ValueError("QuantizeConfig: `calibration_generation.num_beams` must be a positive integer.")
+
+        if self.enabled:
+            if not self.provider:
+                raise ValueError("QuantizeConfig: `calibration_generation.provider` is required when enabled.")
+            if not self.output_path:
+                raise ValueError("QuantizeConfig: `calibration_generation.output_path` is required when enabled.")
+
+
+@dataclass
 class BaseMoERouting:
     pass
 
@@ -779,6 +816,9 @@ class QuantizeConfig():
     # Mix precision search configuration (requires both mix_precision_search=True AND config.enabled=True)
     mix_precision_search: bool = field(default=False, metadata={"help": "Enable mix precision search (also requires enabled=True in mix_precision_config_template)"})
 
+    # Optional calibration dataset generation before quantization.
+    calibration_generation: Optional[CalibrationGenerationConfig] = field(default=None)
+
     def __post_init__(self):
         fields_info = fields(self)
 
@@ -1067,6 +1107,15 @@ class QuantizeConfig():
                 f"QuantizeConfig: `gc_mode` must be one of {[v.value for v in GcMode]}."
             )
 
+        if self.calibration_generation is None:
+            pass
+        elif isinstance(self.calibration_generation, dict):
+            self.calibration_generation = CalibrationGenerationConfig(**self.calibration_generation)
+        elif not isinstance(self.calibration_generation, CalibrationGenerationConfig):
+            raise ValueError(
+                "QuantizeConfig: `calibration_generation` must be a CalibrationGenerationConfig, dict, or None."
+            )
+
     def extension_set(self, key: str, value: Any):
         if self.adapter is None:
             self.adapter = {}
@@ -1274,6 +1323,12 @@ class QuantizeConfig():
             normalized["hessian_mse"] = meta_payload.get(META_FIELD_HESSIAN_MSE)
         if "hessian" not in normalized and isinstance(meta_payload, dict) and "hessian" in meta_payload:
             normalized["hessian"] = meta_payload.get("hessian")
+        if (
+            "calibration_generation" not in normalized
+            and isinstance(meta_payload, dict)
+            and "calibration_generation" in meta_payload
+        ):
+            normalized["calibration_generation"] = meta_payload.get("calibration_generation")
         if "gptaq" not in normalized and isinstance(meta_payload, dict) and "gptaq" in meta_payload:
             normalized["gptaq"] = meta_payload.get("gptaq")
         auto_round_meta_present = False
@@ -1420,6 +1475,9 @@ class QuantizeConfig():
             }
         meta_payload["offload_to_disk"] = self.offload_to_disk
         meta_payload["offload_to_disk_path"] = self.offload_to_disk_path
+        meta_payload["calibration_generation"] = (
+            asdict(self.calibration_generation) if self.calibration_generation is not None else None
+        )
         meta_payload["pack_impl"] = self.pack_impl
         meta_payload["mse"] = self.mse
         meta_payload["mock_quantization"] = self.mock_quantization

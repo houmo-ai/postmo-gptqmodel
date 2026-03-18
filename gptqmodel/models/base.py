@@ -949,6 +949,15 @@ class BaseQModel(nn.Module):
         if adapter is not None:
             self.quantize_config.adapter = adapter
 
+        from ..quantization.calibration.generation.runtime import resolve_calibration_source
+
+        calibration = resolve_calibration_source(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            quantize_config=self.quantize_config,
+            calibration=calibration,
+        )
+
         from ..adapter.adapter import Lora
         from ..looper.eora_processor import EoraProcessor
         from ..looper.module_looper import ModuleLooper

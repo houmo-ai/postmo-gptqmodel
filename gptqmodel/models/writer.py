@@ -411,7 +411,7 @@ def ModelWriter(cls):
         state_dict.clear()
 
         # save lora
-        if self.quantize_config.adapter:
+        if isinstance(self.quantize_config.adapter, Lora):
             _eora_save(self, save_dir=eora_path if eora_path else self.quantize_config.adapter.path, model_save_dir=save_dir)
 
         # Handle `dangling` tensor files that HF doesn't support (optional) but very useful

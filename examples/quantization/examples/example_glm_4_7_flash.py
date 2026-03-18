@@ -83,6 +83,24 @@ def build_mix_precision_override(model, args):
     return override
 
 
+def build_calibration_generation_config(args, save_dir: str):
+    if not args.calib_gen_enabled:
+        return None
+
+    output_path = args.calib_gen_output_path or os.path.join(save_dir, "calibration_generation.jsonl")
+    return {
+        "enabled": True,
+        "provider": args.calib_gen_provider,
+        "output_path": output_path,
+        "nsamples": args.calib_gen_nsamples if args.calib_gen_nsamples is not None else args.nsamples,
+        "seqlen": args.calib_gen_seqlen if args.calib_gen_seqlen is not None else args.seqlen,
+        "num_beams": args.calib_gen_num_beams,
+        "overwrite": args.calib_gen_overwrite,
+        "model_patch": args.calib_gen_model_patch,
+        "allow_override": args.calib_gen_allow_override,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="/data02/datasets/GLM-4.7-Flash", help="HF 模型 ID 或本地路径，例如 mistralai/GptOss-8x7B-v0.1")
@@ -101,6 +119,15 @@ def main():
     parser.add_argument("--moe-only-mix-search", action="store_true", help="普通 linear 固定为 --non-moe-fixed-bits，仅对 MoE 算子做混合精度搜索")
     parser.add_argument("--non-moe-fixed-bits", type=int, default=8, help="开启 --moe-only-mix-search 时，普通 linear 固定使用的 bit 数")
     parser.add_argument("--diceq-search", action="store_true", help="启用 DiceQ 搜索")
+    parser.add_argument("--calib-gen-enabled", action="store_true", help="启用基于配置的校准集自生成")
+    parser.add_argument("--calib-gen-provider", type=str, default="moe_ebss", help="校准集生成 provider")
+    parser.add_argument("--calib-gen-output-path", type=str, default=None, help="自生成校准集 JSONL 输出路径")
+    parser.add_argument("--calib-gen-nsamples", type=int, default=None, help="自生成样本数，默认跟随 --nsamples")
+    parser.add_argument("--calib-gen-seqlen", type=int, default=None, help="自生成序列长度，默认跟随 --seqlen")
+    parser.add_argument("--calib-gen-num-beams", type=int, default=4, help="自生成 beam 数")
+    parser.add_argument("--calib-gen-overwrite", action="store_true", help="允许覆盖已有自生成输出")
+    parser.add_argument("--calib-gen-model-patch", type=str, default=None, help="强制指定生成脚本模型 patch")
+    parser.add_argument("--calib-gen-allow-override", action="store_true", help="允许覆盖显式传入的 calibration 数据")
     args = parser.parse_args()
 
     model_id = os.path.normpath(args.model)
@@ -108,7 +135,9 @@ def main():
     save_dir = args.out or f"{model_name}-{args.bits}bit-{args.group_size}g-hessian_mse"
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True, trust_remote_code=True)
-    calib_dataset = build_calib_dataset(tokenizer, nsamples=args.nsamples, seqlen=args.seqlen)
+    calib_dataset = None
+    if not args.calib_gen_enabled:
+        calib_dataset = build_calib_dataset(tokenizer, nsamples=args.nsamples, seqlen=args.seqlen)
 
     qcfg = QuantizeConfig(
         bits=args.bits,
@@ -119,6 +148,7 @@ def main():
         hessian_mse=bool(args.hessian_mse),
         mix_precision_search=args.mix_precision_search,
         diceq_search=args.diceq_search,
+        calibration_generation=build_calibration_generation_config(args, save_dir),
     )
 
     model = GPTQModel.load(model_id, qcfg, trust_remote_code=True)

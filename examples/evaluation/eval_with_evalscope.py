@@ -1,7 +1,8 @@
 import argparse
 import os
+import re
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from gptqmodel import BACKEND, GPTQModel
@@ -13,6 +14,76 @@ from evalscope.api.messages import ChatMessage
 from evalscope.api.registry import register_model_api
 from evalscope.api.model import GenerateConfig, ModelAPI, ModelOutput
 from evalscope import TaskConfig, run_task
+
+
+# ── 性能修复: monkey-patch dynamic_get ──
+# 原始 dynamic_get 对每个 module_name 遍历所有 dynamic 条目做 re.match，
+# 对于大型 MoE 模型 (9000+ 条目) 会导致加载耗时数分钟甚至卡死。
+# 优化策略：先做 dict O(1) 查找，只对含 regex 特殊字符的 pattern 才回退到正则。
+import gptqmodel.quantization.config as _qconfig
+
+_REGEX_SPECIAL = re.compile(r'[*+?\[\](){}|^$\\]')
+
+def _fast_dynamic_get(
+    dynamic: Dict[str, Dict[str, Union[int, bool]]],
+    module_name: str,
+    key: str = None,
+    default: Union[int, bool] = None,
+    sub_key: str = None,
+) -> Union[Dict, int, bool]:
+    if dynamic is None:
+        return default
+
+    def _extract(overrides):
+        if key is None:
+            return overrides
+        if sub_key:
+            sub_value = overrides.get(key, None)
+            if sub_value is None and key in _qconfig.DYNAMIC_FIELD_SYNONYMS:
+                for lk in _qconfig.DYNAMIC_FIELD_SYNONYMS[key]:
+                    if lk in overrides:
+                        sub_value = overrides[lk]
+                        break
+            if isinstance(sub_value, dict):
+                return sub_value.get(sub_key, default)
+            return default
+        if key in overrides:
+            return overrides[key]
+        if key in _qconfig.DYNAMIC_FIELD_SYNONYMS:
+            for lk in _qconfig.DYNAMIC_FIELD_SYNONYMS[key]:
+                if lk in overrides:
+                    return overrides[lk]
+        return default
+
+    # 快速路径: dict 精确查找 (覆盖 99%+ 场景)
+    if module_name in dynamic:
+        return _extract(dynamic[module_name])
+    if f"+:{module_name}" in dynamic:
+        return _extract(dynamic[f"+:{module_name}"])
+    if f"-:{module_name}" in dynamic:
+        return False
+
+    # 慢速路径: 仅对含 regex 特殊字符的 pattern 执行正则
+    for pattern, overrides in dynamic.items():
+        is_exclude = pattern.startswith("-:")
+        clean = pattern.removeprefix("-:").removeprefix("+:")
+        if not _REGEX_SPECIAL.search(clean):
+            continue  # 纯文本 pattern 已在快速路径处理
+        if is_exclude:
+            if re.match(clean, module_name):
+                return False
+        elif re.match(clean, module_name):
+            return _extract(overrides)
+
+    return default
+
+_qconfig.dynamic_get = _fast_dynamic_get
+# 同时 patch 已通过 from import 绑定的引用
+import gptqmodel.models.base as _base_module
+import gptqmodel.utils.model as _model_utils
+_base_module.dynamic_get = _fast_dynamic_get
+_model_utils.dynamic_get = _fast_dynamic_get
+# ── 性能修复结束 ──
 
 
 @register_model_api(name="EvalModel")
@@ -131,14 +202,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backend",
         type=str,
-        default="triton",
-        help="量化模型后端，示例：triton/cuda/auto",
+        default="torch",
+        help="量化模型后端，示例：torch/triton/auto（默认torch以加快加载）",
     )
     parser.add_argument(
         "--auto-device-map",
         action="store_true",
-        default=True,
-        help="多卡时使用 device_map=auto",
+        default=False,
+        help="多卡时使用 device_map=auto（注意：可能导致加载卡死，默认关闭）",
     )
     parser.add_argument(
         "--disable-auto-device-map",
@@ -264,23 +335,31 @@ def load_model_and_tokenizer(args: argparse.Namespace, task_config: Dict[str, An
             "trust_remote_code": args.trust_remote_code,
         }
         if gpu_count > 1 and args.auto_device_map:
-            print(f"使用 {gpu_count} 张GPU加载量化模型")
+            print(f"[DEBUG] 使用 {gpu_count} 张GPU加载量化模型（device_map=auto）...")
             load_kwargs["device_map"] = "auto"
         else:
-            print("使用单卡方式加载量化模型")
+            print(f"[DEBUG] 使用单卡方式加载量化模型到 {device}")
             load_kwargs["device"] = device
 
-        model = GPTQModel.load(args.model_path, **load_kwargs)
+        print(f"[DEBUG] 开始加载量化模型: {args.model_path}")
+        print(f"[DEBUG] 加载参数: backend={load_kwargs.get('backend')}, trust_remote_code={load_kwargs.get('trust_remote_code')}")
+        model = GPTQModel.load(args.model_path, offload_to_disk=False, **load_kwargs)
+        print(f"[DEBUG] 量化模型加载完成")
+        
         tokenizer = getattr(model, "tokenizer", None)
         if tokenizer is None:
+            print(f"[DEBUG] 从路径加载tokenizer: {args.model_path}")
             tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=args.use_fast_tokenizer)
+            print(f"[DEBUG] tokenizer加载完成")
+        else:
+            print(f"[DEBUG] 模型内置tokenizer已加载")
     else:
         load_kwargs = {
             "torch_dtype": "auto",
             "trust_remote_code": args.trust_remote_code,
         }
         if gpu_count > 1 and args.auto_device_map:
-            print(f"使用 {gpu_count} 张GPU加载浮点模型")
+            print(f"[DEBUG] 使用 {gpu_count} 张GPU加载浮点模型（device_map=auto）...")
             load_kwargs.update(
                 {
                     "device_map": "auto",
@@ -289,13 +368,18 @@ def load_model_and_tokenizer(args: argparse.Namespace, task_config: Dict[str, An
                 }
             )
         else:
-            print("使用单卡方式加载浮点模型")
+            print(f"[DEBUG] 使用单卡方式加载浮点模型到 {device}")
             load_kwargs["device_map"] = device
 
+        print(f"[DEBUG] 开始加载浮点模型: {args.model_path}")
         model = AutoModelForCausalLM.from_pretrained(args.model_path, **load_kwargs)
+        print(f"[DEBUG] 浮点模型加载完成")
+        
+        print(f"[DEBUG] 从路径加载tokenizer: {args.model_path}")
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=args.use_fast_tokenizer)
+        print(f"[DEBUG] tokenizer加载完成")
 
-    print(f"------- load model from {args.model_path} --------")
+    print(f"[DEBUG] ===== 模型与tokenizer全部加载完成 =====")
     return model, tokenizer
 
 
