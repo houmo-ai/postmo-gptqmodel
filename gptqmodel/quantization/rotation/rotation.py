@@ -480,6 +480,51 @@ def fuse_vision_layer_norms_qwen3_vl(model: PreTrainedModel, pre_lm_head_norm_mo
     return model
 
 
+def _get_qwen3_5_multimodal_root(model: PreTrainedModel):
+    root = getattr(model, "model", model)
+    if not hasattr(root, "visual") or not hasattr(root, "language_model"):
+        raise AttributeError(
+            f"Expected Qwen3.5 multimodal root to expose `visual` and `language_model`, got {type(root).__name__}"
+        )
+    return root
+
+
+def _get_qwen3_5_visual(model: PreTrainedModel):
+    return _get_qwen3_5_multimodal_root(model).visual
+
+
+def _get_qwen3_5_language_model(model: PreTrainedModel):
+    return _get_qwen3_5_multimodal_root(model).language_model
+
+
+def fuse_vision_layer_norms_qwen3_5_vl(model: PreTrainedModel, pre_lm_head_norm_module_name: str, layers_node: str, lm_head_name: str):
+    model = model.eval()
+    visual = _get_qwen3_5_visual(model)
+
+    bake_mean_into_linear_conv(visual.patch_embed.proj, visual.blocks[0].attn.qkv.in_features)
+    for W in [visual.pos_embed]:
+        W_ = W.weight.data.double()
+        W.weight.data = (W_ - W_.mean(dim=-1, keepdim=True)).to(W.weight.data.dtype)
+
+    for layer in visual.blocks:
+        fuse_ln_linear(layer.norm1, [layer.attn.qkv])
+        reset_ln(layer.norm1)
+        bake_mean_into_linear(layer.attn.proj)
+        fuse_ln_linear(layer.norm2, [layer.mlp.linear_fc1])
+        reset_ln(layer.norm2)
+        bake_mean_into_linear(layer.mlp.linear_fc2)
+
+    fuse_merger_linear(visual.merger.norm, [visual.merger.linear_fc1])
+    reset_ln(visual.merger.norm)
+
+    for layer in getattr(visual, "deepstack_merger_list", []):
+        if hasattr(layer, "norm") and hasattr(layer, "linear_fc1"):
+            fuse_merger_linear(layer.norm, [layer.linear_fc1])
+            reset_ln(layer.norm)
+
+    return model
+
+
 def random_orthogonal_matrix(size, device):
     """
     Generate a random orthogonal matrix of the specified size.
@@ -557,6 +602,29 @@ def rotate_visual_merger_qwen3_vl(model, Q: torch.Tensor, device) -> None:
         dtype=dtype, device=device).reshape(o_shape, i_shape).contiguous()
 
 
+def rotate_visual_merger_qwen3_5_vl(model, Q: torch.Tensor, device) -> None:
+    visual = _get_qwen3_5_visual(model)
+
+    dtype = visual.merger.linear_fc1.weight.dtype
+    q_shape = Q.shape[0]
+    o_shape, i_shape = visual.merger.linear_fc1.weight.shape
+
+    W_ = visual.merger.linear_fc1.weight.to(
+        dtype=torch.float64, device=device).reshape(o_shape, -1, q_shape)
+    visual.merger.linear_fc1.weight.data = torch.matmul(W_, Q).to(
+        dtype=dtype, device=device).reshape(o_shape, i_shape).contiguous()
+
+    for layer in getattr(visual, "deepstack_merger_list", []):
+        if not hasattr(layer, "linear_fc1"):
+            continue
+        layer_dtype = layer.linear_fc1.weight.dtype
+        layer_o_shape, layer_i_shape = layer.linear_fc1.weight.shape
+        layer_w = layer.linear_fc1.weight.to(
+            dtype=torch.float64, device=device).reshape(layer_o_shape, -1, q_shape)
+        layer.linear_fc1.weight.data = torch.matmul(layer_w, Q).to(
+            dtype=layer_dtype, device=device).reshape(layer_o_shape, layer_i_shape).contiguous()
+
+
 def rotate_qwen3_vl_embeddings(model, Q, device) -> None:
     for W in [model.language_model.embed_tokens]:
         dtype  = W.weight.data.dtype
@@ -577,6 +645,31 @@ def rotate_qwen3_vl_embeddings(model, Q, device) -> None:
             layer.linear_fc2.bias.data = torch.matmul(b, Q).to(dtype=dtype, device="cpu")
 
 
+def rotate_qwen3_5_vl_embeddings(model, Q, device) -> None:
+    language_model = _get_qwen3_5_language_model(model)
+    visual = _get_qwen3_5_visual(model)
+
+    for W in [language_model.embed_tokens]:
+        dtype = W.weight.data.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+    merger_dtype = visual.merger.linear_fc2.weight.data.dtype
+    W_ = visual.merger.linear_fc2.weight.data.to(dtype=torch.float64, device=device)
+    visual.merger.linear_fc2.weight.data = torch.matmul(Q.T, W_).to(dtype=merger_dtype, device="cpu")
+    if visual.merger.linear_fc2.bias is not None:
+        b = visual.merger.linear_fc2.bias.data.to(dtype=torch.float64, device=device)
+        visual.merger.linear_fc2.bias.data = torch.matmul(b, Q).to(dtype=merger_dtype, device="cpu")
+
+    for layer in getattr(visual, "deepstack_merger_list", []):
+        layer_dtype = layer.linear_fc2.weight.data.dtype
+        W_ = layer.linear_fc2.weight.data.to(dtype=torch.float64, device=device)
+        layer.linear_fc2.weight.data = torch.matmul(Q.T, W_).to(dtype=layer_dtype, device="cpu")
+        if layer.linear_fc2.bias is not None:
+            b = layer.linear_fc2.bias.data.to(dtype=torch.float64, device=device)
+            layer.linear_fc2.bias.data = torch.matmul(b, Q).to(dtype=layer_dtype, device="cpu")
+
+
 def rotate_qwen2_5_vl_embeddings(model, Q, device) -> None:
     for W in [model.language_model.embed_tokens]:
         dtype  = W.weight.data.dtype
@@ -593,6 +686,14 @@ def rotate_qwen2_5_vl_embeddings(model, Q, device) -> None:
 def rotate_qwen3_vl_vision_embeddings(model, Q, device) -> None:
     for W in [model.visual.pos_embed]:
         dtype  = W.weight.data.dtype
+        W_ = W.weight.data.to(device=device, dtype=torch.float64)
+        W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
+
+
+def rotate_qwen3_5_vl_vision_embeddings(model, Q, device) -> None:
+    visual = _get_qwen3_5_visual(model)
+    for W in [visual.pos_embed]:
+        dtype = W.weight.data.dtype
         W_ = W.weight.data.to(device=device, dtype=torch.float64)
         W.weight.data = torch.matmul(W_, Q).to(device="cpu", dtype=dtype)
 
@@ -1229,6 +1330,40 @@ def rotate_model_qwen3_vl(model: PreTrainedModel, rotate_mode: str, device: torc
 
 
 @torch.inference_mode()
+def rotate_model_qwen3_5_vl(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
+                            layers_node: str, Q=None):
+    q_block_spec = Q
+    if isinstance(Q, dict):
+        q_block_spec = Q.get("Q_block", Q.get("Q"))
+
+    text_config = getattr(model.config, "text_config", model.config)
+    hidden_size = getattr(text_config, "hidden_size", None)
+    if hidden_size is None:
+        raise ValueError("Qwen3.5-VL rotation requires `hidden_size` in text config.")
+
+    Q_block = _resolve_rotation_matrix(q_block_spec, 0, "Q_block")
+    if Q_block is None:
+        Q_block = get_orthogonal_matrix(hidden_size, rotate_mode, device)
+
+    rotate_qwen3_5_vl_embeddings(model, Q_block, device)
+    rotate_head(model, Q_block, device, lm_head_name)
+    torch_empty_cache()
+
+    layers, _ = get_module_by_name_prefix(model, layers_node)
+    for idx, layer in enumerate(log.pb(layers).title("Rotating Qwen3.5-VL")):
+        q_layer = _resolve_rotation_matrix(q_block_spec, idx, "Q_block")
+        if q_layer is None:
+            q_layer = Q_block
+
+        rotate_attention_inputs_qwen3_5(layer, q_layer, device)
+        rotate_attention_output_qwen3_5(layer, q_layer, device)
+        rotate_mlp_input_qwen3_5(layer, q_layer, device)
+        rotate_mlp_output_qwen3_5(layer, q_layer, device)
+
+    return model, Q_block
+
+
+@torch.inference_mode()
 def rotate_model_moe(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
                           layers_node: str, Q=None):
     q_block_spec = Q
@@ -1325,6 +1460,32 @@ def rotate_qwen3_vl_deepstack_merger(model, Q: torch.Tensor, device) -> None:
         o_shape, i_shape = layer.linear_fc1.weight.shape
         W_ = layer.linear_fc1.weight.to(device=device, dtype=torch.float64).reshape(o_shape, -1, q_shape)
         layer.linear_fc1.weight.data = torch.matmul(W_, Q).to(device=device, dtype=dtype).reshape(o_shape, i_shape).contiguous()
+@torch.inference_mode()
+def rotate_vision_model_qwen3_5_vl(model: PreTrainedModel, rotate_mode: str, device: torch.device, lm_head_name: str,
+                                   layers_node: str, Q=None):
+    visual = _get_qwen3_5_visual(model)
+    Q = (
+        get_orthogonal_matrix(
+            visual.blocks[0].attn.qkv.in_features, rotate_mode, device
+        )
+        if Q is None
+        else Q
+    )
+    rotate_conv(
+        visual.patch_embed.proj,
+        Q,
+        visual.blocks[0].attn.qkv.in_features,
+        device,
+    )
+    rotate_qwen3_5_vl_vision_embeddings(model, Q, device)
+    torch_empty_cache()
+    for idx, layer in enumerate(log.pb(visual.blocks).title("Rotating Qwen3.5-Vision")):
+        rotate_attention_inputs(layer, Q, device)
+        rotate_attention_output(layer, Q, device)
+        rotate_mlp_input_qwen3_vl(layer, Q, device)
+        rotate_mlp_output_qwen3_vl(layer, Q, device)
+    rotate_visual_merger_qwen3_5_vl(model, Q, device)
+    return model, Q
 
 
 # ============================================================================
