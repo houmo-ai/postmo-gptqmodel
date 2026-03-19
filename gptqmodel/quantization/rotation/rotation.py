@@ -264,6 +264,19 @@ def fuse_layer_norms_qwen3_5_moe(
             elif hasattr(experts, "gate_proj") and hasattr(experts, "up_proj"):
                 for i in range(len(experts.gate_proj)):
                     _fuse_norm_into_linears(post_ln, [experts.gate_proj[i], experts.up_proj[i]])
+            else:
+                # defuser per-expert container format: experts[i].gate_proj / up_proj
+                num_experts = getattr(experts, "num_experts", None)
+                if num_experts is not None:
+                    for i in range(num_experts):
+                        expert = experts[i]
+                        linears = []
+                        if hasattr(expert, "gate_proj"):
+                            linears.append(expert.gate_proj)
+                        if hasattr(expert, "up_proj"):
+                            linears.append(expert.up_proj)
+                        if linears:
+                            _fuse_norm_into_linears(post_ln, linears)
 
         # Token-mixer input fusion (input norm)
         attn_inputs = []
@@ -839,6 +852,16 @@ def rotate_mlp_input_qwen3_5_moe(layer, Q, device) -> None:
             for i in range(len(experts.gate_proj)):
                 mlp_inputs.append(experts.gate_proj[i])
                 mlp_inputs.append(experts.up_proj[i])
+        else:
+            # defuser per-expert container format: experts[i].gate_proj / up_proj
+            num_experts = getattr(experts, "num_experts", None)
+            if num_experts is not None:
+                for i in range(num_experts):
+                    expert = experts[i]
+                    if hasattr(expert, "gate_proj"):
+                        mlp_inputs.append(expert.gate_proj)
+                    if hasattr(expert, "up_proj"):
+                        mlp_inputs.append(expert.up_proj)
 
     for W in mlp_inputs:
         dtype = W.weight.dtype
@@ -869,6 +892,14 @@ def rotate_mlp_output_qwen3_5_moe(layer, Q, device) -> None:
         elif hasattr(experts, "down_proj"):
             for i in range(len(experts.down_proj)):
                 output_linears.append(experts.down_proj[i])
+        else:
+            # defuser per-expert container format: experts[i].down_proj
+            num_experts = getattr(experts, "num_experts", None)
+            if num_experts is not None:
+                for i in range(num_experts):
+                    expert = experts[i]
+                    if hasattr(expert, "down_proj"):
+                        output_linears.append(expert.down_proj)
 
     for W in output_linears:
         dtype = W.weight.data.dtype
