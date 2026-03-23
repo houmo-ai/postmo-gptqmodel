@@ -213,6 +213,12 @@ def parse_args():
         help="apply rotation, optionally save/evaluate it, then exit without quantizing",
     )
     parser.add_argument(
+        "--mse",
+        type=float,
+        default=2.4,
+        help="mse use 2.4 to default",
+    )
+    parser.add_argument(
         "--hessian-mse",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -289,6 +295,7 @@ def main():
             group_size=args.group_size,
             rotation=args.rotation,
             hessian_mse=args.hessian_mse,
+            mse=args.mse,
             device=args.device,
             offload_to_disk=args.offload_to_disk,
             offload_to_disk_path=args.offload_path if args.offload_to_disk else None,
