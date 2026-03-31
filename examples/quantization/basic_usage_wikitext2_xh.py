@@ -24,7 +24,8 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from gptqmodel import GPTQModel, QuantizeConfig
-from gptqmodel.utils import Perplexity
+
+# from gptqmodel.utils import Perplexity
 from gptqmodel.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -83,23 +84,23 @@ def get_wikitext2(tokenizer, nsamples, seqlen):
     return train_samples
 
 
-@torch.no_grad()
-def calculate_avg_ppl(model, tokenizer):
-    ppl = Perplexity(
-        model=model,
-        tokenizer=tokenizer,
-        dataset_path="wikitext",
-        dataset_name="wikitext-2-raw-v1",
-        split="test",
-        text_column="text",
-    )
+# @torch.no_grad()
+# def calculate_avg_ppl(model, tokenizer):
+#     ppl = Perplexity(
+#         model=model,
+#         tokenizer=tokenizer,
+#         dataset_path="wikitext",
+#         dataset_name="wikitext-2-raw-v1",
+#         split="test",
+#         text_column="text",
+#     )
 
-    all = ppl.calculate(n_ctx=2048, n_batch=2048)
+#     all = ppl.calculate(n_ctx=2048, n_batch=2048)
 
-    # average ppl
-    avg = sum(all) / len(all)
+#     # average ppl
+#     avg = sum(all) / len(all)
 
-    return avg
+#     return avg
 
 
 def main(args):
@@ -119,10 +120,13 @@ def main(args):
         bits=bits,  # quantize model to 4-bit
         group_size=group_size,  # it is recommended to set the value to 128
         sym=True,
-        # mse=True,
         rotation="hadamard",
         device="cuda:0",
         desc_act=False,
+        offload_to_disk=False,
+        # mse=True,
+        # hessian_mse=True,
+        # mse=2.4,
     )
 
     # load un-quantized model, the model will always be force loaded into cpu
@@ -142,7 +146,7 @@ def main(args):
     # inference with model.generate
     print(tokenizer.decode(model.generate(**tokenizer("test is", return_tensors="pt").to(device))[0]))
 
-    print(f"Quantized Model {quantized_model_id} avg PPL is {calculate_avg_ppl(model, tokenizer):.04f}")
+    # print(f"Quantized Model {quantized_model_id} avg PPL is {calculate_avg_ppl(model, tokenizer):.04f}")
 
 
 if __name__ == "__main__":
