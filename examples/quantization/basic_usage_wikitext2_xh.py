@@ -144,7 +144,10 @@ def main(args):
     model = GPTQModel.load(quantized_model_id, device=device)
 
     # inference with model.generate
-    print(tokenizer.decode(model.generate(**tokenizer("test is", return_tensors="pt").to(device))[0]))
+    inputs = tokenizer("test is", return_tensors="pt")
+    inputs = inputs.to(device)
+    text = tokenizer.decode(model.generate(**inputs)[0])
+    logger.info(f"Generated text: {text}")
 
     # print(f"Quantized Model {quantized_model_id} avg PPL is {calculate_avg_ppl(model, tokenizer):.04f}")
 
