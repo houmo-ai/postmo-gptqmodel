@@ -365,6 +365,7 @@ if not TORCH_ACCELERATOR_BACKEND:
 
 SKIP_ROCM_VERSION_CHECK = _read_env("SKIP_ROCM_VERSION_CHECK")
 FORCE_BUILD = _bool_env("GPTQMODEL_FORCE_BUILD", False)
+USE_PREBUILT_WHEEL = _bool_env("GPTQMODEL_USE_PREBUILT_WHEEL", False)
 
 # BUILD_CUDA_EXT:
 # - If user sets explicitly, respect it.
@@ -900,6 +901,13 @@ class CachedWheelsCommand(_bdist_wheel):
         # No implicit torch checks; allow explicit override via env
         xpu_avail = _bool_env("XPU_AVAILABLE", False)
         if FORCE_BUILD or xpu_avail:
+            return super().run()
+
+        if not USE_PREBUILT_WHEEL:
+            print(
+                "Local source install detected; skipping precompiled wheel download and building from source. "
+                "Set GPTQMODEL_USE_PREBUILT_WHEEL=1 to restore the cached wheel path."
+            )
             return super().run()
 
         python_version = f"cp{sys.version_info.major}{sys.version_info.minor}{sys.abiflags}"
