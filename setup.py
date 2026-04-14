@@ -952,7 +952,11 @@ print(f"HAS_CUDA_V9 {HAS_CUDA_V9}")
 print(f"SETUP_KWARGS {additional_setup_kwargs}")
 print(f"gptqmodel_version={gptqmodel_version}")
 
-_namespace_packages = find_namespace_packages(include=["gptqmodel_ext.*"])
+_namespace_packages = find_namespace_packages(include=[
+    "gptqmodel.quantization.calibration",
+    "gptqmodel.quantization.calibration.*",
+    "gptqmodel_ext.*",
+])
 _packages = find_packages()
 for _pkg in _namespace_packages:
     if _pkg not in _packages:
