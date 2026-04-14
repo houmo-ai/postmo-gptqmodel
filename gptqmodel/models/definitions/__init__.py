@@ -123,6 +123,11 @@ except ImportError:
     Qwen3_5QModel = None
 
 try:
+    from .qwen3_5_vl import Qwen3_5_VLQModel
+except ImportError:
+    Qwen3_5_VLQModel = None
+
+try:
     from .qwen3_5_moe import Qwen3_5_MoeQModel, Qwen3_5MoeQModel
 except ImportError:
     Qwen3_5_MoeQModel = None

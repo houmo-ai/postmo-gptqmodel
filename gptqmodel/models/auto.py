@@ -158,17 +158,21 @@ from .definitions.xverse import XverseQModel  # noqa: E402
 TRANSFORMERS_SUPPORTS_QWEN3_5 = Version(TRANSFORMERS_VERSION) >= Version("5.2.0")
 Qwen3_5QModel = None
 Qwen3_5MoeQModel = None
+Qwen3_5_VLQModel = None
 if TRANSFORMERS_SUPPORTS_QWEN3_5:
     try:
         try:
             from .definitions.qwen3_5 import Qwen3_5QModel  # noqa: E402
             from .definitions.qwen3_5_moe import Qwen3_5MoeQModel  # noqa: E402
+            from .definitions.qwen3_5_vl import Qwen3_5_VLQModel  # noqa: E402
         except ImportError:
             Qwen3_5QModel = None
             Qwen3_5MoeQModel = None
+            Qwen3_5_VLQModel = None
     except ImportError:
         Qwen3_5QModel = None
         Qwen3_5MoeQModel = None
+        Qwen3_5_VLQModel = None
 
 
 # make quants and inference more determinisitc
@@ -302,8 +306,10 @@ MODEL_MAP = {
     "voxtral": VoxtralGPTQ,
 }
 
+if Qwen3_5_VLQModel is not None:
+    MODEL_MAP["qwen3_5"] = Qwen3_5_VLQModel
+
 if Qwen3_5QModel is not None:
-    MODEL_MAP["qwen3_5"] = Qwen3_5QModel
     MODEL_MAP["qwen3_5_text"] = Qwen3_5QModel
 
 if Qwen3_5MoeQModel is not None:
