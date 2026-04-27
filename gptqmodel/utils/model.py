@@ -267,6 +267,24 @@ def make_quant(
     if not pack and format in (FORMAT.GPTQ, FORMAT.GPTQ_V2) and backend == BACKEND.BITBLAS:
         backend = BACKEND.TORCH
 
+    # When `dynamic` is present, the model has per-layer overrides (different bits / group_size
+    # for different layers). The default global selection forces a single kernel that can serve
+    # ALL bit widths, which usually means falling back to the slow TorchQuantLinear (since faster
+    # kernels like Triton/Marlin/ExllamaV2 only support a subset of bits, e.g. [4] or [4, 8]).
+    #
+    # The per-layer path below selects an optimal kernel for each submodule based on that
+    # submodule's effective bits/group_size/sym, so 4-bit and 8-bit layers can use fast kernels
+    # while only the unsupported-bits layers (e.g. 5-bit) fall back to TorchQuantLinear.
+    if not pack and dynamic is not None and backend in (BACKEND.AUTO, BACKEND.AUTO_TRAINABLE):
+        return _make_quant_per_layer_dynamic(
+            module=module,
+            qcfg=qcfg,
+            quant_result=quant_result,
+            backend=backend,
+            lm_head_name=lm_head_name,
+            device=device,
+        )
+
     # returns multiple validated kernels
     quant_linear_candidates = select_quant_linear(
         bits=bits,
@@ -319,6 +337,132 @@ def make_quant(
                 raise e
 
     raise ValueError(f"No compatible quant linear was found for this module: {module.__class__.__name__}")
+
+
+def _make_quant_per_layer_dynamic(
+    module,
+    qcfg: QuantizeConfig,
+    quant_result: Dict[str, Dict[str, Any]],
+    backend: BACKEND,
+    lm_head_name: str,
+    device: DEVICE,
+) -> Type[BaseQuantLinear]:
+    """Per-layer kernel selection for models with `dynamic` config.
+
+    For each quantized submodule, resolve its effective bits/group_size/sym (after
+    applying `dynamic` overrides) and pick the highest-priority kernel that supports
+    that exact configuration. This allows fast kernels (Triton/Marlin/ExllamaV2) to
+    handle the majority of layers while only the bit-widths they don't support
+    (e.g. 5-bit) fall back to the slower TorchQuantLinear.
+
+    Returns a representative `BaseQuantLinear` subclass (the most frequently chosen
+    kernel) for downstream use; the caller treats this as informational since
+    different layers may use different kernels.
+    """
+    base_bits = qcfg.bits
+    base_group_size = qcfg.group_size
+    base_desc_act = qcfg.desc_act
+    base_sym = qcfg.sym
+    base_pack_dtype = qcfg.pack_dtype
+    dynamic = qcfg.dynamic
+    fmt = qcfg.format
+    adapter = qcfg.adapter
+
+    cache: Dict[tuple, Type[BaseQuantLinear]] = {}
+    chosen_classes: List[Type[BaseQuantLinear]] = []
+
+    for name, submodule in module.named_modules():
+        if name not in quant_result:
+            continue
+
+        overrides = dynamic_get(dynamic=dynamic, module_name=name)
+        if overrides is False:
+            # negative pattern match: skip this module entirely
+            continue
+
+        if overrides:
+            eff_bits = overrides.get("bits", base_bits)
+            eff_group_size = overrides.get("group_size", base_group_size)
+            eff_desc_act = overrides.get("desc_act", base_desc_act)
+            eff_sym = overrides.get("sym", base_sym)
+            eff_pack_dtype = overrides.get("pack_dtype", base_pack_dtype)
+        else:
+            eff_bits = base_bits
+            eff_group_size = base_group_size
+            eff_desc_act = base_desc_act
+            eff_sym = base_sym
+            eff_pack_dtype = base_pack_dtype
+
+        cache_key = (eff_bits, eff_group_size, eff_desc_act, eff_sym, eff_pack_dtype)
+        if cache_key in cache:
+            linear_cls = cache[cache_key]
+        else:
+            try:
+                candidates = select_quant_linear(
+                    bits=eff_bits,
+                    group_size=eff_group_size,
+                    desc_act=eff_desc_act,
+                    sym=eff_sym,
+                    backend=backend,
+                    format=fmt,
+                    quant_method=qcfg.quant_method,
+                    pack=False,
+                    dynamic=None,  # KEY: skip dynamic-wide validation; use this layer's effective config
+                    device=device,
+                    pack_dtype=eff_pack_dtype,
+                    multi_select=True,
+                    adapter=adapter,
+                )
+            except Exception as e:
+                raise ValueError(
+                    f"Per-layer kernel selection failed for `{name}` "
+                    f"(bits={eff_bits}, group_size={eff_group_size}, sym={eff_sym}): {e}"
+                )
+            if not candidates:
+                raise ValueError(
+                    f"No compatible quant linear for `{name}` (bits={eff_bits}, "
+                    f"group_size={eff_group_size}, sym={eff_sym})."
+                )
+            linear_cls = candidates[0]
+            cache[cache_key] = linear_cls
+            log.info(
+                f"Kernel: per-layer selected `{linear_cls.__name__}` for "
+                f"bits={eff_bits} group_size={eff_group_size} sym={eff_sym}"
+            )
+
+        chosen_classes.append(linear_cls)
+
+        create_quant_module(
+            name=name,
+            linear_cls=linear_cls,
+            bits=base_bits,
+            desc_act=base_desc_act,
+            dynamic=dynamic,
+            group_size=base_group_size,
+            module=module,
+            submodule=submodule,
+            sym=base_sym,
+            device=device,
+            lm_head_name=lm_head_name,
+            pack_dtype=base_pack_dtype,
+            backend=backend,
+            adapter=adapter,
+        )
+
+    if chosen_classes:
+        from collections import Counter
+        most_common, count = Counter(chosen_classes).most_common(1)[0]
+        unique_kernels = sorted({c.__name__ for c in chosen_classes})
+        log.info(
+            f"Kernel: per-layer mix used; representative -> `{most_common.__name__}` "
+            f"({count}/{len(chosen_classes)} layers); kernels in use: {unique_kernels}"
+        )
+        return most_common
+
+    # No quantized modules found: fall back to torch.
+    from ..nn_modules.qlinear.torch import TorchQuantLinear
+    return TorchQuantLinear
+
 
 def create_quant_module(
     name: str,
