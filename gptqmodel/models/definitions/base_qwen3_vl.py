@@ -54,30 +54,48 @@ class BaseQwen3VLGPTQ(BaseQModel):
 
     require_load_processor = True
 
+    def _language_model(self):
+        if hasattr(self.model, "language_model"):
+            return self.model.language_model
+        if hasattr(self.model, "model") and hasattr(self.model.model, "language_model"):
+            return self.model.model.language_model
+        raise AttributeError(f"{self.model.__class__.__name__} has no language_model")
+
+    def _visual_model(self):
+        if hasattr(self.model, "visual"):
+            return self.model.visual
+        if hasattr(self.model, "model") and hasattr(self.model.model, "visual"):
+            return self.model.model.visual
+        raise AttributeError(f"{self.model.__class__.__name__} has no visual module")
+
     def pre_quantize_generate_hook_start(self):
-        self.model.language_model.embed_tokens = move_to(self.model.language_model.embed_tokens, device=self.quantize_config.device)
-        self.model.language_model.rotary_emb = move_to(self.model.language_model.rotary_emb, device=self.quantize_config.device)
-        self.model.visual = move_to(self.model.visual, device=self.quantize_config.device)
+        language_model = self._language_model()
+        visual_model = self._visual_model()
+        language_model.embed_tokens = move_to(language_model.embed_tokens, device=self.quantize_config.device)
+        language_model.rotary_emb = move_to(language_model.rotary_emb, device=self.quantize_config.device)
+        move_to(visual_model, device=self.quantize_config.device)
 
     def pre_quantize_generate_hook_end(self):
+        language_model = self._language_model()
+        visual_model = self._visual_model()
         if self.quantize_config.offload_to_disk:
-            offload_to_disk(model=self.model.language_model,
-                            module=self.model.language_model.embed_tokens,
+            offload_to_disk(model=language_model,
+                            module=language_model.embed_tokens,
                             disk_path=self.quantize_config.offload_to_disk_path,
                             )
-            offload_to_disk(model=self.model.language_model,
-                            module=self.model.language_model.rotary_emb,
+            offload_to_disk(model=language_model,
+                            module=language_model.rotary_emb,
                             disk_path=self.quantize_config.offload_to_disk_path,
                             )
             offload_to_disk(model=self.model,
-                            module=self.model.visual,
+                            module=visual_model,
                             disk_path=self.quantize_config.offload_to_disk_path,
                             )
             return
 
-        self.model.language_model.embed_tokens = move_to(self.model.language_model.embed_tokens, device=CPU)
-        self.model.language_model.rotary_emb = move_to(self.model.language_model.rotary_emb, device=CPU)
-        self.model.visual = move_to(self.model.visual, device=CPU)
+        language_model.embed_tokens = move_to(language_model.embed_tokens, device=CPU)
+        language_model.rotary_emb = move_to(language_model.rotary_emb, device=CPU)
+        move_to(visual_model, device=CPU)
 
     @staticmethod
     def process_vision_info(

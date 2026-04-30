@@ -1594,4 +1594,3 @@ class BaseQuantizeConfig(QuantizeConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         log.warn("QuantizeConfig: BaseQuantizeConfig is re-named and pending deprecation. Please use `QuantizeConfig` instead.")
-

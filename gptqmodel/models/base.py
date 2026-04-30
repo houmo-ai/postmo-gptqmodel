@@ -439,6 +439,7 @@ class BaseQModel(nn.Module):
         self._turtle_materialized_ids: Set[int] = set()
         self._rotation_preserved_modules: Dict[str, nn.Module] = {}
         self._rotation_applied = False
+        self._rotation_q_block: Optional[torch.Tensor] = None
 
         self.processor: ProcessorMixin = None
 
@@ -1521,13 +1522,17 @@ class BaseQModel(nn.Module):
                 device=rotation_device,
                 **module_name_args,
             )
-        self.model, _ = entry["rotate_fn"](
+        self.model, q_block = entry["rotate_fn"](
             model=self.model,
             rotate_mode=self.quantize_config.rotation,
             device=rotation_device,
             Q=diceq_q,
             **module_name_args,
         )
+        # Expose Q_block so post-quantize MTP rotation (which works on
+        # safetensors directly, since transformers strips mtp.* on load)
+        # can reuse the exact same rotation matrix as the LLM.
+        self._rotation_q_block = q_block
         converted = materialize_inference_tensors(self.model)
         if converted:
             log.info("Rotation: materialized %s inference tensors for eager forward compatibility.", converted)

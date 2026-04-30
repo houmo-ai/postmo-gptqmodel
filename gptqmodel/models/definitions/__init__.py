@@ -128,10 +128,12 @@ except ImportError:
     Qwen3_5_VLQModel = None
 
 try:
-    from .qwen3_5_moe import Qwen3_5_MoeQModel, Qwen3_5MoeQModel
+    from .qwen3_5_moe import Qwen3_5_MoeQModel, Qwen3_5_MoeTextQModel, Qwen3_5MoeQModel, Qwen3_5MoeTextQModel
 except ImportError:
     Qwen3_5_MoeQModel = None
+    Qwen3_5_MoeTextQModel = None
     Qwen3_5MoeQModel = None
+    Qwen3_5MoeTextQModel = None
 from .qwen3_moe import Qwen3MoeQModel
 from .qwen3_vl import Qwen3_VLQModel
 from .rw import RwgQModel

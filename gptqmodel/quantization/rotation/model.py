@@ -6,7 +6,8 @@ from gptqmodel.models.definitions.qwen3 import Qwen3QModel
 from gptqmodel.models.definitions.qwen3_vl import Qwen3_VLQModel
 from gptqmodel.models.definitions.qwen2_5_vl import Qwen2_5_VLQModel
 from gptqmodel.models.definitions.qwen3_5 import Qwen3_5QModel
-from gptqmodel.models.definitions.qwen3_5_moe import Qwen3_5MoeQModel
+from gptqmodel.models.definitions.qwen3_5_moe import Qwen3_5MoeQModel, Qwen3_5MoeTextQModel
+from gptqmodel.models.definitions.qwen3_5_vl import Qwen3_5_VLQModel
 from gptqmodel.models.definitions.qwen3_moe import Qwen3MoeQModel
 from gptqmodel.models.definitions.qwen3_next import Qwen3NextGPTQ
 from gptqmodel.models.definitions.glm4_moe_lite import Glm4MoeLiteQModel
@@ -41,9 +42,33 @@ MODEL_ROTATION_REGISTRY = [
     },
     {
         "cls": Qwen3_5MoeQModel,
+        # qwen3_5_moe is the full VLM model_type; rotate vision with the same
+        # LLM Q. qwen3_5_moe_text is registered separately below with no vision.
+        "vision": True,
+        "fuse_norm": fuse_layer_norms_qwen3_5_moe,
+        "fuse_vision_norm": fuse_vision_layer_norms_qwen3_5_vl,
+        "rotate_fn": rotate_model_qwen3_5_moe,
+        "rotate_vision_fn": rotate_vision_model_qwen3_5_vl,
+    },
+    {
+        "cls": Qwen3_5MoeTextQModel,
         "vision": False,
         "fuse_norm": fuse_layer_norms_qwen3_5_moe,
         "rotate_fn": rotate_model_qwen3_5_moe,
+    },
+    {
+        # CRITICAL: Qwen3_5_VLQModel was previously NOT registered. auto.py maps
+        # config.model_type=="qwen3_5" to this class, so without this entry
+        # apply_rotation() raised "rotation only supports: ...". This is the
+        # primary bug behind why example_qwen35dense.py used a dense LlamaQModel
+        # path (dropping mtp/visual) and example_qwen35_vl_rotate_fp.py had to
+        # hand-call rotation helpers.
+        "cls": Qwen3_5_VLQModel,
+        "vision": True,
+        "fuse_norm": fuse_layer_norms_qwen3_5,
+        "fuse_vision_norm": fuse_vision_layer_norms_qwen3_5_vl,
+        "rotate_fn": rotate_model_qwen3_5_vl,
+        "rotate_vision_fn": rotate_vision_model_qwen3_5_vl,
     },
     {
         "cls": Qwen3NextGPTQ,

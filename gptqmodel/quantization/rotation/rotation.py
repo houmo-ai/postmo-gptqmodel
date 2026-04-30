@@ -1132,7 +1132,14 @@ def rotate_model_qwen3_5_moe(
     if Q_block is None:
         Q_block = get_orthogonal_matrix(hidden_size, rotate_mode, device)
 
-    rotate_embeddings(model, Q_block, device)
+    try:
+        _get_qwen3_5_visual(model)
+    except AttributeError:
+        rotate_embeddings(model, Q_block, device)
+    else:
+        # Full qwen3_5_moe VLM: visual merger output feeds the LLM hidden space,
+        # so it must use the exact same Q as language embeddings.
+        rotate_qwen3_5_vl_embeddings(model, Q_block, device)
     rotate_head(model, Q_block, device, lm_head_name)
     torch_empty_cache()
 

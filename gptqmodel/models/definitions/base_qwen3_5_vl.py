@@ -18,6 +18,8 @@ class BaseQwen3_5VLGPTQ(BaseQwen3VLGPTQ):
     # not every layer has every sub-module.
     layer_modules_strict = False
 
+    ATTENTION_MASKS_REQUIRED_FOR_INPUT = True
+
     module_tree = [
         "model",
         "language_model",
