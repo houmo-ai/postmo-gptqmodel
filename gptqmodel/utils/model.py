@@ -643,6 +643,9 @@ def hf_convert_gptq_v1_to_v2_format(
 def convert_gptq_v1_to_v2_format_module(module: BaseQuantLinear, bits: int, pack_dtype: torch.dtype) -> nn.Module:
     assert isinstance(module, BaseQuantLinear)
 
+    if module.qzero_format() == 2:
+        return module
+
     log.info.once("Format: Converting GPTQ v1 to v2")
 
     # v1 checkpoint format used to do `qzeros = qzeros -= 1` before serialization, thus the
@@ -723,6 +726,7 @@ def convert_gptq_v1_to_v2_format_module(module: BaseQuantLinear, bits: int, pack
 
     # change format id
     module.qzero_format(format=2)
+    return module
 
 # Optionally convert weight from gptq_v1 to v2 format if Kernel is compatible with v2
 @torch.inference_mode()
@@ -748,7 +752,9 @@ def convert_gptq_v1_to_v2_format(
         # additions here do not overflow.
         # v1 checkpoint format with sym=False saved via convert_gptq_v2_to_v1_format() will
         # overflow ~<=13% based on testing
-        if isinstance(submodule, qlinear_kernel):
+        if isinstance(submodule, BaseQuantLinear) and (
+            isinstance(submodule, qlinear_kernel) or getattr(submodule, "REQUIRES_FORMAT_V2", False)
+        ):
             convert_gptq_v1_to_v2_format_module(module=submodule, bits=cfg.bits, pack_dtype=cfg.pack_dtype)
 
         #log.info(f"Format: Conversion complete: {time.time() - t}s")
