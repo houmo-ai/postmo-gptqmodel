@@ -392,6 +392,7 @@ def validate_vision_demo_pair(
     atol: float,
     rtol: float,
     generation_tokens: int = 256,
+    require_equal: bool = True,
 ) -> None:
     if not has_vision_model(ref_model_dir, trust_remote_code):
         print("[vision] source model has no vision tower; skipping vision demo")
@@ -416,10 +417,17 @@ def validate_vision_demo_pair(
     print(f"[vision] {token_diff}")
     print(f"[vision] ref_decoded ={ref_text!r}")
     print(f"[vision] test_decoded={test_text!r}")
-    # if not torch.allclose(test_logits, ref_logits, atol=atol, rtol=rtol) and not generation_equal:
-    #     raise AssertionError(
-    #         "Vision demo mismatch after rotation: "
-    #         f"max_abs_diff={max_abs:.6e}, mean_abs_diff={mean_abs:.6e}, "
-    #         f"last_token_equal={last_token_equal}, generation_equal={generation_equal}, "
-    #         f"{token_diff}"
-    #     )
+    if require_equal and not torch.allclose(test_logits, ref_logits, atol=atol, rtol=rtol) and not generation_equal:
+        raise AssertionError(
+            "Vision demo mismatch after rotation: "
+            f"max_abs_diff={max_abs:.6e}, mean_abs_diff={mean_abs:.6e}, "
+            f"last_token_equal={last_token_equal}, generation_equal={generation_equal}, "
+            f"{token_diff}, ref_decoded={ref_text!r}, test_decoded={test_text!r}"
+        )
+    if not require_equal and not test_text.strip():
+        raise AssertionError(
+            "Quantized vision demo produced empty output: "
+            f"max_abs_diff={max_abs:.6e}, mean_abs_diff={mean_abs:.6e}, "
+            f"last_token_equal={last_token_equal}, generation_equal={generation_equal}, "
+            f"{token_diff}"
+        )

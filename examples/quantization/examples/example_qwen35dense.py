@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -272,6 +273,11 @@ def main():
     print(f"Quantized model avg PPL (wikitext2): {avg_ppl:.4f}")
 
     if args.check_quant_vision_demo:
+        del inputs, output_ids, generated_ids
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         ref_model_dir = args.rotated_out or args.model
         validate_vision_demo_pair(
             ref_model_dir,
@@ -285,6 +291,7 @@ def main():
             atol=args.vision_demo_atol,
             rtol=args.vision_demo_rtol,
             generation_tokens=args.vision_demo_generation_tokens,
+            require_equal=False,
         )
 
 
