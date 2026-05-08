@@ -312,9 +312,20 @@ def move_batch_to_device(batch, device: str, float_dtype: torch.dtype):
 @torch.inference_mode()
 def vision_demo_outputs(model_dir: str, batch, device: str, torch_dtype, trust_remote_code: bool, max_new_tokens: int):
     wrapper = None
+    # Determine the concrete target device for this forward pass.
+    # On multi-GPU machines device_map='auto' distributes the VL model across
+    # GPUs (e.g. vision tower on cuda:7, language layers on cuda:0-7), which
+    # causes a device mismatch when the model merges image + text embeddings.
+    # We therefore normalise to a single GPU so both paths stay on one device.
+    single_device = "cpu" if device == "cpu" else (device if device != "auto" else "cuda:0")
+
     if is_gptq_quantized_dir(model_dir):
-        load_kwargs = {"device_map": "auto"} if device == "auto" else {"device": device}
-        wrapper = GPTQModel.load(model_dir, trust_remote_code=trust_remote_code, **load_kwargs)
+        # Use a single-GPU device_map so the vision tower and language model
+        # share the same device and the merge step does not see a device mismatch.
+        wrapper = GPTQModel.load(
+            model_dir, trust_remote_code=trust_remote_code,
+            device_map={"": single_device},
+        )
         model = wrapper.model
     else:
         load_kwargs = {"device_map": "auto"} if device == "auto" else {"device_map": "cpu"}
@@ -326,7 +337,7 @@ def vision_demo_outputs(model_dir: str, batch, device: str, torch_dtype, trust_r
         )
     model.eval()
     forward_dtype = next(model.parameters()).dtype
-    if device != "auto":
+    if device != "auto" and wrapper is None:
         model.to(device=device)
         runtime_device = device
     else:

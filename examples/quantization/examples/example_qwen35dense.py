@@ -202,6 +202,10 @@ def main():
             if args.rotated_out:
                 print(f"[rotation] Saving rotated fp model to: {args.rotated_out}")
                 os.makedirs(args.rotated_out, exist_ok=True)
+                # Ensure no tied-weight metadata remains so both lm_head.weight and
+                # embed_tokens.weight are saved as independent tensors.
+                if hasattr(model.model, "_tied_weights_keys"):
+                    model.model._tied_weights_keys = {}
                 model.model.save_pretrained(args.rotated_out, safe_serialization=True, max_shard_size=args.max_shard_size)
                 tokenizer.save_pretrained(args.rotated_out)
                 ensure_processor_saved(args.model, args.rotated_out, args.trust_remote_code)

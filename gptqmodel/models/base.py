@@ -1490,6 +1490,10 @@ class BaseQModel(nn.Module):
                 self.model.config.text_config.tie_word_embeddings = False
             lm_head, _ = get_module_by_name_prefix(self.model, self.lm_head)
             lm_head.weight = nn.Parameter(lm_head.weight.data.clone())
+            # Clear stale tied-weight metadata so HF save_pretrained / tie_weights()
+            # cannot accidentally drop or re-tie the now-independent lm_head weight.
+            if hasattr(self.model, "_tied_weights_keys"):
+                self.model._tied_weights_keys = {}
 
         module_name_args = {
             "layers_node": self.extract_layers_node(),

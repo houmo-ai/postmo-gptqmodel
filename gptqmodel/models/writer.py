@@ -55,6 +55,7 @@ from ..utils.model import (
     streaming_state_dict_to_shards,
 )
 from ..utils.regex_compat import re
+from ..utils.safetensor import untie_weights
 from ..utils.structure import alias_all_from_turtle_if_meta, restore_rotation_preserved_modules
 from ..utils.torch import torch_empty_cache
 from ..version import __version__
@@ -312,6 +313,13 @@ def ModelWriter(cls):
             if restored:
                 log.info("Rotation: restored %s preserved modules before turtle sync.", restored)
             alias_all_from_turtle_if_meta(shell_model=self.model, turtle_model=self.turtle_model)
+
+        # When rotation was applied, ensure any latent tied weights are fully broken
+        # before building the state dict (e.g. if _tied_weights_keys was not yet cleared).
+        if getattr(self, "_rotation_applied", False):
+            untie_weights(self.model)
+            if hasattr(self.model, "_tied_weights_keys"):
+                self.model._tied_weights_keys = {}
 
         offload_root = self.quantize_config.offload_to_disk_path if getattr(self.quantize_config, "offload_to_disk", False) else None
         state_dict = get_state_dict_for_save(self.model, offload_root=offload_root)
