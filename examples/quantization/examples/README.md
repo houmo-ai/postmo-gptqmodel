@@ -158,3 +158,14 @@ python examples/quantization/examples/example_qwen35dense.py \
 ```
 
 MoE 使用 `example_qwen35moe.py`，并把 `--model` / `--rotated-out` 换成对应目录。
+
+
+# Gemma4-26B-A4B量化使用说明
+
+由于gemma4-moe结构的特殊性，在gptqmodel中无需旋转，因此，量化指令如下：
+
+```
+CUDA_VISIBLE_DEVICES=7 python examples/quantization/examples/example_gemma4.py --model /data01/home/chenzx/model/gemma-4-26B-A4B-it --out ~/model/gemma-4-26B-A4B-it-gptq-20260508 --calibration-jsonl ~/project/gptqmodel/gen_qwen3_30b_EBSS.jsonl --nsamples 512 --bits 4 --group-size 64 --no-offload-to-disk --skip-eval --batch-size 1
+```
+
+该例子中使用qwen3-30b的校准集，用户亦可使用gemma4的自生成，可参考`gptqmodel/quantization/calibration/README.md`中校准集生成方法
