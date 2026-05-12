@@ -401,20 +401,15 @@ def ModelWriter(cls):
 
         total_size_mb = total_size_bytes / (1024 * 1024)
 
-        if len(expected_files) > 1:
-            index = {
-                "metadata": {"total_size": total_size_bytes},
-                "weight_map": tensor_to_filename,
-            }
-            index_save_name = model_save_name + ".index.json"
-            index_save_path = join(save_dir, index_save_name)
-            with open(index_save_path, "w", encoding="utf-8") as f:
-                content = json.dumps(index, indent=2, sort_keys=True) + "\n"
-                f.write(content)
-        else:
-            index_save_path = join(save_dir, model_save_name + ".index.json")
-            if os.path.exists(index_save_path):
-                os.remove(index_save_path)
+        index = {
+            "metadata": {"total_size": total_size_bytes},
+            "weight_map": tensor_to_filename,
+        }
+        index_save_name = model_save_name + ".index.json"
+        index_save_path = join(save_dir, index_save_name)
+        with open(index_save_path, "w", encoding="utf-8") as f:
+            content = json.dumps(index, indent=2, sort_keys=True) + "\n"
+            f.write(content)
 
         state_dict.clear()
 

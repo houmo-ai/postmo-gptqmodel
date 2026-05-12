@@ -17,6 +17,7 @@ from transformers import AutoConfig, AutoModelForImageTextToText, AutoProcessor
 
 from gptqmodel import GPTQModel
 from gptqmodel.quantization.rotation.mtp import rotate_qwen3_5_mtp
+from gptqmodel.utils.missing_tensors import copy_missing_tensors_from_source
 
 
 FULL_VISION_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe"}
@@ -200,6 +201,11 @@ def ensure_processor_saved(src_model_dir: str, dst_model_dir: str, trust_remote_
 
 def rotate_mtp_after_save(src_model_dir: str, dst_model_dir: str, gptq_model, is_moe: bool, rotation: Optional[str]) -> Optional[str]:
     if not rotation:
+        # No rotation requested: still need to restore MTP tensors that were
+        # stripped by transformers during model loading.  Copy them from the
+        # original (un-quantized) source checkpoint so they are present in the
+        # saved quantized model.
+        copy_missing_tensors_from_source(source_dir=src_model_dir, target_dir=dst_model_dir)
         return None
     q_block = getattr(gptq_model, "_rotation_q_block", None)
     if q_block is None:

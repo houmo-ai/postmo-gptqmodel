@@ -41,6 +41,17 @@ python examples/quantization/examples/example_qwen35dense.py \
   --device-map auto \
   --calibration-jsonl gptqmodel/quantization/calibration/dense_ivsg/gen_data/Qwen3.5-27B.jsonl \
   --check-quant-vision-demo
+
+python examples/quantization/examples/example_qwen35dense.py \
+  --model /data01/datasets/Qwen3.5-0.8B \
+  --rotation None \
+  --bits 4 \
+  --group-size 64 \
+  --nsamples 256 \
+  --out work_dirs/q0.8b-W4G64 \
+  --device-map auto \
+  --calibration-jsonl gptqmodel/quantization/calibration/dense_ivsg/gen_data/Qwen3.5-27B.jsonl \
+  --check-quant-vision-demo
 ```
 
 Smoke/debug 命令：
