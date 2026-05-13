@@ -1483,11 +1483,23 @@ class BaseQModel(nn.Module):
             if synced:
                 log.info("Rotation: synced %s meta leaf modules from turtle model before applying rotation.", synced)
 
-        if self.model.config.tie_word_embeddings:
+        tie_word_embeddings = getattr(self.model.config, "tie_word_embeddings", None)
+        if tie_word_embeddings is None:
+            text_config = getattr(self.model.config, "text_config", None)
+            if text_config is None:
+                thinker_config = getattr(self.model.config, "thinker_config", None)
+                text_config = getattr(thinker_config, "text_config", None) if thinker_config is not None else None
+            tie_word_embeddings = getattr(text_config, "tie_word_embeddings", False)
+
+        if tie_word_embeddings:
             log.info("Rotation requires word embeddings to be untied. Untying.")
-            self.model.config.tie_word_embeddings = False
+            if hasattr(self.model.config, "tie_word_embeddings"):
+                self.model.config.tie_word_embeddings = False
             if hasattr(self.model.config, "text_config"):
                 self.model.config.text_config.tie_word_embeddings = False
+            thinker_config = getattr(self.model.config, "thinker_config", None)
+            if thinker_config is not None and hasattr(thinker_config, "text_config"):
+                thinker_config.text_config.tie_word_embeddings = False
             lm_head, _ = get_module_by_name_prefix(self.model, self.lm_head)
             lm_head.weight = nn.Parameter(lm_head.weight.data.clone())
             # Clear stale tied-weight metadata so HF save_pretrained / tie_weights()

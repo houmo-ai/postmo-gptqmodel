@@ -14,9 +14,26 @@ from ..base import BaseQModel
 from ..moe_lifecycle import GateUpDownMoELifecycleHooks
 
 
+def _patch_defuser_qwen3_omni_registry() -> None:
+    import defuser.model_registry as defuser_model_registry
+
+    if getattr(defuser_model_registry, "_gptqmodel_qwen3_omni_registry_patch", False):
+        return
+
+    qwen3_moe_entry = dict(defuser_model_registry.MODEL_CONFIG.get("qwen3_moe", {}))
+    registry_entry = defuser_model_registry.MODEL_CONFIG.setdefault("qwen3_omni_moe", {})
+    for key, value in qwen3_moe_entry.items():
+        registry_entry.setdefault(key, value)
+    registry_entry.setdefault("min_transformers_version", "5.0.0")
+    defuser_model_registry._gptqmodel_qwen3_omni_registry_patch = True
+
+
 class Qwen3OmniMoeGPTQ(BaseQModel):
     ATTENTION_MASKS_REQUIRED_FOR_INPUT = True
     ATTENTION_MASKS_DTYPE = torch.long
+    layer_modules_strict = False
+
+    lm_head = "thinker.lm_head"
 
     INPUT_EMBEDDING_EXTRA_ARGS = {
         "return_audio": False,
@@ -40,14 +57,18 @@ class Qwen3OmniMoeGPTQ(BaseQModel):
             "input_layernorm": ("input_layernorm:!",),
             "self_attn": ("q_proj:0", "k_proj:0", "v_proj:0", "o_proj:1"),
             "post_attention_layernorm": ("post_attention_layernorm:!",),
-            "mlp:moe": {
-                "gate": ("gate",),
+            "mlp": ("gate_proj:0", "up_proj:0", "down_proj:1"),
+            "mlp:moe:?": {
+                "gate": ("gate:!",),
                 "experts": {
                     "#": ("gate_proj:0", "up_proj:0", "down_proj:1"),
                 },
             },
         }
     ]
+
+    def before_model_load(self, load_quantized_model=False):
+        _patch_defuser_qwen3_omni_registry()
 
     def pre_quantize_generate_hook_start(self):
         spk_path = os.path.join(self.model_local_path, "spk_dict.pt")

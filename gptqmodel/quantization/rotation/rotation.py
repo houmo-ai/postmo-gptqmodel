@@ -121,6 +121,19 @@ def _fuse_pre_head_norm_if_present(
     _reset_norm_for_fusion(pre_head_layernorm)
 
 
+def _resolve_text_config(config):
+    text_config = getattr(config, "text_config", None)
+    if text_config is not None:
+        return text_config
+
+    thinker_config = getattr(config, "thinker_config", None)
+    thinker_text_config = getattr(thinker_config, "text_config", None) if thinker_config is not None else None
+    if thinker_text_config is not None:
+        return thinker_text_config
+
+    return config
+
+
 def fuse_merger_linear(
     layernorm: torch.nn.Module, linear_layers: typing.Iterable[torch.nn.Linear]
 ) -> None:
@@ -1123,7 +1136,7 @@ def rotate_model_qwen3_5_moe(
     if isinstance(Q, dict):
         q_block_spec = Q.get("Q_block", Q.get("Q"))
 
-    text_config = getattr(model.config, "text_config", model.config)
+    text_config = _resolve_text_config(model.config)
     hidden_size = getattr(text_config, "hidden_size", None)
     if hidden_size is None:
         raise ValueError("Qwen3.5-MoE rotation requires `hidden_size` in text config.")
@@ -1175,7 +1188,7 @@ def rotate_model_qwen3_5(
     if isinstance(Q, dict):
         q_block_spec = Q.get("Q_block", Q.get("Q"))
 
-    text_config = getattr(model.config, "text_config", model.config)
+    text_config = _resolve_text_config(model.config)
     hidden_size = getattr(text_config, "hidden_size", None)
     if hidden_size is None:
         raise ValueError("Qwen3.5 rotation requires `hidden_size` in text config.")
@@ -1215,7 +1228,7 @@ def rotate_model_qwen3_next(
     if isinstance(Q, dict):
         q_block_spec = Q.get("Q_block", Q.get("Q"))
 
-    text_config = getattr(model.config, "text_config", model.config)
+    text_config = _resolve_text_config(model.config)
     hidden_size = getattr(text_config, "hidden_size", None)
     if hidden_size is None:
         raise ValueError("Qwen3-Next rotation requires `hidden_size` in model config.")
@@ -1343,7 +1356,7 @@ def rotate_model_qwen3_5_vl(model: PreTrainedModel, rotate_mode: str, device: to
     if isinstance(Q, dict):
         q_block_spec = Q.get("Q_block", Q.get("Q"))
 
-    text_config = getattr(model.config, "text_config", model.config)
+    text_config = _resolve_text_config(model.config)
     hidden_size = getattr(text_config, "hidden_size", None)
     if hidden_size is None:
         raise ValueError("Qwen3.5-VL rotation requires `hidden_size` in text config.")
