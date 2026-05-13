@@ -1,0 +1,15 @@
+- Gemma4 31B的AutoRound量化，保存为 GPTQModel格式，weights/gemma-4-31B-it
+    - 类似实验报告_Qwen3.5-27B_AutoRound.md，完成 AutoRound 量化，保存为 GPTQModel 格式
+        - 第一步：先实现 Mode1 的 AutoRound 量化，保存为 GPTQModel 格式
+        - 第二步：实现 Mode2 的 AutoRound 量化，保存为 GPTQModel 格式
+        - 第三步：实现 Mode3 的 AutoRound 量化，保存为 GPTQModel 格式
+    - 评估 AutoRound 量化后的模型
+        - 使用相同的评估数据集和指标，评估 AutoRound 量化后的模型性能
+        - 比较 AutoRound 量化前后的性能差异，分析 AutoRound 量化的效果
+    - 记录实验结果和分析，撰写实验报告
+        - 包括实验步骤、评估结果、性能分析等内容
+        - 以 Markdown 格式撰写实验报告，命名为 实验报告_Gemma4-31B_AutoRound.md 
+        - 在报告中详细描述 AutoRound 量化的过程和结果，提供相关的代码和数据分析
+    - 环境
+        - conda activate gemma4
+        - GPU每个Mode单卡够了，找空闲的卡跑, 四张卡，每个Mode跑一个。多进程工作

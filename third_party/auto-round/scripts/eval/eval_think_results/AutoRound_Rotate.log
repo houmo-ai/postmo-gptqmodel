@@ -1,0 +1,94 @@
+Skipping import of cpp extensions due to incompatible torch version 2.8.0+cu128 for torchao version 0.16.0             Please see https://github.com/pytorch/ao/issues/2919 for more info
+[33;1m2026-04-02 15:25:32 WARNING modeling_qwen3_5.py L501: The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d[0m
+[33;1m2026-04-02 15:25:32 WARNING modeling_utils.py L4430: `loss_type=None` was set in the config but it is unrecognized. Using the default loss: `ForCausalLMLoss`.[0m
+[33;1m2026-04-02 15:25:33 WARNING backend.py L1181: Better backend is found, please install all the following requirements to enable it.[0m
+[33;1m2026-04-02 15:25:33 WARNING backend.py L1181: `pip install "torch<2.6.0" "auto-gptq>=0.7.1" "transformers<5.0.0"`[0m
+
+Loading weights:   0%|          | 0/450 [00:00<?, ?it/s]
+Loading weights:   0%|          | 1/450 [00:00<02:22,  3.15it/s]
+Loading weights: 100%|██████████| 450/450 [00:00<00:00, 1134.93it/s]
+[1mQwen3_5ForCausalLM LOAD REPORT[0m from: /tmp/fixed_index_qwg2hd23
+Key                                                   | Status     | 
+------------------------------------------------------+------------+-
+model.layers.{0...63}.mlp.down_proj.qweight           | UNEXPECTED | 
+model.layers.{0...63}.mlp.up_proj.qweight             | UNEXPECTED | 
+model.layers.{0...62}.linear_attn.out_proj.qweight    | UNEXPECTED | 
+model.layers.{0...63}.mlp.down_proj.scales            | UNEXPECTED | 
+model.layers.{0...62}.linear_attn.in_proj_qkv.qzeros  | UNEXPECTED | 
+model.layers.{0...62}.linear_attn.in_proj_qkv.scales  | UNEXPECTED | 
+model.layers.{3...63}.self_attn.v_proj.qzeros         | UNEXPECTED | 
+model.layers.{0...62}.linear_attn.out_proj.qzeros     | UNEXPECTED | 
+model.embed_tokens.scales                             | UNEXPECTED | 
+model.layers.{0...63}.mlp.gate_proj.scales            | UNEXPECTED | 
+model.layers.{0...62}.linear_attn.out_proj.scales     | UNEXPECTED | 
+model.layers.{0...63}.mlp.gate_proj.qweight           | UNEXPECTED | 
+model.layers.{3...63}.self_attn.q_proj.qweight        | UNEXPECTED | 
+model.layers.{0...63}.mlp.up_proj.scales              | UNEXPECTED | 
+model.layers.{0...63}.mlp.up_proj.qzeros              | UNEXPECTED | 
+model.layers.{3...63}.self_attn.v_proj.scales         | UNEXPECTED | 
+model.layers.{3...63}.self_attn.o_proj.qweight        | UNEXPECTED | 
+model.layers.{0...62}.linear_attn.in_proj_qkv.qweight | UNEXPECTED | 
+model.layers.{0...62}.linear_attn.in_proj_z.qweight   | UNEXPECTED | 
+model.layers.{0...63}.mlp.gate_proj.qzeros            | UNEXPECTED | 
+model.layers.{0...63}.mlp.down_proj.qzeros            | UNEXPECTED | 
+model.layers.{0...62}.linear_attn.in_proj_z.qzeros    | UNEXPECTED | 
+model.layers.{3...63}.self_attn.o_proj.qzeros         | UNEXPECTED | 
+model.layers.{3...63}.self_attn.k_proj.qzeros         | UNEXPECTED | 
+model.layers.{3...63}.self_attn.q_proj.qzeros         | UNEXPECTED | 
+model.layers.{3...63}.self_attn.v_proj.qweight        | UNEXPECTED | 
+model.layers.{3...63}.self_attn.k_proj.scales         | UNEXPECTED | 
+model.layers.{0...62}.linear_attn.in_proj_z.scales    | UNEXPECTED | 
+model.layers.{3...63}.self_attn.o_proj.scales         | UNEXPECTED | 
+model.layers.{3...63}.self_attn.q_proj.scales         | UNEXPECTED | 
+model.layers.{3...63}.self_attn.k_proj.qweight        | UNEXPECTED | 
+model.embed_tokens.qweight                            | UNEXPECTED | 
+model.embed_tokens.qzeros                             | UNEXPECTED | 
+model.layers.{0...63}.mlp.down_proj.weight            | MISSING    | 
+model.embed_tokens.weight                             | MISSING    | 
+model.layers.{0...63}.mlp.up_proj.weight              | MISSING    | 
+model.layers.{0...62}.linear_attn.out_proj.weight     | MISSING    | 
+model.layers.{0...62}.linear_attn.in_proj_z.weight    | MISSING    | 
+model.layers.{0...62}.linear_attn.in_proj_qkv.weight  | MISSING    | 
+model.layers.{0...63}.mlp.gate_proj.weight            | MISSING    | 
+model.layers.{3...63}.self_attn.k_proj.weight         | MISSING    | 
+model.layers.{3...63}.self_attn.o_proj.weight         | MISSING    | 
+model.layers.{3...63}.self_attn.v_proj.weight         | MISSING    | 
+model.layers.{3...63}.self_attn.q_proj.weight         | MISSING    | 
+
+[3mNotes:
+- UNEXPECTED[3m	:can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+- MISSING[3m	:those params were newly initialized because missing from the checkpoint. Consider training on your downstream task.[0m
+[33;1m2026-04-02 15:25:34 WARNING configuration_utils.py L752: The following generation flags are not valid and may be ignored: ['temperature', 'top_p', 'top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.[0m
+
+============================================================
+模型: AutoRound+Rotate (weights/Qwen3.5-27B-W4G64-rotate-autoround/Qwen3.5-27B-rotated-w4g64)
+============================================================
+  ⚠ 检测到双套 weight_map (CausalLM: 1650, VLM: 1652)，修正为仅保留 VLM 键
+
+[1/5] Q: 你是谁？
+  Think: 0 tokens (0 chars)
+  Answer: 2133 tokens (6590 chars)
+  Time: 159.0s
+
+[2/5] Q: 中国最长的河流是什么？请简要介绍。
+  Think: 0 tokens (0 chars)
+  Answer: 2142 tokens (6792 chars)
+  Time: 159.7s
+
+[3/5] Q: 请解方程 2x + 5 = 15
+  Think: 0 tokens (0 chars)
+  Answer: 2136 tokens (6749 chars)
+  Time: 162.3s
+
+[4/5] Q: 用100字描述春天的景色
+  Think: 0 tokens (0 chars)
+  Answer: 2128 tokens (6711 chars)
+  Time: 159.6s
+
+[5/5] Q: 写一个Python函数计算斐波那契数列的第n项
+  Think: 0 tokens (0 chars)
+  Answer: 2147 tokens (6821 chars)
+  Time: 160.4s
+
+结果已保存: eval_think_results/AutoRound_Rotate.json
+汇总: think 0 tokens, answer 10686 tokens

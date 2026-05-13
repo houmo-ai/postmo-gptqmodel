@@ -13,3 +13,7 @@ include gptqmodel_ext/machete/generate.py
 recursive-exclude gptqmodel_ext __pycache__ *.pyc
 prune tests/
 prune format/
+
+# --- third_party: auto-round subtree ---
+recursive-include third_party/auto-round/auto_round *.py *.json *.safetensors *.md *.txt
+recursive-include third_party/auto-round/auto_round_extension *.py *.md

@@ -962,9 +962,44 @@ for _pkg in _namespace_packages:
     if _pkg not in _packages:
         _packages.append(_pkg)
 
+# ---------------------------
+# Third-party: auto-round subtree
+# ---------------------------
+# auto-round lives at third_party/auto-round/ (git subtree).
+# Expose its top-level packages (`auto_round`, `auto_round_extension`) so they
+# become importable after `pip install` alongside `gptqmodel`. Source files stay
+# in-tree; we only map them via `package_dir` so the subtree is not touched.
+_AUTO_ROUND_ROOT = "third_party/auto-round"
+_auto_round_packages = find_packages(
+    where=_AUTO_ROUND_ROOT,
+    include=[
+        "auto_round",
+        "auto_round.*",
+        "auto_round_extension",
+        "auto_round_extension.*",
+    ],
+)
+for _pkg in _auto_round_packages:
+    if _pkg not in _packages:
+        _packages.append(_pkg)
+
+_auto_round_package_dir = {
+    "auto_round": f"{_AUTO_ROUND_ROOT}/auto_round",
+    "auto_round_extension": f"{_AUTO_ROUND_ROOT}/auto_round_extension",
+}
+
+# Non-.py runtime assets shipped inside auto_round. Declared explicitly so they
+# land in the wheel even when `include_package_data` misses them.
+_auto_round_package_data = {
+    "auto_round.compressors.mllm": ["templates/*.json"],
+    "auto_round.experimental.transform.utils": ["*.safetensors"],
+}
+
 setup(
     version=gptqmodel_version,
     packages=_packages,
+    package_dir=_auto_round_package_dir,
+    package_data=_auto_round_package_data,
     include_package_data=True,
     include_dirs=include_dirs,
     cmdclass=(

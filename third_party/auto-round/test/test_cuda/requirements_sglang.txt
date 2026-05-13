@@ -1,0 +1,1 @@
+sglang @ git+https://github.com/sgl-project/sglang.git@main#subdirectory=python
