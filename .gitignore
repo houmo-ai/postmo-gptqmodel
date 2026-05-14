@@ -199,3 +199,4 @@ gptqmodel_offload_*
 /GPTQModel
 /auto-round
 /work_dirs
+*weights
