@@ -224,7 +224,6 @@ def rotate_llm(model, Q, device):
         if hasattr(layer, "self_attn"):
             for proj in [layer.self_attn.q_proj, layer.self_attn.k_proj, layer.self_attn.v_proj]:
                 proj.weight.data = _rotate_weight(proj.weight.data, Q, device)
-            _bake_mean_into_linear(layer.self_attn.o_proj)
             layer.self_attn.o_proj.weight.data = _rotate_weight_out(
                 layer.self_attn.o_proj.weight.data, Q, device)
 
@@ -232,13 +231,11 @@ def rotate_llm(model, Q, device):
             for proj in [layer.linear_attn.in_proj_qkv, layer.linear_attn.in_proj_z,
                          layer.linear_attn.in_proj_b, layer.linear_attn.in_proj_a]:
                 proj.weight.data = _rotate_weight(proj.weight.data, Q, device)
-            _bake_mean_into_linear(layer.linear_attn.out_proj)
             layer.linear_attn.out_proj.weight.data = _rotate_weight_out(
                 layer.linear_attn.out_proj.weight.data, Q, device)
 
         layer.mlp.gate_proj.weight.data = _rotate_weight(layer.mlp.gate_proj.weight.data, Q, device)
         layer.mlp.up_proj.weight.data = _rotate_weight(layer.mlp.up_proj.weight.data, Q, device)
-        _bake_mean_into_linear(layer.mlp.down_proj)
         layer.mlp.down_proj.weight.data = _rotate_weight_out(
             layer.mlp.down_proj.weight.data, Q, device)
 
@@ -315,10 +312,8 @@ def rotate_vision_full(model, Q_vision, device):
     for i, block in enumerate(visual.blocks):
         print(f"  Rotating vision block {i}/{len(visual.blocks)}", end="\r")
         block.attn.qkv.weight.data = _rotate_weight(block.attn.qkv.weight.data, Q_vision, device)
-        _bake_mean_into_linear(block.attn.proj)
         block.attn.proj.weight.data = _rotate_weight_out(block.attn.proj.weight.data, Q_vision, device)
         block.mlp.linear_fc1.weight.data = _rotate_weight(block.mlp.linear_fc1.weight.data, Q_vision, device)
-        _bake_mean_into_linear(block.mlp.linear_fc2)
         block.mlp.linear_fc2.weight.data = _rotate_weight_out(
             block.mlp.linear_fc2.weight.data, Q_vision, device)
 
@@ -342,7 +337,6 @@ def _rotate_merger_input(model, Q_vision, device):
 def rotate_merger_output(model, Q_llm, device):
     """Rotate merger output to match rotated LLM input space."""
     visual = _get_visual(model)
-    _bake_mean_into_linear(visual.merger.linear_fc2)
     visual.merger.linear_fc2.weight.data = _rotate_weight_out(
         visual.merger.linear_fc2.weight.data, Q_llm, device)
 

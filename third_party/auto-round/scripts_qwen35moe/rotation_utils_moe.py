@@ -294,12 +294,10 @@ def rotate_llm_moe(model, Q, device):
 
         # ── Attention output rotation (W_new = Q^T @ W) ──
         if hasattr(layer, "self_attn"):
-            _bake_mean_into_linear(layer.self_attn.o_proj)
             layer.self_attn.o_proj.weight.data = _rotate_weight_out(
                 layer.self_attn.o_proj.weight.data, Q, device)
 
         if hasattr(layer, "linear_attn"):
-            _bake_mean_into_linear(layer.linear_attn.out_proj)
             layer.linear_attn.out_proj.weight.data = _rotate_weight_out(
                 layer.linear_attn.out_proj.weight.data, Q, device)
 
@@ -349,7 +347,6 @@ def rotate_llm_moe(model, Q, device):
         # ── MoE MLP output rotation (W_new = Q^T @ W) ──
         # Shared expert output
         if hasattr(mlp, "shared_expert"):
-            _bake_mean_into_linear(mlp.shared_expert.down_proj)
             mlp.shared_expert.down_proj.weight.data = _rotate_weight_out(
                 mlp.shared_expert.down_proj.weight.data, Q, device)
 
@@ -357,13 +354,11 @@ def rotate_llm_moe(model, Q, device):
         if experts is not None:
             if hasattr(experts, "down_proj") and isinstance(experts.down_proj, torch.nn.Parameter):
                 # Packed format: down_proj shape (num_experts, hidden, inter)
-                _bake_mean_into_packed_down_proj(experts.down_proj)
                 dtype = experts.down_proj.dtype
                 down = experts.down_proj.data.to(device=device, dtype=torch.float64)
                 experts.down_proj.data = torch.matmul(Q.T, down).to(dtype=dtype)
             elif hasattr(experts, "down_proj") and not isinstance(experts.down_proj, torch.nn.Parameter):
                 for ei in range(len(experts.down_proj)):
-                    _bake_mean_into_linear(experts.down_proj[ei])
                     experts.down_proj[ei].weight.data = _rotate_weight_out(
                         experts.down_proj[ei].weight.data, Q, device)
             else:
@@ -372,7 +367,6 @@ def rotate_llm_moe(model, Q, device):
                     for ei in range(num_experts):
                         expert = experts[ei]
                         if hasattr(expert, "down_proj"):
-                            _bake_mean_into_linear(expert.down_proj)
                             expert.down_proj.weight.data = _rotate_weight_out(
                                 expert.down_proj.weight.data, Q, device)
 
@@ -451,10 +445,8 @@ def rotate_vision_full(model, Q_vision, device):
     for i, block in enumerate(visual.blocks):
         print(f"  Rotating vision block {i}/{len(visual.blocks)}", end="\r")
         block.attn.qkv.weight.data = _rotate_weight(block.attn.qkv.weight.data, Q_vision, device)
-        _bake_mean_into_linear(block.attn.proj)
         block.attn.proj.weight.data = _rotate_weight_out(block.attn.proj.weight.data, Q_vision, device)
         block.mlp.linear_fc1.weight.data = _rotate_weight(block.mlp.linear_fc1.weight.data, Q_vision, device)
-        _bake_mean_into_linear(block.mlp.linear_fc2)
         block.mlp.linear_fc2.weight.data = _rotate_weight_out(
             block.mlp.linear_fc2.weight.data, Q_vision, device)
 
@@ -478,7 +470,6 @@ def _rotate_merger_input(model, Q_vision, device):
 def rotate_merger_output(model, Q_llm, device):
     """Rotate merger output to match rotated LLM input space."""
     visual = _get_visual(model)
-    _bake_mean_into_linear(visual.merger.linear_fc2)
     visual.merger.linear_fc2.weight.data = _rotate_weight_out(
         visual.merger.linear_fc2.weight.data, Q_llm, device)
 
