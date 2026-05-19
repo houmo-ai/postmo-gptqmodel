@@ -666,6 +666,18 @@ class BaseQModel(nn.Module):
         if model_config is not None and cls.dynamic_expert_index is not None:
             num_experts = cls.get_num_experts(model_config)
 
+            # Dense fallback: num_experts is None or 0 means this is a dense model.
+            # Filter out any EXPERT_INDEX_PLACEHOLDER blocks and return only dense blocks.
+            if not num_experts:
+                dense_modules = []
+                for names in layer_modules:
+                    has_expert = any(EXPERT_INDEX_PLACEHOLDER in n for n in names)
+                    has_capture_only = all(CAPTURE_ONLY_FLAG in n for n in names)
+                    if has_expert or has_capture_only:
+                        continue
+                    dense_modules.append(list(names))
+                return dense_modules
+
             moe_simple = []
             capture_only_modules = None
             for names in layer_modules:

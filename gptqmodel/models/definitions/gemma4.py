@@ -303,11 +303,20 @@ def convert_gemma4_experts(module, config):
 
 
 class Gemma4TextQModel(BaseQModel):
+    # Gemma4 is a dual-architecture model: dense (num_experts=None) or MoE (num_experts>0).
+    # dynamic_expert_index triggers MoE expansion when num_experts > 0; dense config returns
+    # None/0 from get_num_experts, causing build_moe_modules_if_need to use the dense path.
     dynamic_expert_index = "num_experts"
     support_offload_to_disk = False
     pre_lm_head_norm_module = "model.norm"
     layer_modules_strict = False
     moe_lifecycle_hooks = Gemma4MoELifecycleHooks()
+
+    @classmethod
+    def get_num_experts(cls, model_config):
+        # For dense Gemma4 config, num_experts is None; return 0 to signal no MoE expansion.
+        num_experts = super().get_num_experts(model_config)
+        return num_experts if num_experts else 0
 
     module_tree = [
         "model",
@@ -358,11 +367,20 @@ class Gemma4TextQModel(BaseQModel):
 
 class Gemma4ForConditionalGenerationGPTQ(BaseQModel):
     support_batch_quantize = False
+    # Gemma4 is a dual-architecture model: dense (num_experts=None) or MoE (num_experts>0).
+    # dynamic_expert_index triggers MoE expansion when num_experts > 0; dense config returns
+    # None/0 from get_num_experts, causing build_moe_modules_if_need to use the dense path.
     dynamic_expert_index = "num_experts"
     support_offload_to_disk = False
     pre_lm_head_norm_module = "model.language_model.norm"
     layer_modules_strict = False
     moe_lifecycle_hooks = Gemma4MoELifecycleHooks()
+
+    @classmethod
+    def get_num_experts(cls, model_config):
+        # For dense Gemma4 config, num_experts is None; return 0 to signal no MoE expansion.
+        num_experts = super().get_num_experts(model_config)
+        return num_experts if num_experts else 0
 
     module_tree = [
         "model",
