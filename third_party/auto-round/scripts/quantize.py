@@ -66,8 +66,12 @@ def parse_args():
                         help="Random seed for rotation matrices and AutoRound")
     parser.add_argument("--format", type=str, default="auto_gptq",
                         help="Export format: auto_gptq (GPTQModel compat), auto_round, etc.")
+    parser.add_argument("--torch_dtype", type=str, default="bf16", choices=["bf16", "fp16"],
+                        help="Floating dtype used when loading/saving the pre-quant model")
     parser.add_argument("--save_rotated", type=str, default=None,
                         help="Save rotated (pre-quant) model for debugging")
+    parser.add_argument("--only_save_rotated", action="store_true", default=False,
+                        help="Exit after saving the rotated pre-quant model; requires --save_rotated")
     parser.add_argument("--deterministic", action="store_true", default=False,
                         help="Enable deterministic CuBLAS and attention (reproducible results)")
     parser.add_argument("--two_stage", action="store_true", default=False,
@@ -691,6 +695,14 @@ def main():
         print("ERROR: --two_stage only works with --mode rotate-quant-all")
         sys.exit(1)
 
+    if args.only_save_rotated and not args.save_rotated:
+        print("ERROR: --only_save_rotated requires --save_rotated")
+        sys.exit(1)
+
+    if args.only_save_rotated and not need_rotation:
+        print("ERROR: --only_save_rotated requires a rotation mode")
+        sys.exit(1)
+
     # ── Deterministic mode ──
     if args.deterministic:
         torch.use_deterministic_algorithms(True, warn_only=False)
@@ -707,6 +719,7 @@ def main():
     print(f"LLM: W{args.llm_bits}G{args.llm_group_size}")
     if need_vision_quant:
         print(f"Vision: W{args.vision_bits}G{args.vision_group_size}")
+    print(f"Torch dtype: {args.torch_dtype}")
     if args.two_stage:
         print(f"Two-stage: LLM with pile-10k, vision with llava_conv_58k")
     if args.deterministic:
@@ -729,8 +742,9 @@ def main():
     # Always load to CPU; AutoRound handles GPU placement during optimization.
     # device_map="auto" causes device mismatch errors during caching for VLMs.
     load_device = "cpu"
+    torch_dtype = torch.float16 if args.torch_dtype == "fp16" else torch.bfloat16
     model_kwargs = dict(
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch_dtype,
         device_map=load_device,
         trust_remote_code=True,
     )
@@ -793,6 +807,19 @@ def main():
             print(f"Saving rotated model to: {args.save_rotated}")
             model.save_pretrained(args.save_rotated, max_shard_size="5GB")
             tokenizer.save_pretrained(args.save_rotated)
+            if processor is not None:
+                processor.save_pretrained(args.save_rotated)
+
+            if args.only_save_rotated:
+                total_time = time.time() - total_start
+                print(f"\n{'='*60}")
+                print("Done! Rotated pre-quant model saved")
+                print(f"   Output: {args.save_rotated}")
+                print(f"   Mode: {args.mode}")
+                print(f"   Torch dtype: {args.torch_dtype}")
+                print(f"   Time: {total_time:.1f}s ({total_time / 3600:.2f}h)")
+                print(f"{'='*60}")
+                return
 
     # ── Build layer_config for mode 4 (vision W8) ──
     layer_config = None

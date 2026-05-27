@@ -21,7 +21,7 @@ echo "Model: ${MODEL_PATH}"
 echo "Output: ${OUTPUT_DIR}"
 echo "=========================================="
 
-python scripts/quantize.py \
+python third_party/auto-round/scripts/quantize.py \
     --model "${MODEL_PATH}" \
     --mode llm-only \
     --output_dir "${OUTPUT_DIR}" \
