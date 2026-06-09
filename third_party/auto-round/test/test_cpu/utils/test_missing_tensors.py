@@ -572,6 +572,71 @@ class TestCopyMissingTensorsFromSource(unittest.TestCase):
             self.assertIn("mtp.0.norm.weight", updated_index["weight_map"])
             self.assertEqual(updated_index["weight_map"]["mtp.0.norm.weight"], "model_extra_tensors.safetensors")
 
+    def test_stale_sharded_index_is_rebuilt_from_physical_tensor_keys(self):
+        """A stale sharded index is replaced with keys physically present in safetensors files."""
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
+            _save_safetensors(
+                {"model.layers.0.self_attn.q_proj.weight": torch.randn(32, 64)},
+                os.path.join(source_dir, "model.safetensors"),
+            )
+
+            saved_shard = "model-00001-of-00001.safetensors"
+            _save_safetensors(
+                {"model.layers.0.self_attn.q_proj.qweight": torch.randint(0, 2**31, (8, 32), dtype=torch.int32)},
+                os.path.join(target_dir, saved_shard),
+            )
+            index = {
+                "metadata": {"total_size": 123, "format": "pt"},
+                "weight_map": {"model.layers.0.self_attn.q_proj.weight": saved_shard},
+            }
+            with open(os.path.join(target_dir, "model.safetensors.index.json"), "w") as f:
+                json.dump(index, f)
+            _write_config(target_dir)
+
+            copy_missing_tensors_from_source(source_dir, target_dir)
+
+            with open(os.path.join(target_dir, "model.safetensors.index.json")) as f:
+                updated_index = json.load(f)
+
+            self.assertEqual(updated_index["metadata"], index["metadata"])
+            self.assertEqual(
+                updated_index["weight_map"],
+                {"model.layers.0.self_attn.q_proj.qweight": saved_shard},
+            )
+            self.assertFalse(os.path.exists(os.path.join(target_dir, "model_extra_tensors.safetensors")))
+
+    def test_empty_sharded_target_raises_instead_of_using_stale_index(self):
+        """An indexed target with no physical tensor keys is invalid and must not use stale weight_map keys."""
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as target_dir:
+            _save_safetensors(
+                {"model.layers.0.self_attn.q_proj.weight": torch.randn(32, 64)},
+                os.path.join(source_dir, "model.safetensors"),
+            )
+
+            saved_shard = "model-00001-of-00001.safetensors"
+            _save_safetensors({}, os.path.join(target_dir, saved_shard))
+            index = {
+                "metadata": {"total_size": 0},
+                "weight_map": {"model.layers.0.self_attn.q_proj.weight": saved_shard},
+            }
+            with open(os.path.join(target_dir, "model.safetensors.index.json"), "w") as f:
+                json.dump(index, f)
+            _write_config(target_dir)
+
+            with self.assertRaisesRegex(ValueError, "no tensor keys"):
+                copy_missing_tensors_from_source(source_dir, target_dir)
+
+    def test_saved_index_helper_avoids_pep604_dict_union_annotation(self):
+        """Keep the newly added index helper compatible with Python versions before PEP 604 syntax."""
+        module_path = os.path.join(
+            os.path.dirname(__file__),
+            "../../../auto_round/utils/missing_tensors.py",
+        )
+        with open(os.path.normpath(module_path)) as f:
+            source = f.read()
+
+        self.assertNotIn("index_data: dict | None", source)
+
     def test_index_json_is_created_for_single_file_target(self):
         """When the target uses a single safetensors file and tensors are copied, a new
         model.safetensors.index.json is created mapping all tensors to their shards."""

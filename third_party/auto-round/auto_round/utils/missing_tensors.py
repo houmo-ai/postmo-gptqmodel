@@ -37,6 +37,7 @@
 #     ``packing_format == "auto_round:auto_gptq"`` are detected in
 #     ``config.json``).
 
+import glob
 import json
 import os
 from typing import Optional, Tuple
@@ -137,10 +138,50 @@ def copy_missing_tensors_from_source(
     saved_index_file = os.path.join(target_dir, "model.safetensors.index.json")
     saved_single_file = os.path.join(target_dir, "model.safetensors")
 
+    def _collect_saved_tensors_from_files(index_data: Optional[dict] = None) -> dict:
+        """Return actual tensor names present in target safetensors files.
+
+        The saved index can be stale or contain architecture-level aliases that
+        do not match the keys physically written into the safetensors shards.
+        Missing-tensor detection must use the physical keys, otherwise source
+        tensors from already-processed layers can be copied back as extras.
+        """
+        shard_names = set()
+        if index_data is not None:
+            shard_names.update(index_data.get("weight_map", {}).values())
+        shard_names.update(os.path.basename(path) for path in glob.glob(os.path.join(target_dir, "*.safetensors")))
+
+        tensor_to_file = {}
+        for shard_name in sorted(shard_names):
+            shard_path = os.path.join(target_dir, shard_name)
+            if not os.path.exists(shard_path):
+                continue
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    tensor_to_file[key] = shard_name
+        return tensor_to_file
+
+    saved_idx = None
     if os.path.exists(saved_index_file):
         with open(saved_index_file) as f:
             saved_idx = json.load(f)
-        saved_tensor_names = set(saved_idx["weight_map"].keys())
+        actual_tensor_to_file = _collect_saved_tensors_from_files(saved_idx)
+        if actual_tensor_to_file:
+            saved_tensor_names = set(actual_tensor_to_file)
+            if saved_idx.get("weight_map", {}) != actual_tensor_to_file:
+                saved_idx["weight_map"] = actual_tensor_to_file
+                with open(saved_index_file, "w") as f:
+                    json.dump(saved_idx, f, indent=2)
+                logger.info(
+                    "Rebuilt target checkpoint index from actual safetensors keys "
+                    f"({len(actual_tensor_to_file)} tensor(s)); stale index keys were ignored."
+                )
+        else:
+            raise ValueError(
+                "Target checkpoint index exists, but no tensor keys were found in the referenced "
+                f"safetensors shards under {target_dir}. Refusing to use stale index keys for "
+                "missing-tensor detection."
+            )
     elif os.path.exists(saved_single_file):
         with safe_open(saved_single_file, framework="pt", device="cpu") as f:
             saved_tensor_names = set(f.keys())
