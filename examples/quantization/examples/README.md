@@ -19,9 +19,9 @@
 
 推荐统一放在 `work_dirs/` 下：
 
-| 模型 | 正式输出 | Smoke/debug 输出 |
-|---|---|---|
-| Qwen3.5 Dense 9B W4G64 rotate | `work_dirs/q9b-W4G64-rot` | `work_dirs/q9b-W4G64-rot-smoke-debug` |
+| 模型                             | 正式输出                      | Smoke/debug 输出                       |
+| -------------------------------- | ----------------------------- | -------------------------------------- |
+| Qwen3.5 Dense 9B W4G64 rotate    | `work_dirs/q9b-W4G64-rot`     | `work_dirs/q9b-W4G64-rot-smoke-debug`  |
 | Qwen3.5 MoE 35B-A3B W4G64 rotate | `work_dirs/q35b-W4G64-rot-v2` | `work_dirs/q35b-W4G64-rot-smoke-debug` |
 
 如需迭代同一配置，用 `-v2`、`-v3` 后缀，不要覆盖已确认可用的目录。
@@ -91,15 +91,32 @@ python examples/quantization/examples/example_qwen35moe.py \
   --calibration-jsonl gptqmodel/quantization/calibration/moe_ebss/gen_data/Qwen3-Next-80B-A3B-Instruct.jsonl
 ```
 
+## MoE 122B-A10B 推荐命令
+
+CUDA_VISIBLE_DEVICES=2 python examples/quantization/examples/example_qwen35moe.py \
+ --model /data01/nfs_shared/llm_models/Qwen/Qwen3.5-122B-A10B \
+ --bits 4 \
+ --rotation hadamard \
+ --group-size 64 \
+ --self-attn-bits 8 \
+ --shared-expert-bits 8 \
+ --expert-down-bits 5 \
+ --nsamples 512 \
+ --no-offload-to-disk \
+ --check-quant-vision-demo \
+ --calibration-jsonl gptqmodel/quantization/calibration/moe_ebss/gen_data/Qwen3-Next-80B-A3B-Instruct.jsonl
+
+注意必须指定 --no-offload-to-disk，否则量化后的模型会出现乱码
+
 MoE bit 配置约定：
 
-| 模块 | 推荐 bits |
-|---|---:|
-| self-attn / linear-attn | 8 |
-| shared expert | 8 |
-| routed expert gate/up | 4 |
-| routed expert down_proj | 5 |
-| 其他 base linear | 4 |
+| 模块                    | 推荐 bits |
+| ----------------------- | --------: |
+| self-attn / linear-attn |         8 |
+| shared expert           |         8 |
+| routed expert gate/up   |         4 |
+| routed expert down_proj |         5 |
+| 其他 base linear        |         4 |
 
 ## 校准数据
 
@@ -169,7 +186,6 @@ python examples/quantization/examples/example_qwen35dense.py \
 ```
 
 MoE 使用 `example_qwen35moe.py`，并把 `--model` / `--rotated-out` 换成对应目录。
-
 
 # Gemma4-26B-A4B量化使用说明
 
