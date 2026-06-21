@@ -673,12 +673,14 @@ def get_dataset(tokenizer, seqlen, dataset_name="NeelNanda/pile-10k", seed=42, n
 
     def concat_dataset_element(dataset):
         input_ids, concat_input_ids = [eg["input_ids"] for eg in dataset], []
-        attention_mask_list, attention_mask = [], torch.ones([1, seqlen]).to(torch.int64)
+        attention_mask_list, attention_mask = [], torch.ones([seqlen]).to(torch.int64)
         buffer_input_id = torch.Tensor().to(torch.int64)
         bos_token_id, eos_token_id = tokenizer.bos_token_id, tokenizer.eos_token_id
         os_cnt, have_bos, have_eos = 0, False, False
 
         for input_id in input_ids:
+            if isinstance(input_id, list):
+                input_id = torch.tensor(input_id, dtype=torch.int64)
             if input_id[0] == bos_token_id:
                 input_id = input_id[1:]
                 os_cnt, have_bos = os_cnt + 1, True

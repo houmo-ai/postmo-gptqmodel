@@ -10,14 +10,15 @@ Example:
 """
 
 import argparse
-from contextlib import contextmanager
 import json
 import os
 import sys
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+GPTQMODEL_ROOT = os.path.dirname(os.path.dirname(PROJECT_ROOT))
+for path in (GPTQMODEL_ROOT, PROJECT_ROOT):
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
 import torch
 
@@ -70,19 +71,6 @@ def _assert_quantized_gemma4_moe_checkpoint(quantized_model):
     return config
 
 
-def _patch_incompatible_backends():
-    try:
-        from auto_round.inference.backend import BackendInfos
-
-        to_remove = [name for name in list(BackendInfos.keys()) if "marlin" in name or "exllama" in name]
-        for name in to_remove:
-            del BackendInfos[name]
-        if to_remove:
-            print(f"[chat] Removed {len(to_remove)} incompatible backends")
-    except Exception as exc:
-        print(f"[chat] Backend patch skipped: {exc}")
-
-
 def _resolve_runtime_device(device):
     if device == "auto":
         if torch.cuda.is_available() and torch.cuda.device_count() > 0:
@@ -115,61 +103,6 @@ def _resolve_runtime_device(device):
     return device
 
 
-def _normalize_device_map(device):
-    if device == "cpu":
-        return "cpu"
-    return {"": device}
-
-
-def _checkpoint_uses_split_moe_experts(config):
-    modules = config.get("quantization_config", {}).get("modules_in_block_to_quantize", [])
-    flat_modules = []
-    for module_group in modules:
-        if isinstance(module_group, list):
-            flat_modules.extend(module_group)
-        elif isinstance(module_group, str):
-            flat_modules.append(module_group)
-    return any(name.startswith("experts.0.") for name in flat_modules)
-
-
-@contextmanager
-def _patched_gemma4_moe_gptq_loader(config):
-    if not _checkpoint_uses_split_moe_experts(config):
-        yield
-        return
-
-    from auto_round.modeling.fused_moe.moe_experts_interface import prepare_model_for_moe_quantization
-    from transformers.quantizers.quantizer_gptq import GptqHfQuantizer
-
-    original_process = GptqHfQuantizer._process_model_before_weight_loading
-
-    def patched_process(self, model, **kwargs):
-        text_config = getattr(model.config, "text_config", model.config)
-        experts = None
-        try:
-            experts = model.model.language_model.layers[0].experts
-        except Exception:
-            experts = None
-
-        already_split = experts is not None and hasattr(experts, "0")
-        if (
-            getattr(self, "pre_quantized", False)
-            and getattr(model.config, "model_type", None) == "gemma4"
-            and getattr(text_config, "enable_moe_block", False)
-            and not already_split
-        ):
-            prepare_model_for_moe_quantization(model)
-            print("[chat] Prepared Gemma4 MoE split experts before GPTQ weight loading")
-
-        return original_process(self, model, **kwargs)
-
-    GptqHfQuantizer._process_model_before_weight_loading = patched_process
-    try:
-        yield
-    finally:
-        GptqHfQuantizer._process_model_before_weight_loading = original_process
-
-
 def _count_quantized_layers(model):
     quant_layer_count = 0
     quant_types = {}
@@ -182,45 +115,34 @@ def _count_quantized_layers(model):
 
 
 def _load_quantized_model(quantized_model, device, dtype_name, config):
-    _patch_incompatible_backends()
+    """Load quantized Gemma4 MoE with GPTQModel, never AutoRound/vanilla HF."""
+    del dtype_name  # GPTQModel resolves dtype/backend from the quantized checkpoint.
 
-    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoTokenizer
+    from gptqmodel import GPTQModel
+    from transformers import AutoTokenizer
 
     runtime_device = _resolve_runtime_device(device)
-    model_kwargs = dict(
-        torch_dtype=_get_torch_dtype(dtype_name),
-        device_map=_normalize_device_map(runtime_device),
-        trust_remote_code=True,
-    )
-
     tokenizer = AutoTokenizer.from_pretrained(quantized_model, trust_remote_code=True)
 
-    last_error = None
-    with _patched_gemma4_moe_gptq_loader(config):
-        for loader in (AutoModelForImageTextToText, AutoModelForCausalLM):
-            try:
-                with torch.no_grad():
-                    model = loader.from_pretrained(quantized_model, **model_kwargs)
-                if not hasattr(model, "generate"):
-                    raise TypeError(f"{type(model).__name__} does not implement generate()")
+    with torch.no_grad():
+        gptq_model = GPTQModel.load(quantized_model, device=runtime_device, trust_remote_code=True)
+    model = gptq_model.model
+    if not hasattr(model, "generate"):
+        raise TypeError(f"{type(model).__name__} does not implement generate()")
 
-                quant_layer_count, quant_types = _count_quantized_layers(model)
-                if quant_layer_count == 0:
-                    raise RuntimeError("Loaded model does not expose any quantized layers (qweight not found)")
+    quant_layer_count, quant_types = _count_quantized_layers(model)
+    if quant_layer_count == 0:
+        raise RuntimeError("Loaded model does not expose any quantized layers (qweight not found)")
 
-                model.eval()
-                print(f"[chat] Loaded with {loader.__name__}")
-                print(f"[chat] Runtime device: {runtime_device}")
-                print(
-                    f"[chat] Quantized checkpoint confirmed: bits={config['quantization_config'].get('bits')}, "
-                    f"group_size={config['quantization_config'].get('group_size')}, layers={quant_layer_count}"
-                )
-                print(f"[chat] Quant layer types: {quant_types}")
-                return model, tokenizer, runtime_device
-            except Exception as exc:
-                last_error = exc
-
-    raise RuntimeError(f"Failed to load quantized checkpoint for chat: {last_error}")
+    model.eval()
+    print("[chat] Loaded with GPTQModel.load")
+    print(f"[chat] Runtime device: {runtime_device}")
+    print(
+        f"[chat] Quantized checkpoint confirmed: bits={config['quantization_config'].get('bits')}, "
+        f"group_size={config['quantization_config'].get('group_size')}, layers={quant_layer_count}"
+    )
+    print(f"[chat] Quant layer types: {quant_types}")
+    return model, tokenizer, runtime_device
 
 
 def _tokenize_messages(tokenizer, messages, device):

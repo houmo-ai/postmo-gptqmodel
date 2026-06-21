@@ -246,7 +246,11 @@ def get_mllm_dataloader(
             template, model=model, tokenizer=tokenizer, processor=processor, image_processor=image_processor
         )
 
-    if os.path.isfile(dataset) or dataset in MLLM_DATASET.keys():
+    # Only registered multimodal dataset names should enter the MLLM dataset
+    # registry. Local JSON/JSONL files can also be text-only calibration
+    # corpora; route those through auto_round.calib_dataset below instead of
+    # looking up the full file path in MLLM_DATASET.
+    if dataset in MLLM_DATASET.keys():
         if seqlen > MLLM_DATASET[dataset].MAX_SUPPORT_SEQLEN:
             logger.warning(
                 f"seqlen({seqlen}) is greater than the maximum length supported by the {dataset},"

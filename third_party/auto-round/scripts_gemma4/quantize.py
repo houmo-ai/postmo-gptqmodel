@@ -687,6 +687,17 @@ def main():
     from auto_round import AutoRound
 
     ar_kwargs = {}
+    layer_config = {}
+    if getattr(text_config, "hidden_size_per_layer_input", 0):
+        # E-series PLE gate/projection linears are not represented by the
+        # Gemma3 GPTQModel loader used for Gemma4 artifacts. Keep them as FP
+        # weights, matching the GPTQ recipe and avoiding qweight sidecars that
+        # are ignored on reload/export.
+        layer_config.update({
+            "per_layer_input_gate": {"bits": 16, "act_bits": 16},
+            "per_layer_projection": {"bits": 16, "act_bits": 16},
+        })
+        print("  Keeping per-layer input gate/projection in FP16 for GPTQModel compatibility")
 
     ar = AutoRound(
         model=model,
@@ -702,6 +713,7 @@ def main():
         dataset=args.dataset,
         seed=args.seed,
         quant_nontext_module=False,
+        layer_config=layer_config or None,
         **ar_kwargs,
     )
 

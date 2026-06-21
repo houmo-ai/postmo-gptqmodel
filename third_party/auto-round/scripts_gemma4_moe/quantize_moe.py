@@ -15,7 +15,6 @@ Example:
 """
 
 import argparse
-from contextlib import contextmanager
 import gc
 import glob
 import json
@@ -24,8 +23,10 @@ import sys
 import time
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+GPTQMODEL_ROOT = os.path.dirname(os.path.dirname(PROJECT_ROOT))
+for path in (GPTQMODEL_ROOT, PROJECT_ROOT):
+    if path not in sys.path:
+        sys.path.insert(0, path)
 
 import torch
 
@@ -199,95 +200,6 @@ def fix_checkpoint_after_save(output_dir):
         print(f"[fix_checkpoint] Removed {removed} duplicates from model_extra_tensors")
 
 
-def _patch_incompatible_backends():
-    """Remove backends that commonly fail on older GLIBC environments."""
-    try:
-        from auto_round.inference.backend import BackendInfos
-
-        to_remove = [name for name in list(BackendInfos.keys()) if "marlin" in name or "exllama" in name]
-        for name in to_remove:
-            del BackendInfos[name]
-        if to_remove:
-            print(f"[verify] Removed {len(to_remove)} incompatible backends")
-    except Exception as exc:
-        print(f"[verify] Backend patch skipped: {exc}")
-
-
-def _normalize_device_map(device):
-    if device == "cpu":
-        return "cpu"
-    return {"": device}
-
-
-def _checkpoint_uses_split_moe_experts(output_dir):
-    config_path = os.path.join(output_dir, "config.json")
-    if not os.path.exists(config_path):
-        return False
-
-    try:
-        with open(config_path) as handle:
-            config = json.load(handle)
-    except Exception as exc:
-        print(f"[verify] Failed to inspect checkpoint config: {exc}")
-        return False
-
-    if config.get("model_type") != "gemma4":
-        return False
-
-    text_config = config.get("text_config", {})
-    if not text_config.get("enable_moe_block", False):
-        return False
-
-    modules = config.get("quantization_config", {}).get("modules_in_block_to_quantize", [])
-    flat_modules = []
-    for module_group in modules:
-        if isinstance(module_group, list):
-            flat_modules.extend(module_group)
-        elif isinstance(module_group, str):
-            flat_modules.append(module_group)
-
-    return any(name.startswith("experts.0.") for name in flat_modules)
-
-
-@contextmanager
-def _patched_gemma4_moe_gptq_loader(output_dir):
-    if not _checkpoint_uses_split_moe_experts(output_dir):
-        yield
-        return
-
-    from auto_round.modeling.fused_moe.moe_experts_interface import prepare_model_for_moe_quantization
-    from transformers.quantizers.quantizer_gptq import GptqHfQuantizer
-
-    original_process = GptqHfQuantizer._process_model_before_weight_loading
-
-    def patched_process(self, model, **kwargs):
-        text_config = getattr(model.config, "text_config", model.config)
-        experts = None
-        try:
-            experts = model.model.language_model.layers[0].experts
-        except Exception:
-            experts = None
-
-        already_split = experts is not None and hasattr(experts, "0")
-        if (
-            getattr(self, "pre_quantized", False)
-            and getattr(model.config, "model_type", None) == "gemma4"
-            and getattr(text_config, "enable_moe_block", False)
-            and not already_split
-        ):
-            prepare_model_for_moe_quantization(model)
-            print("[verify] Prepared Gemma4 MoE split experts before GPTQ weight loading")
-
-        return original_process(self, model, **kwargs)
-
-    print("[verify] Detected Gemma4 MoE split-experts checkpoint")
-    GptqHfQuantizer._process_model_before_weight_loading = patched_process
-    try:
-        yield
-    finally:
-        GptqHfQuantizer._process_model_before_weight_loading = original_process
-
-
 def _load_tokenizer_for_verify(output_dir, original_model):
     from transformers import AutoTokenizer
 
@@ -323,30 +235,26 @@ def _build_verify_inputs(tokenizer, prompt, device):
 
 
 def _load_quantized_model_for_verify(output_dir, device, dtype_name):
-    _patch_incompatible_backends()
+    """Load the saved quantized checkpoint through GPTQModel's Gemma4 hooks.
 
-    from transformers import AutoModelForCausalLM, AutoModelForImageTextToText
+    Gemma4 MoE AutoRound checkpoints are saved in GPTQModel-compatible split
+    expert form (``experts.<id>.gate/up/down_proj``).  Vanilla transformers /
+    AutoRound loading constructs the fused HF ``Gemma4TextExperts`` module and
+    can leave expert weights missing or mismatched.  GPTQModel's Gemma4
+    definition is the authoritative Merak load path: it builds the split expert
+    container before qweight loading, matching export/eval behavior.
+    """
+    del dtype_name  # GPTQModel resolves dtype/backend from the quantized checkpoint.
 
-    model_kwargs = dict(
-        torch_dtype=_get_torch_dtype(dtype_name),
-        device_map=_normalize_device_map(device),
-        trust_remote_code=True,
-    )
+    from gptqmodel import GPTQModel
 
-    last_error = None
-    with _patched_gemma4_moe_gptq_loader(output_dir):
-        for loader in (AutoModelForImageTextToText, AutoModelForCausalLM):
-            try:
-                with torch.no_grad():
-                    model = loader.from_pretrained(output_dir, **model_kwargs)
-                if not hasattr(model, "generate"):
-                    raise TypeError(f"{type(model).__name__} does not implement generate()")
-                model.eval()
-                return model, loader.__name__
-            except Exception as exc:
-                last_error = exc
-
-    raise RuntimeError(f"Failed to load quantized model for verification: {last_error}")
+    with torch.no_grad():
+        gptq_model = GPTQModel.load(output_dir, device=device, trust_remote_code=True)
+    model = gptq_model.model
+    if not hasattr(model, "generate"):
+        raise TypeError(f"{type(model).__name__} does not implement generate()")
+    model.eval()
+    return model, "GPTQModel.load"
 
 
 def verify_saved_model_generation(output_dir, original_model, device, dtype_name, prompt, max_new_tokens):
