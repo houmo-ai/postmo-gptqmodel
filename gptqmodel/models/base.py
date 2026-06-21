@@ -1458,6 +1458,12 @@ class BaseQModel(nn.Module):
             self.post_quantize(norm)
         return inputs
 
+    def build_layer_extra_inputs_cache(self, example, data_device):
+        return None
+
+    def prepare_layer_inputs_for_quantize(self, layer_inputs, input_cache, layer_index: int):
+        return layer_inputs
+
     def pre_quantize(self, module: nn.Module) -> nn.Module:
         if get_device(module) == META:
             return self.shell_module_materialize(

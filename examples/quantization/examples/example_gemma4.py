@@ -21,13 +21,39 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from gptqmodel import GPTQModel, QuantizeConfig
+from gptqmodel.quantization.config import ExpertsRoutingBypass, ExpertsRoutingOverride, MoEConfig
+from gptqmodel.recipes.gemma4 import _copy_hf_auxiliary_files, _patch_gemma4_quantization_config
 
 
 def get_wikitext2(nsamples, seqlen):
-    traindata = load_dataset("wikitext", "wikitext-2-raw-v1", split="train").filter(
-        lambda x: len(x["text"]) >= seqlen
+    traindata = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+    texts = [example["text"].strip() for example in traindata if example["text"].strip()]
+    long_texts = [text for text in texts if len(text) >= seqlen]
+    if len(long_texts) >= nsamples:
+        return long_texts[:nsamples]
+
+    logging.warning(
+        "Only found %s wikitext2 rows with len(text) >= %s; "
+        "building contiguous calibration chunks to reach nsamples=%s",
+        len(long_texts),
+        seqlen,
+        nsamples,
     )
-    return [example["text"] for example in traindata.select(range(nsamples))]
+    corpus = "\n\n".join(texts)
+    samples = list(long_texts)
+    cursor = 0
+    while len(samples) < nsamples and cursor < len(corpus):
+        chunk = corpus[cursor: cursor + seqlen]
+        if chunk.strip():
+            samples.append(chunk)
+        cursor += seqlen
+    if len(samples) < nsamples:
+        logging.warning(
+            "Requested %s wikitext2 calibration sample(s), but only built %s sample(s)",
+            nsamples,
+            len(samples),
+        )
+    return samples
 
 
 def get_jsonl_texts(path, nsamples, text_key="text"):
@@ -107,6 +133,17 @@ def build_chat_inputs(tokenizer, prompt: str, device: str):
     return tokenizer(text, return_tensors="pt").to(device)
 
 
+def build_moe_config(args):
+    if args.moe_routing == "none":
+        return None
+    if args.moe_routing == "bypass":
+        return MoEConfig(routing=ExpertsRoutingBypass(batch_size=args.moe_routing_batch_size))
+    n_per_tok = args.moe_num_experts_per_tok
+    if isinstance(n_per_tok, str) and n_per_tok != "all":
+        n_per_tok = int(n_per_tok)
+    return MoEConfig(routing=ExpertsRoutingOverride(num_experts_per_tok=n_per_tok))
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Gemma4 GPTQ quantization + generation validation")
     parser.add_argument(
@@ -141,8 +178,8 @@ def parse_args():
     parser.add_argument(
         "--calibration-jsonl",
         type=str,
-        default="/data01/home/chenzx/project/gptqmodel/gen_qwen3_30b_EBSS.jsonl",
-        help="optional JSONL calibration dataset path; overrides wikitext2 when provided",
+        default=None,
+        help="optional JSONL calibration dataset path; uses wikitext2 when omitted",
     )
     parser.add_argument(
         "--calibration-text-key",
@@ -181,6 +218,25 @@ def parse_args():
         default=False,
         help="skip post-quantization generation and perplexity evaluation",
     )
+    parser.add_argument(
+        "--moe-routing",
+        type=str,
+        default="none",
+        choices=["none", "bypass", "override"],
+        help="MoE routing mode: bypass forwards calibration to all experts.",
+    )
+    parser.add_argument(
+        "--moe-routing-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for MoE bypass routing to reduce VRAM pressure.",
+    )
+    parser.add_argument(
+        "--moe-num-experts-per-tok",
+        type=str,
+        default="all",
+        help="Override top-k experts per token when --moe-routing=override.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -205,6 +261,7 @@ def main():
             hessian_mse=args.hessian_mse,
             mse=args.mse,
             device=args.device,
+            moe=build_moe_config(args),
             offload_to_disk=args.offload_to_disk,
             offload_to_disk_path=args.offload_path if args.offload_to_disk else None,
         )
@@ -218,6 +275,8 @@ def main():
         print("[3/5] Running GPTQ quantization ...")
         model.quantize(calibration_dataset, batch_size=args.batch_size)
         model.save(args.out)
+        _copy_hf_auxiliary_files(args.model, args.out)
+        _patch_gemma4_quantization_config(args.out)
         print(f"Quantized model saved to: {args.out}")
     else:
         print(f"[1/5] Skip quantization, using existing quantized model: {args.out}")

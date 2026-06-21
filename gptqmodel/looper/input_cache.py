@@ -4,7 +4,7 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -15,6 +15,7 @@ class InputCache:
     layer_input_kwargs: List[Dict[str, torch.Tensor]]
     position_ids: List[torch.Tensor]
     attention_masks: List[torch.Tensor]
+    layer_extra_inputs: Optional[List[List[List[Any]]]] = None
 
     def module_kwargs(self):
         result = dict()

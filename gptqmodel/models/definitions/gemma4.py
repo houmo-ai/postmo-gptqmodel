@@ -65,7 +65,13 @@ class Gemma4NaiveExperts(nn.Module):
             self.intermediate_dim = config.moe_intermediate_size
             self.act_fn = ACT2FN[config.hidden_activation]
 
-        self.experts = nn.ModuleList()
+        # Register every split expert directly under the container as
+        # `<layer>.experts.<expert_id>.*`.  Gemma4 legacy Merak artifacts and
+        # AutoRound scripts save MoE tensors with this flat key shape; keeping a
+        # nested ModuleList as `<layer>.experts.experts.<expert_id>.*` makes the
+        # loader skip quantized expert weights and leaves the MoE block in FP,
+        # which produces corrupted generations after export.
+        self.experts = []
 
         with torch.no_grad():
             for i in range(self.num_experts):
@@ -84,16 +90,16 @@ class Gemma4NaiveExperts(nn.Module):
                     up_weight = torch.empty(self.intermediate_dim, self.hidden_dim, dtype=dtype, device=device)
                     down_weight = torch.empty(self.hidden_dim, self.intermediate_dim, dtype=dtype, device=device)
 
-                self.experts.append(
-                    Gemma4NaiveExpert(
-                        hidden_dim=self.hidden_dim,
-                        intermediate_dim=self.intermediate_dim,
-                        act_fn=self.act_fn,
-                        gate_weight=gate_weight.to(dtype=dtype, device=device),
-                        up_weight=up_weight.to(dtype=dtype, device=device),
-                        down_weight=down_weight.to(dtype=dtype, device=device),
-                    )
+                expert = Gemma4NaiveExpert(
+                    hidden_dim=self.hidden_dim,
+                    intermediate_dim=self.intermediate_dim,
+                    act_fn=self.act_fn,
+                    gate_weight=gate_weight.to(dtype=dtype, device=device),
+                    up_weight=up_weight.to(dtype=dtype, device=device),
+                    down_weight=down_weight.to(dtype=dtype, device=device),
                 )
+                self.add_module(str(i), expert)
+                self.experts.append(expert)
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         final_hidden_states = torch.zeros_like(hidden_states)
@@ -108,11 +114,30 @@ class Gemma4NaiveExperts(nn.Module):
                 continue
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
-            current_hidden_states = self.experts[expert_idx](current_state)
+            current_hidden_states = self.experts[int(expert_idx.item())](current_state)
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
         return final_hidden_states
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        # Backward compatibility for artifacts produced before the flat expert
+        # naming fix.  Old checkpoints used `<layer>.experts.experts.<id>.*`;
+        # the canonical layout is now `<layer>.experts.<id>.*`.
+        legacy_prefix = f"{prefix}experts."
+        for key in list(state_dict.keys()):
+            if key.startswith(legacy_prefix):
+                flat_key = f"{prefix}{key[len(legacy_prefix):]}"
+                state_dict.setdefault(flat_key, state_dict[key])
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
 
 class Gemma4MoELifecycleHooks(GateUpDownMoELifecycleHooks):
@@ -302,7 +327,63 @@ def convert_gemma4_experts(module, config):
     return module
 
 
-class Gemma4TextQModel(BaseQModel):
+class Gemma4PerLayerInputMixin:
+    @classmethod
+    def normalize_quantized_module_names(cls, names):
+        return {name.replace(".experts.experts.", ".experts.") for name in names}
+
+    def _get_gemma4_text_model(self):
+        model = getattr(self, "model", None)
+        if model is None:
+            return None
+        if hasattr(model, "model") and hasattr(model.model, "language_model"):
+            return model.model.language_model
+        if hasattr(model, "model") and hasattr(model.model, "layers"):
+            return model.model
+        if hasattr(model, "layers"):
+            return model
+        return None
+
+    def build_layer_extra_inputs_cache(self, example, data_device):
+        text_model = self._get_gemma4_text_model()
+        if text_model is None:
+            return None
+        hidden_size_per_layer_input = getattr(text_model, "hidden_size_per_layer_input", None)
+        if not hidden_size_per_layer_input:
+            return None
+        input_ids = example.get("input_ids") if isinstance(example, dict) else None
+        if input_ids is None:
+            return None
+
+        with torch.no_grad():
+            input_ids = input_ids.to(device=data_device)
+            inputs_embeds = text_model.embed_tokens(input_ids)
+            per_layer_inputs = text_model.get_per_layer_inputs(input_ids, inputs_embeds)
+            per_layer_inputs = text_model.project_per_layer_inputs(inputs_embeds, per_layer_inputs)
+            return [
+                [per_layer_inputs[:, :, layer_idx, :].detach().to(device=data_device)]
+                for layer_idx in range(per_layer_inputs.shape[2])
+            ]
+
+    def prepare_layer_inputs_for_quantize(self, layer_inputs, input_cache, layer_index: int):
+        layer_extra_inputs = getattr(input_cache, "layer_extra_inputs", None)
+        if not layer_extra_inputs or layer_index >= len(layer_extra_inputs):
+            return layer_inputs
+        extra_inputs_for_layer = layer_extra_inputs[layer_index]
+        if len(extra_inputs_for_layer) < len(layer_inputs):
+            return layer_inputs
+
+        prepared = []
+        for batch_idx, inputs in enumerate(layer_inputs):
+            if not inputs:
+                prepared.append(inputs)
+                continue
+            hidden_states = inputs[0]
+            prepared.append([hidden_states, *extra_inputs_for_layer[batch_idx]])
+        return prepared
+
+
+class Gemma4TextQModel(Gemma4PerLayerInputMixin, BaseQModel):
     # Gemma4 is a dual-architecture model: dense (num_experts=None) or MoE (num_experts>0).
     # dynamic_expert_index triggers MoE expansion when num_experts > 0; dense config returns
     # None/0 from get_num_experts, causing build_moe_modules_if_need to use the dense path.
@@ -341,9 +422,7 @@ class Gemma4TextQModel(BaseQModel):
             "post_feedforward_layernorm_2": ("post_feedforward_layernorm_2:!",),
             "router": ("router:!",),
             "experts:moe": {
-                "experts": {
-                    "#": ("gate_proj:0", "up_proj:0", "down_proj:1"),
-                },
+                "#": ("gate_proj:0", "up_proj:0", "down_proj:1"),
             },
         },
     ]
@@ -365,7 +444,7 @@ class Gemma4TextQModel(BaseQModel):
 
 
 
-class Gemma4ForConditionalGenerationGPTQ(BaseQModel):
+class Gemma4ForConditionalGenerationGPTQ(Gemma4PerLayerInputMixin, BaseQModel):
     support_batch_quantize = False
     # Gemma4 is a dual-architecture model: dense (num_experts=None) or MoE (num_experts>0).
     # dynamic_expert_index triggers MoE expansion when num_experts > 0; dense config returns
@@ -406,9 +485,7 @@ class Gemma4ForConditionalGenerationGPTQ(BaseQModel):
             "post_feedforward_layernorm_2": ("post_feedforward_layernorm_2:!",),
             "router": ("router:!",),
             "experts:moe": {
-                "experts": {
-                    "#": ("gate_proj:0", "up_proj:0", "down_proj:1"),
-                },
+                "#": ("gate_proj:0", "up_proj:0", "down_proj:1"),
             },
         },
     ]

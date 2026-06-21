@@ -116,6 +116,12 @@ def run_layer_stage(
             layer_inputs = processor.inputs_cache.layer_inputs
             if is_lm_head_module and layer_inputs:
                 layer_inputs = looper.gptq_model.lm_head_pre_quantize_generate_hook(layer_inputs)
+            elif layer_inputs:
+                layer_inputs = looper.gptq_model.prepare_layer_inputs_for_quantize(
+                    layer_inputs,
+                    processor.inputs_cache,
+                    layer_index,
+                )
             layer_input_kwargs = processor.inputs_cache.layer_input_kwargs
             position_ids = processor.inputs_cache.position_ids
             attention_masks = processor.inputs_cache.attention_masks
@@ -211,6 +217,11 @@ def run_layer_stage(
 
             # second forward after process()
             if not is_last_module and processor.fwd_after_process and subset_context is not None:
+                layer_inputs = looper.gptq_model.prepare_layer_inputs_for_quantize(
+                    layer_inputs,
+                    processor.inputs_cache,
+                    layer_index,
+                )
                 replay_batch_count = looper._resolve_batch_total(
                     getattr(processor, "num_batches", None),
                     layer_inputs,

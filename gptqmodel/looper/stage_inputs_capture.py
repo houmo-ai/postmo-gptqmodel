@@ -44,6 +44,7 @@ class StageInputsCapture:
         attention_masks: List[torch.Tensor | None] = []
         position_ids: List[torch.Tensor] = []
         layer_input_kwargs: List[Dict[str, Any]] = []
+        layer_extra_inputs: List[List[List[Any]]] | None = None
 
         timer = getattr(self.gptq_model, "quant_region_timer", None)
         layer_label = None
@@ -104,11 +105,13 @@ class StageInputsCapture:
             ).draw()
 
         def store_input_hook(module, args, kwargs):
-            layer_input: List[torch.Tensor] = []
+            layer_input: List[Any] = []
             if kwargs.get("hidden_states") is not None:
                 layer_input.append(move_to(kwargs["hidden_states"], device=data_device))
             else:
                 layer_input.append(move_to(args[0], device=data_device))
+                for arg in args[1:]:
+                    layer_input.append(nested_move_to(arg, device=data_device) if arg is not None else None)
 
             layer_inputs.append(layer_input)
 
@@ -181,6 +184,16 @@ class StageInputsCapture:
                     if self.gptq_model.ATTENTION_MASKS_DTYPE is torch.long:
                         example["attention_mask"] = example["attention_mask"].long()
 
+                    extra_inputs_for_batch = self.gptq_model.build_layer_extra_inputs_cache(
+                        example,
+                        data_device,
+                    )
+                    if extra_inputs_for_batch is not None:
+                        if layer_extra_inputs is None:
+                            layer_extra_inputs = [[] for _ in range(len(extra_inputs_for_batch))]
+                        for layer_idx, extra_args in enumerate(extra_inputs_for_batch):
+                            layer_extra_inputs[layer_idx].append(extra_args)
+
                     with ctx(
                         DEVICE_THREAD_POOL.read_lock(self.gptq_model.quantize_config.device),
                         device_ctx(self.gptq_model.quantize_config.device),
@@ -224,6 +237,7 @@ class StageInputsCapture:
             layer_input_kwargs=layer_input_kwargs,
             position_ids=position_ids,
             attention_masks=attention_masks,
+            layer_extra_inputs=layer_extra_inputs,
         )
 
         if timer is not None and start_time is not None:

@@ -371,7 +371,10 @@ def forward_batch_worker(
     rehome_module_to_device(module, module_device, move_parameters=True, move_buffers=True)
 
     torch_sync() # try to avoid torch.AcceleratorError: CUDA error: unspecified launch failure
-    inputs = [move_to(inp, device=module_device) for inp in layer_input]
+    inputs = [
+        nested_move_to(inp, device=module_device) if inp is not None else None
+        for inp in layer_input
+    ]
 
     attn_tensor = None
     if attention_mask is not None:

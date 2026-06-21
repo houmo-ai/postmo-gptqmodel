@@ -618,6 +618,8 @@ def ModelLoader(cls):
                     quantized_module_names = {
                         key[: -len(".qweight")] for key in weight_map if key.endswith(".qweight")
                     }
+                    if hasattr(cls, "normalize_quantized_module_names"):
+                        quantized_module_names = cls.normalize_quantized_module_names(quantized_module_names)
                     if len(quantized_module_names) == 0:
                         quantized_module_names = None
                 except Exception as e:
@@ -630,6 +632,8 @@ def ModelLoader(cls):
                         quantized_module_names = {
                             key[: -len(".qweight")] for key in f.keys() if key.endswith(".qweight")
                         }
+                    if hasattr(cls, "normalize_quantized_module_names"):
+                        quantized_module_names = cls.normalize_quantized_module_names(quantized_module_names)
                     if len(quantized_module_names) == 0:
                         quantized_module_names = None
                 except Exception as e:

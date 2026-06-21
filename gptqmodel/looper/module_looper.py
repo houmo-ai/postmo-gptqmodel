@@ -247,13 +247,16 @@ class ModuleLooper():
                     # Create wrapper that forwards to all experts
                     moe_block_prefix = hooks._extract_moe_block_prefix(self.current_subset, self.moe_block)
 
-                    def moe_forward_wrapper(hidden_states, **kwargs):
+                    def moe_forward_wrapper(hidden_states, *args, **kwargs):
+                        def original_forward_with_args(next_hidden_states, **next_kwargs):
+                            return self.moe_forward_original(next_hidden_states, *args, **next_kwargs)
+
                         return hooks.forward_to_all_experts(
                             moe_block=self.moe_block,
                             hidden_states=hidden_states,
                             processor=self.processor,
                             subset=self.current_subset,
-                            original_forward=self.moe_forward_original,
+                            original_forward=original_forward_with_args,
                             model_class=self.module_looper.gptq_model.__class__,
                             module_looper=self.module_looper,  # Pass for TLS-based hooks pausing
                             moe_block_prefix=moe_block_prefix,
@@ -943,7 +946,10 @@ class ModuleLooper():
                     if module_target is not None:
                         exec_device = module_target
 
-                layer_input = [move_to(inp, device=exec_device) for inp in layer_inputs[batch_idx]]
+                layer_input = [
+                    nested_move_to(inp, device=exec_device) if inp is not None else None
+                    for inp in layer_inputs[batch_idx]
+                ]
 
                 raw_mask = attention_masks[batch_idx]
                 attn_tensor = raw_mask if raw_mask is None else move_to(raw_mask, device=exec_device)
