@@ -19,6 +19,7 @@ from qwen35_common import (
     calculate_avg_ppl,
     ensure_processor_saved,
     ensure_visual_tensors_present,
+    force_moe_grouped_mm_fallback_if_needed,
     is_gptq_quantized_dir,
     is_moe_model,
     layer_limit_dynamic_skips,
@@ -147,6 +148,15 @@ def parse_args():
     parser.add_argument("--rotated-out", type=str, default=None)
     parser.add_argument("--stop-after-rotate", action="store_true", default=False)
     parser.add_argument("--hessian-mse", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--wait-for-submodule-finalizers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Wait for GPTQ packing/finalize tasks before saving. "
+            "Qwen3.5/Qwen3.6 checkpoints can be corrupted with zero qweight buffers if saving races async finalizers."
+        ),
+    )
     parser.add_argument("--moe-routing", type=str, default="bypass", choices=["none", "bypass", "override"])
     parser.add_argument("--moe-routing-batch-size", type=int, default=None)
     parser.add_argument("--moe-num-experts-per-tok", type=str, default="all")
@@ -167,6 +177,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    force_moe_grouped_mm_fallback_if_needed()
     args.out = args.out or build_default_output_dir(args)
 
     if not is_moe_model(args.model, args.trust_remote_code):
@@ -220,6 +231,7 @@ def main():
             rotation=args.rotation,
             rotation_vision=rotation_vision,
             hessian_mse=args.hessian_mse,
+            wait_for_submodule_finalizers=args.wait_for_submodule_finalizers,
             moe=moe_config,
             offload_to_disk=args.offload_to_disk,
             offload_to_disk_path=args.offload_path if args.offload_to_disk else None,

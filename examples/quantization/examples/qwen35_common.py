@@ -23,6 +23,31 @@ from gptqmodel.utils.missing_tensors import copy_missing_tensors_from_source
 FULL_VISION_MODEL_TYPES = {"qwen3_5", "qwen3_5_moe"}
 
 
+def force_moe_grouped_mm_fallback_if_needed() -> bool:
+    """Disable Transformers grouped-MoE matmul on GPUs that cannot run it.
+
+    Transformers may select ``torch._grouped_mm`` for Qwen3.5 MoE inference.
+    That kernel is only available on SM90+; on A100/SM80 it fails at runtime.
+    AutoRound's Qwen3.5 MoE scripts already apply the same monkey patch, so the
+    GPTQModel examples must do it too to keep validation behavior consistent
+    across the two quant APIs.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return False
+        major, minor = torch.cuda.get_device_capability(0)
+        if major >= 9:
+            return False
+        import transformers.integrations.moe as _moe
+
+        _moe._can_use_grouped_mm = lambda *args, **kwargs: False
+        print(f"[Patch] Forced MoE fallback for SM{major}{minor} (grouped_mm needs SM90)")
+        return True
+    except Exception as exc:  # pragma: no cover - best-effort compatibility patch.
+        print(f"[Patch] MoE grouped_mm fallback patch skipped: {exc}")
+        return False
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -317,6 +342,7 @@ def move_batch_to_device(batch, device: str, float_dtype: torch.dtype):
 
 @torch.inference_mode()
 def vision_demo_outputs(model_dir: str, batch, device: str, torch_dtype, trust_remote_code: bool, max_new_tokens: int):
+    force_moe_grouped_mm_fallback_if_needed()
     wrapper = None
     # Determine the concrete target device for this forward pass.
     # On multi-GPU machines device_map='auto' distributes the VL model across

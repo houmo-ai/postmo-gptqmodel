@@ -8,7 +8,8 @@ layers — are stored in the original checkpoint but are silently omitted when t
 model is saved via ``save_pretrained``.
 
 This module provides :func:`copy_missing_tensors_from_source`, which detects and
-copies such tensors from the original checkpoint into the saved output directory.
+copies such tensors from the original checkpoint into a sidecar file in the
+saved output directory.
 Detection works by comparing parent layer names present in the source checkpoint
 against those present in the saved output: any source tensor whose parent layer
 has no tensors at all in the saved output (and is itself absent) is considered
@@ -78,7 +79,11 @@ def copy_missing_tensors_from_source(
 
     Some parameters (e.g., MTP layers) are not loaded by ``transformers`` and
     therefore not written by ``save_pretrained``.  This function copies those
-    tensors from the original checkpoint into the quantized output dir.
+    tensors from the original checkpoint into a dedicated sidecar in the
+    quantized output dir, then patches ``model.safetensors.index.json``.  It
+    intentionally avoids rewriting existing model shards, because those shards
+    may contain mmap-backed quantized buffers and must remain immutable after
+    the main save path completes.
 
     Detection works by comparing **parent layer names** between source and target.
     A source tensor is considered "missing" when:
@@ -162,84 +167,56 @@ def copy_missing_tensors_from_source(
 
     log.info("copy_missing_tensors: found %d missing tensors in %s", len(to_copy), target_dir)
 
-    # ── Single-file case (no index.json): append tensors to the single file ─
-    target_is_single = not os.path.exists(os.path.join(target_dir, "model.safetensors.index.json"))
-    if target_is_single:
-        single_path = os.path.join(target_dir, "model.safetensors")
-        # Load existing tensors
-        existing = {}
-        with safe_open(single_path, framework="pt", device="cpu") as f:
-            for key in f.keys():
-                existing[key] = f.get_tensor(key)
-        # Add missing tensors
-        for name, src_shard_path in to_copy.items():
-            with safe_open(src_shard_path, framework="pt", device="cpu") as f:
-                existing[name] = f.get_tensor(name)
-        # Save
-        save_file(existing, single_path)
-        log.info("copy_missing_tensors: copied %d tensors to single-file %s", len(to_copy), single_path)
-        return len(to_copy)
-
-    # ── Sharded case: load target shards, add missing tensors, save back ────
-    # Build target tensor name → shard path mapping
-    target_tensors = {}
-    for shard_path in target_shards.values():
-        with safe_open(shard_path, framework="pt", device="cpu") as f:
-            for key in f.keys():
-                target_tensors[key] = shard_path
-
-    # Group missing tensors by which shard they should join
-    shard_data = {}
+    # ── Sidecar copy ────────────────────────────────────────────────────────
+    # Never rewrite an existing safetensors shard here.  Qwen3.5 no-rotation
+    # MTP restore used to append the passthrough tensors to an already-written
+    # model shard, which can corrupt mmap-backed qweight/qzeros/scales buffers
+    # when the same file is read and overwritten in-place.  Match the rotated
+    # MTP path instead: write a dedicated sidecar and patch the index.
+    sidecar_name = "missing_tensors_passthrough.safetensors"
+    sidecar_path = os.path.join(target_dir, sidecar_name)
+    sidecar_tensors = {}
     for name, src_shard_path in to_copy.items():
         if not isinstance(name, str):
             continue
-        parent = name.rsplit(".", 1)[0]
-        # Find a target tensor from the same layer to determine shard
-        assigned_shard = None
-        for t_name, t_shard in target_tensors.items():
-            if isinstance(t_name, str) and t_name.rsplit(".", 1)[0] == parent:
-                assigned_shard = t_shard
-                break
-        if assigned_shard is None:
-            assigned_shard = list(target_shards.values())[0]
-
-        if assigned_shard not in shard_data:
-            shard_data[assigned_shard] = {}
-            with safe_open(assigned_shard, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    if isinstance(key, str):
-                        shard_data[assigned_shard][key] = f.get_tensor(key)
-
         with safe_open(src_shard_path, framework="pt", device="cpu") as f:
-            shard_data[assigned_shard][name] = f.get_tensor(name)
+            sidecar_tensors[name] = f.get_tensor(name)
+    save_file(
+        sidecar_tensors,
+        sidecar_path,
+        metadata={"format": "pt", "produced_by": "gptqmodel.utils.missing_tensors"},
+    )
 
-    # Save updated shards
-    for shard_path, tensors in shard_data.items():
-        save_file(tensors, shard_path)
-        log.debug("copy_missing_tensors: updated shard %s", os.path.basename(shard_path))
-
-    # ── Update index.json ────────────────────────────────────────────────────
     target_index_path = os.path.join(target_dir, "model.safetensors.index.json")
-    with open(target_index_path) as f:
-        idx = json.load(f)
-    wmap = idx.get("weight_map", {})
+    if os.path.exists(target_index_path):
+        with open(target_index_path) as f:
+            idx = json.load(f)
+    else:
+        idx = {"metadata": {}, "weight_map": {}}
+        single_path = os.path.join(target_dir, "model.safetensors")
+        if os.path.exists(single_path):
+            with safe_open(single_path, framework="pt", device="cpu") as f:
+                idx["weight_map"].update({key: "model.safetensors" for key in f.keys()})
 
+    wmap = idx.setdefault("weight_map", {})
     for name in to_copy:
-        if not isinstance(name, str):
-            continue
-        parent = name.rsplit(".", 1)[0]
-        assigned_shard = None
-        for t_name, t_shard in target_tensors.items():
-            if isinstance(t_name, str) and t_name.rsplit(".", 1)[0] == parent:
-                assigned_shard = os.path.basename(t_shard)
-                break
-        if assigned_shard is None:
-            assigned_shard = os.path.basename(list(target_shards.values())[0])
-        wmap[name] = assigned_shard
+        if isinstance(name, str):
+            wmap[name] = sidecar_name
 
-    idx["weight_map"] = wmap
+    meta = idx.setdefault("metadata", {})
+    try:
+        shard_names = set(wmap.values())
+        meta["total_size"] = sum(
+            os.path.getsize(os.path.join(target_dir, shard_name))
+            for shard_name in shard_names
+            if os.path.exists(os.path.join(target_dir, shard_name))
+        )
+    except OSError:
+        pass
+
     with open(target_index_path, "w") as f:
-        json.dump(idx, f, indent=2)
+        json.dump(idx, f, indent=2, sort_keys=True)
+        f.write("\n")
 
-    log.info("copy_missing_tensors: copied %d tensors to %s", len(to_copy), target_dir)
+    log.info("copy_missing_tensors: copied %d tensors to sidecar %s", len(to_copy), sidecar_name)
     return len(to_copy)

@@ -48,7 +48,7 @@ from auto_round.utils import (
 )
 
 
-def _only_text_test(model, tokenizer, device, model_type):
+def _only_text_test(model, tokenizer, device, model_type, low_gpu_mem_usage=False):
     """Test if the model whether can use text-only datasets."""
 
     if model_type in SUPPORT_ONLY_TEXT_MODELS:  # save time
@@ -67,8 +67,8 @@ def _only_text_test(model, tokenizer, device, model_type):
 
     # Estimate model size and check if it fits in GPU memory.
     # When the model is too large, we skip the GPU transfer and test on CPU only.
-    use_gpu = True if device != "cpu" else False
-    if device != "cpu" and torch.cuda.is_available():
+    use_gpu = True if device != "cpu" and not low_gpu_mem_usage else False
+    if use_gpu and torch.cuda.is_available():
         model_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
         dev_idx_str = device.split(":")[-1] if ":" in device else "0"
         if dev_idx_str.isdigit():
@@ -83,6 +83,10 @@ def _only_text_test(model, tokenizer, device, model_type):
             inputs = inputs.to(device)
             model = model.to(device)
             model(**inputs)
+            model = model.to("cpu")
+            inputs = inputs.to("cpu")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return True
         except RuntimeError as e:
             model = model.to("cpu")
@@ -95,6 +99,8 @@ def _only_text_test(model, tokenizer, device, model_type):
                 return False
             return True
         except Exception as e:
+            model = model.to("cpu")
+            inputs = inputs.to("cpu")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             return False
@@ -281,7 +287,7 @@ class MLLMCompressor(BaseCompressor):
                 )
                 dataset = "liuhaotian/llava_conv_58k"
             elif self.template is not None and not _only_text_test(
-                model, tokenizer, self.device, self.template.model_type
+                model, tokenizer, self.device, self.template.model_type, low_gpu_mem_usage=low_gpu_mem_usage
             ):
                 logger.warning(
                     f"{model.config.model_type} does not support for {dataset},"

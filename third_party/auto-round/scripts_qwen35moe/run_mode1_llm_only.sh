@@ -13,10 +13,12 @@ ATTN_BITS="${AR_ATTN_BITS:-8}"
 SHARED_EXPERT_BITS="${AR_SHARED_EXPERT_BITS:-8}"
 ITERS="${AR_ITERS:-200}"
 NSAMPLES="${AR_NSAMPLES:-128}"
+BATCH_SIZE="${AR_BATCH_SIZE:-8}"
+GRADIENT_ACCUMULATE_STEPS="${AR_GRADIENT_ACCUMULATE_STEPS:-1}"
 RAW_ARGS=()
 LOG_DIR="${LOG_DIR:-./output/logs}"
-VISIBLE_GPUS="${CUDA_VISIBLE_DEVICES:-0,1}"
-AUTOROUND_DEVICE_MAP="${AR_DEVICE_MAP:-balanced}"
+VISIBLE_GPUS="${CUDA_VISIBLE_DEVICES:-0}"
+AUTOROUND_DEVICE_MAP="${AR_DEVICE_MAP:-0}"
 LOW_GPU_MEM_USAGE="${AR_LOW_GPU_MEM_USAGE:-1}"
 LOW_GPU_MEM_ARGS=()
 QUANT_OVERRIDE_ARGS=()
@@ -80,6 +82,28 @@ while [ "${index}" -lt "${#RAW_ARGS[@]}" ]; do
     --nsamples=*)
       NSAMPLES="${arg#*=}"
       ;;
+    --batch_size)
+      if [ $((index + 1)) -lt "${#RAW_ARGS[@]}" ]; then
+        index=$((index + 1))
+        BATCH_SIZE="${RAW_ARGS[$index]}"
+      else
+        EXTRA_ARGS+=("${arg}")
+      fi
+      ;;
+    --batch_size=*)
+      BATCH_SIZE="${arg#*=}"
+      ;;
+    --gradient_accumulate_steps)
+      if [ $((index + 1)) -lt "${#RAW_ARGS[@]}" ]; then
+        index=$((index + 1))
+        GRADIENT_ACCUMULATE_STEPS="${RAW_ARGS[$index]}"
+      else
+        EXTRA_ARGS+=("${arg}")
+      fi
+      ;;
+    --gradient_accumulate_steps=*)
+      GRADIENT_ACCUMULATE_STEPS="${arg#*=}"
+      ;;
     *)
       EXTRA_ARGS+=("${arg}")
       ;;
@@ -101,6 +125,12 @@ if [ "${NSAMPLES}" != "128" ]; then
 fi
 if [ "${ITERS}" != "200" ]; then
   RUN_NAME+="-iter${ITERS}"
+fi
+if [ "${BATCH_SIZE}" != "8" ]; then
+  RUN_NAME+="-bs${BATCH_SIZE}"
+fi
+if [ "${GRADIENT_ACCUMULATE_STEPS}" != "1" ]; then
+  RUN_NAME+="-ga${GRADIENT_ACCUMULATE_STEPS}"
 fi
 
 OUTPUT_DIR="${OUTPUT_DIR:-./output/${MODEL_NAME}-${RUN_NAME}}"
@@ -125,20 +155,25 @@ echo "attn_bits override: ${ATTN_BITS:-default}"
 echo "shared_expert_bits override: ${SHARED_EXPERT_BITS:-default}"
 echo "iters: ${ITERS}"
 echo "nsamples: ${NSAMPLES}"
+echo "batch_size: ${BATCH_SIZE}"
+echo "gradient_accumulate_steps: ${GRADIENT_ACCUMULATE_STEPS}"
 echo "=========================================="
 
-"${PYTHON_BIN}" scripts_qwen35moe/quantize_moe.py \
+"${PYTHON_BIN}" third_party/auto-round/scripts_qwen35moe/quantize_moe.py \
     --model "${MODEL_PATH}" \
     --mode llm-only \
     --output_dir "${OUTPUT_DIR}" \
     --llm_bits 4 \
     --llm_group_size 64 \
+    --attn_bits 8 \
+    --shared_expert_bits 8 \
     --sym \
     --seed 42 \
     --iters "${ITERS}" \
     --nsamples "${NSAMPLES}" \
     --seqlen 2048 \
-    --batch_size 8 \
+    --batch_size "${BATCH_SIZE}" \
+    --gradient_accumulate_steps "${GRADIENT_ACCUMULATE_STEPS}" \
     --device_map "${AUTOROUND_DEVICE_MAP}" \
     "${LOW_GPU_MEM_ARGS[@]}" \
     --dataset "NeelNanda/pile-10k" \

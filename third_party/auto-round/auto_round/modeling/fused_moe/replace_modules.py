@@ -27,6 +27,7 @@ from auto_round.utils import (
     global_state,
     is_transformers_version_greater_or_equal_5,
     logger,
+    mv_module_from_gpu,
 )
 
 BUILTIN_MODULES = {
@@ -145,10 +146,8 @@ def safe_to_cpu_(model: torch.nn.Module) -> None:
     if global_state.replaced_module_count == 0:
         model.to("cpu")
         return
-    else:
-        # TODO: (yiliu30) there might be some edge cases where some modules are replaced
-        # and we need to move them to CPU safely.
-        pass
+    mv_module_from_gpu(model)
+    _global_tracker.move_originals_to_cpu()
 
 
 class ReplacementModuleBase(ABC, torch.nn.Module):
@@ -445,6 +444,15 @@ class ModuleReplacementTracker:
         if count > 0:
             self._replacement_to_original.clear()
             logger.debug(f"Released {count} original modules from tracker")
+
+    def move_originals_to_cpu(self) -> None:
+        """Move tracked original modules to CPU without materializing meta tensors."""
+        seen = set()
+        for original in list(self._replacement_to_original.values()):
+            if original is None or id(original) in seen:
+                continue
+            seen.add(id(original))
+            mv_module_from_gpu(original)
 
     def clear(self) -> None:
         """Clear all tracked information."""

@@ -87,6 +87,15 @@ def parse_args():
     parser.add_argument("--stop-after-rotate", action="store_true", default=False)
     parser.add_argument("--mse", type=float, default=2.4)
     parser.add_argument("--hessian-mse", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--wait-for-submodule-finalizers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Wait for GPTQ packing/finalize tasks before saving. "
+            "Qwen3.5 checkpoints can be corrupted with zero qweight buffers if saving races async finalizers."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--nsamples", type=int, default=256)
     parser.add_argument("--seqlen", type=int, default=1024)
@@ -160,6 +169,7 @@ def main():
             rotation_vision=rotation_vision,
             hessian_mse=args.hessian_mse,
             mse=args.mse,
+            wait_for_submodule_finalizers=args.wait_for_submodule_finalizers,
             device=None if args.device_map else args.device,
             offload_to_disk=args.offload_to_disk,
             offload_to_disk_path=args.offload_path if args.offload_to_disk else None,
