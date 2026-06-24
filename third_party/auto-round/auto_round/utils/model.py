@@ -1291,10 +1291,6 @@ def mv_module_from_gpu(module):
     Returns:
     The module on the specified device.
     """
-    if hasattr(module, "device"):
-        if module.device.type in ("cpu", "meta"):
-            return module
-
     has_meta = any(p.device.type == "meta" for p in module.parameters())
     if not has_meta:
         has_meta = any(b.device.type == "meta" for b in module.buffers())

@@ -10,10 +10,12 @@
 ## 关键注意事项
 
 1. **旋转量化必须关闭 disk offload。** `offload_to_disk=True` 已确认会导致 Qwen3.5 rotated quant checkpoint 推理乱码，因此两个脚本默认 `--no-offload-to-disk`，并且在 `--rotation` 下显式传 `--offload-to-disk` 会直接报错。
-2. **建议 always 带 `--check-quant-vision-demo`。** 该检查会加载量化后的完整 VLM 模型，做图文 demo 对比；失败时会打印 max/mean logits diff、首个不同 generated token，以及 ref/test decoded 文本。
-3. **已有量化输出会自动复用。** 如果 `--out` 已经是 GPTQ 目录，脚本默认跳过量化，直接执行后续推理/PPL/vision demo；但如果旧产物记录为 `offload_to_disk=true` 且当前带 `--rotation`，会强制重新量化，避免复用坏 checkpoint。
-4. **校准 JSONL 每行一个 JSON 对象。** 默认读取 `text` 字段，可用 `--calibration-text-key` 修改字段名。
-5. **多卡使用 `--device-map auto`。** Dense 9B 单卡通常可跑；MoE 35B-A3B 推荐多卡 auto。
+2. **Qwen3.5 rotation 与 MTP/spec-decode 不兼容。** GPTQModel 示例脚本在开启 `--rotation` 时会按同一旋转约定处理 LLM、vision merger 和 MTP sidecar；但 xh2modelzoo 的 MTP/spec-decode 导出链路不能消费 rotated MTP。因此面向 xh2modelzoo 的 workflow YAML 默认必须设置 `quant.rotation: false`。如需 GPTQModel rotated checkpoint，请显式关闭 xh2modelzoo 的 MTP/spec-decode 配置后再开启 rotation。
+3. **建议 always 带 `--check-quant-vision-demo`。** 该检查会加载量化后的完整 VLM 模型，做图文 demo 对比；失败时会打印 max/mean logits diff、首个不同 generated token，以及 ref/test decoded 文本。
+4. **保持 `--wait-for-submodule-finalizers` 默认开启。** GPTQ packing/finalize 是异步任务；Qwen3.5/Qwen3.6 在未等待 finalizer 时可能在 save 阶段写出全 0 的 `qweight/qzeros/scales`，表现为 demo 全 `!`、PPL 为 `nan`。只有排查性能问题时才显式使用 `--no-wait-for-submodule-finalizers`。
+5. **已有量化输出会自动复用。** 如果 `--out` 已经是 GPTQ 目录，脚本默认跳过量化，直接执行后续推理/PPL/vision demo；但如果旧产物记录为 `offload_to_disk=true` 且当前带 `--rotation`，会强制重新量化，避免复用坏 checkpoint。
+6. **校准 JSONL 每行一个 JSON 对象。** 默认读取 `text` 字段，可用 `--calibration-text-key` 修改字段名。
+7. **设备映射使用 `--device-map auto`。** Dense 9B 和 MoE 35B-A3B 均可单卡运行；如需多卡再显式设置 `CUDA_VISIBLE_DEVICES` 暴露多张卡。
 
 ## 输出命名规范
 
@@ -44,7 +46,6 @@ python examples/quantization/examples/example_qwen35dense.py \
 
 python examples/quantization/examples/example_qwen35dense.py \
   --model /data01/datasets/Qwen3.5-0.8B \
-  --rotation None \
   --bits 4 \
   --group-size 64 \
   --nsamples 256 \
@@ -53,6 +54,9 @@ python examples/quantization/examples/example_qwen35dense.py \
   --calibration-jsonl gptqmodel/quantization/calibration/dense_ivsg/gen_data/Qwen3.5-27B.jsonl \
   --check-quant-vision-demo
 ```
+
+非旋转量化不要传 `--rotation`；脚本的 argparse choices 只接受
+`hadamard`、`block_hadamard`、`random` 三种真实旋转模式。
 
 Smoke/debug 命令：
 

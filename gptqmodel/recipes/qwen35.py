@@ -16,10 +16,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-_SUPPORTED_METHODS = {"autoround", "gptq"}
+_SUPPORTED_METHODS = {"gptq"}
 _SUPPORTED_PRESETS = {"llm_only", "full_vlm", "full_vlm_rotate", "rotated_fp_only"}
 _SUPPORTED_ROTATIONS = {None, "hadamard", "block_hadamard", "random"}
 _SUPPORTED_ARTIFACT_FORMATS = {"gptqmodel_hf"}
+_DENSE_CALIBRATION_JSONL = "gptqmodel/quantization/calibration/dense_ivsg/gen_data/Qwen3.5-27B.jsonl"
+_MOE_CALIBRATION_JSONL = "gptqmodel/quantization/calibration/moe_ebss/gen_data/Qwen3-Next-80B-A3B-Instruct.jsonl"
 
 
 @dataclass(frozen=True)
@@ -40,9 +42,9 @@ def quantize_qwen35(
     *,
     model_dir: str,
     output_dir: str,
-    method: str = "autoround",
-    preset: str = "full_vlm_rotate",
-    rotation: str | None = "hadamard",
+    method: str = "gptq",
+    preset: str = "full_vlm",
+    rotation: str | bool | None = False,
     artifact_format: str = "gptqmodel_hf",
     topology: str | None = None,
     group_size: int = 64,
@@ -52,18 +54,21 @@ def quantize_qwen35(
     seed: int = 42,
     quant_nontext_module: bool | None = None,
     device: str | None = None,
-    device_map: str | None = None,
+    device_map: str | None = "auto",
     trust_remote_code: bool = True,
     batch_size: int = 1,
     low_gpu_mem_usage: bool | None = None,
     offload_to_disk: bool = False,
     offload_path: str | None = None,
+    hessian_mse: bool = True,
+    wait_for_submodule_finalizers: bool = True,
+    mse: float | None = None,
     calibration_jsonl: str | None = None,
     calibration_text_key: str = "text",
     calibration_dataset: str | None = None,
     calibration_split: str | None = None,
-    nsamples: int = 256,
-    seqlen: int = 2048,
+    nsamples: int | None = None,
+    seqlen: int | None = None,
     check_quant_vision_demo: bool = True,
     check_rotation_ppl: bool = False,
     max_quant_layers: int | None = None,
@@ -90,11 +95,23 @@ def quantize_qwen35(
     Gerrit command-shape checks.
     """
 
-    method = str(method or "autoround").lower()
-    preset = str(preset or "full_vlm_rotate").lower()
+    method = str(method or "gptq").lower()
+    preset = str(preset or "full_vlm").lower()
     rotation = _normalize_rotation(rotation)
     artifact_format = str(artifact_format or "gptqmodel_hf").lower()
     topology = _resolve_topology(model_dir=model_dir, topology=topology)
+
+    if calibration_jsonl is None and calibration_dataset is None:
+        calibration_jsonl = _DENSE_CALIBRATION_JSONL if topology == "dense" else _MOE_CALIBRATION_JSONL
+    if nsamples is None:
+        nsamples = 256 if topology == "dense" else 512
+    if seqlen is None:
+        seqlen = 1024
+    if topology == "moe":
+        self_attn_bits = 8 if self_attn_bits is None else self_attn_bits
+        shared_expert_bits = 8 if shared_expert_bits is None else shared_expert_bits
+        expert_bits = 4 if expert_bits is None else expert_bits
+        expert_down_bits = 5 if expert_down_bits is None else expert_down_bits
 
     _validate_recipe_args(
         method=method,
@@ -105,8 +122,8 @@ def quantize_qwen35(
         offload_to_disk=offload_to_disk,
     )
 
-    if preset == "rotated_fp_only" and not rotation:
-        raise ValueError("preset='rotated_fp_only' requires a non-null rotation")
+    if preset in {"full_vlm_rotate", "rotated_fp_only"} and not rotation:
+        raise ValueError(f"preset={preset!r} requires a non-null rotation")
 
     command = _build_command(
         model_dir=model_dir,
@@ -123,6 +140,9 @@ def quantize_qwen35(
         batch_size=batch_size,
         offload_to_disk=offload_to_disk,
         offload_path=offload_path,
+        hessian_mse=hessian_mse,
+        wait_for_submodule_finalizers=wait_for_submodule_finalizers,
+        mse=mse,
         calibration_jsonl=calibration_jsonl,
         calibration_text_key=calibration_text_key,
         nsamples=nsamples,
@@ -194,6 +214,9 @@ def _build_command(
     batch_size: int,
     offload_to_disk: bool,
     offload_path: str | None,
+    hessian_mse: bool,
+    wait_for_submodule_finalizers: bool,
+    mse: float | None,
     calibration_jsonl: str | None,
     calibration_text_key: str,
     nsamples: int,
@@ -245,6 +268,16 @@ def _build_command(
             command.extend(["--offload-path", str(offload_path)])
     else:
         command.append("--no-offload-to-disk")
+    if hessian_mse:
+        command.append("--hessian-mse")
+    else:
+        command.append("--no-hessian-mse")
+    if wait_for_submodule_finalizers:
+        command.append("--wait-for-submodule-finalizers")
+    else:
+        command.append("--no-wait-for-submodule-finalizers")
+    if mse is not None and topology == "dense":
+        command.extend(["--mse", str(float(mse))])
     if calibration_jsonl:
         command.extend(["--calibration-jsonl", str(calibration_jsonl)])
     if calibration_text_key:
@@ -319,9 +352,11 @@ def _resolve_topology(*, model_dir: str, topology: str | None) -> str:
     return "dense"
 
 
-def _normalize_rotation(rotation: str | None) -> str | None:
-    if rotation is None:
+def _normalize_rotation(rotation: str | bool | None) -> str | None:
+    if rotation is None or rotation is False:
         return None
+    if rotation is True:
+        return "hadamard"
     value = str(rotation).strip().lower()
     if value in {"", "none", "null", "false"}:
         return None

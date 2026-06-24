@@ -688,9 +688,7 @@ def alias_all_from_turtle_if_meta(
     if turtle_model is None:
         return 0
 
-    turtle_map = dict(turtle_model.named_modules())
-    swapped = 0
-
+    meta_targets = []
     for qname, shell_sub in list(shell_model.named_modules()):
         if not qname:  # skip root
             continue
@@ -698,9 +696,24 @@ def alias_all_from_turtle_if_meta(
             continue
         if not _module_all_meta(shell_sub):
             continue
+        meta_targets.append((qname, shell_sub))
 
-        turtle_sub = turtle_map.get(qname, None)
-        if turtle_sub is None:
+    if not meta_targets:
+        if tie_after and hasattr(shell_model, "tie_weights") and getattr(shell_model.config, "tie_word_embeddings", False):
+            try:
+                shell_model.tie_weights()
+                log.info("Module: Re-tied embedding weights on shell model after full sync")
+            except Exception as e:
+                log.info(f"Module: tie_weights failed: {e}")
+        log.info("Module: Total synced modules: 0")
+        return 0
+
+    swapped = 0
+
+    for qname, shell_sub in meta_targets:
+        try:
+            turtle_sub = turtle_model.get_submodule(qname)
+        except AttributeError:
             # log.info(f"Module: Skipped {qname}: not found in turtle model")
             continue
 
