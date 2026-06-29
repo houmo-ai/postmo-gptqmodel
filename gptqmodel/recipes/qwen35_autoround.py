@@ -76,6 +76,15 @@ def quantize_qwen35_autoround(
         batch_size = 8 if batch_size is None else batch_size
         format = format or "auto_gptq"
 
+    if topology == "dense":
+        _reject_dense_moe_overrides(
+            attn_bits=attn_bits,
+            shared_expert_bits=shared_expert_bits,
+            expert_bits=expert_bits,
+            expert_up_gate_bits=expert_up_gate_bits,
+            expert_down_bits=expert_down_bits,
+        )
+
     command = _build_command(
         model_dir=model_dir,
         output_dir=output_dir,
@@ -127,6 +136,13 @@ def quantize_qwen35_autoround(
         mode=mode,
         provenance=provenance,
     )
+
+
+def _reject_dense_moe_overrides(**values: int | None) -> None:
+    provided = [name for name, value in values.items() if value is not None]
+    if provided:
+        joined = ", ".join(provided)
+        raise ValueError(f"{joined} are only supported for topology='moe'")
 
 
 def _build_command(
@@ -199,16 +215,17 @@ def _build_command(
         command.append("--low_gpu_mem_usage")
     if gradient_accumulate_steps is not None:
         command.extend(["--gradient_accumulate_steps", str(int(gradient_accumulate_steps))])
-    if attn_bits is not None:
-        command.extend(["--attn_bits", str(int(attn_bits))])
-    if shared_expert_bits is not None:
-        command.extend(["--shared_expert_bits", str(int(shared_expert_bits))])
-    if expert_bits is not None:
-        command.extend(["--expert_bits", str(int(expert_bits))])
-    if expert_up_gate_bits is not None:
-        command.extend(["--expert_up_gate_bits", str(int(expert_up_gate_bits))])
-    if expert_down_bits is not None:
-        command.extend(["--expert_down_bits", str(int(expert_down_bits))])
+    if topology == "moe":
+        if attn_bits is not None:
+            command.extend(["--attn_bits", str(int(attn_bits))])
+        if shared_expert_bits is not None:
+            command.extend(["--shared_expert_bits", str(int(shared_expert_bits))])
+        if expert_bits is not None:
+            command.extend(["--expert_bits", str(int(expert_bits))])
+        if expert_up_gate_bits is not None:
+            command.extend(["--expert_up_gate_bits", str(int(expert_up_gate_bits))])
+        if expert_down_bits is not None:
+            command.extend(["--expert_down_bits", str(int(expert_down_bits))])
     if deterministic:
         command.append("--deterministic")
     if save_rotated:
