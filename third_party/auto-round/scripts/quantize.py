@@ -61,6 +61,10 @@ def parse_args():
     parser.add_argument("--nsamples", type=int, default=128)
     parser.add_argument("--seqlen", type=int, default=2048)
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--gradient_accumulate_steps", type=int, default=1,
+                        help="Gradient accumulation steps for AutoRound calibration")
+    parser.add_argument("--low_gpu_mem_usage", action="store_true", default=False,
+                        help="Enable AutoRound low GPU memory mode")
     parser.add_argument("--dataset", type=str, default="NeelNanda/pile-10k")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for rotation matrices and AutoRound")
@@ -412,6 +416,8 @@ def _run_two_stage(model, tokenizer, processor, args, ar_kwargs):
         seqlen=args.seqlen,
         nsamples=args.nsamples,
         batch_size=args.batch_size,
+        gradient_accumulate_steps=args.gradient_accumulate_steps,
+        low_gpu_mem_usage=args.low_gpu_mem_usage,
         dataset="NeelNanda/pile-10k",
         seed=args.seed,
         quant_nontext_module=False,
@@ -497,6 +503,7 @@ def _run_two_stage(model, tokenizer, processor, args, ar_kwargs):
         nsamples=args.nsamples,
         batch_size=1,
         gradient_accumulate_steps=8,
+        low_gpu_mem_usage=args.low_gpu_mem_usage,
         dataset="liuhaotian/llava_conv_58k",
         seed=args.seed,
         layer_config=vis_layer_config,
@@ -861,6 +868,8 @@ def main():
             seqlen=args.seqlen,
             nsamples=args.nsamples,
             batch_size=args.batch_size,
+            gradient_accumulate_steps=args.gradient_accumulate_steps,
+            low_gpu_mem_usage=args.low_gpu_mem_usage,
             dataset=args.dataset,
             seed=args.seed,
             layer_config=layer_config,
