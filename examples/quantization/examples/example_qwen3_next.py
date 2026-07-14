@@ -4,8 +4,10 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import argparse
+import gc
 import json
 import logging
+import math
 import os
 import random
 from contextlib import contextmanager
@@ -13,10 +15,14 @@ from datetime import datetime
 
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from gptqmodel import GPTQModel, QuantizeConfig
 from gptqmodel.quantization.config import ExpertsRoutingBypass, ExpertsRoutingOverride, MoEConfig
+from gptqmodel.utils.missing_tensors import (
+    copy_missing_tensors_from_source,
+    validate_tensor_prefix_parity,
+)
 
 
 def get_wikitext2(nsamples, seqlen):
@@ -172,6 +178,75 @@ def build_chat_inputs(tokenizer, prompt: str, device: str):
     return tokenizer(text, return_tensors="pt").to(device)
 
 
+@torch.inference_mode()
+def capture_last_token_logits(model, inputs):
+    embed_device = model.get_input_embeddings().weight.device
+    if embed_device.type == "meta":
+        raise RuntimeError("Cannot run the precision gate with meta-device input embeddings.")
+    device_inputs = {
+        key: value.to(embed_device) if isinstance(value, torch.Tensor) else value
+        for key, value in inputs.items()
+    }
+    return model(**device_inputs, use_cache=False).logits[0, -1].detach().float().cpu()
+
+
+def compare_last_token_logits(reference, candidate):
+    reference = reference.detach().float().reshape(-1).cpu()
+    candidate = candidate.detach().float().reshape(-1).cpu()
+    if reference.shape != candidate.shape:
+        raise ValueError(f"Logit shape mismatch: {tuple(reference.shape)} != {tuple(candidate.shape)}")
+    diff = (reference - candidate).abs()
+    reference_top1 = int(reference.argmax().item())
+    candidate_top1 = int(candidate.argmax().item())
+    return {
+        "cosine_similarity": float(
+            torch.nn.functional.cosine_similarity(reference.unsqueeze(0), candidate.unsqueeze(0)).item()
+        ),
+        "max_abs_error": float(diff.max().item()),
+        "mean_abs_error": float(diff.mean().item()),
+        "reference_top1": reference_top1,
+        "candidate_top1": candidate_top1,
+        "top1_match": reference_top1 == candidate_top1,
+    }
+
+
+def enforce_precision_gate(metrics, min_logit_cosine, require_top1_match):
+    cosine = float(metrics["cosine_similarity"])
+    if not math.isfinite(cosine) or cosine < min_logit_cosine:
+        raise RuntimeError(
+            "saved-checkpoint precision gate failed: "
+            f"cosine_similarity={cosine:.8f} < {min_logit_cosine:.8f}"
+        )
+    if require_top1_match and not metrics["top1_match"]:
+        raise RuntimeError(
+            "saved-checkpoint precision gate failed: "
+            f"top-1 changed from {metrics['reference_top1']} to {metrics['candidate_top1']}"
+        )
+
+
+def resolve_experts_implementation(requested):
+    if requested != "auto":
+        return requested
+    if not torch.cuda.is_available():
+        return "eager"
+    capabilities = [
+        torch.cuda.get_device_capability(device_idx)
+        for device_idx in range(torch.cuda.device_count())
+    ]
+    return "grouped_mm" if capabilities and all(major >= 9 for major, _ in capabilities) else "eager"
+
+
+def configure_experts_implementation(model, requested):
+    implementation = resolve_experts_implementation(requested)
+    setter = getattr(model, "set_experts_implementation", None)
+    if callable(setter):
+        setter(implementation)
+    else:
+        model.config._experts_implementation = implementation
+    print(f"[experts] Using Transformers experts implementation: {implementation}")
+    return implementation
+
+
 def build_moe_config(args):
     if args.moe_routing == "none":
         return None
@@ -182,14 +257,29 @@ def build_moe_config(args):
     return MoEConfig(routing=ExpertsRoutingOverride(num_experts_per_tok=args.moe_num_experts_per_tok))
 
 
-def build_dynamic_quant_config(args):
+def layer_limit_dynamic_skips(num_hidden_layers, max_quant_layers):
+    if max_quant_layers is None:
+        return {}
+    if max_quant_layers < 0 or max_quant_layers > num_hidden_layers:
+        raise ValueError(
+            f"--max-quant-layers must be between 0 and {num_hidden_layers}, got {max_quant_layers}"
+        )
     return {
+        rf"-:.*\.layers\.{layer_idx}\..*": {}
+        for layer_idx in range(max_quant_layers, num_hidden_layers)
+    }
+
+
+def build_dynamic_quant_config(args, num_hidden_layers):
+    dynamic = layer_limit_dynamic_skips(num_hidden_layers, args.max_quant_layers)
+    dynamic.update({
         r".*\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$": {"bits": args.self_attn_bits},
         r".*\.linear_attn\.(in_proj_qkvz|out_proj)$": {"bits": args.linear_attn_bits},
         r".*\.mlp\.(gate_proj|up_proj|down_proj)$": {"bits": args.dense_mlp_bits},
         r".*\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$": {"bits": args.expert_bits},
         r".*\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)$": {"bits": args.shared_expert_bits},
-    }
+    })
+    return dynamic
 
 
 def build_default_output_dir(args):
@@ -253,6 +343,12 @@ def parse_args():
         help="bit width for shared MoE expert",
     )
     parser.add_argument("--group-size", type=int, default=64)
+    parser.add_argument(
+        "--max-quant-layers",
+        type=int,
+        default=None,
+        help="quantize decoder layers [0, N); later layers remain BF16",
+    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--nsamples", type=int, default=256)
     parser.add_argument("--seqlen", type=int, default=1024, help="minimum sequence length for wikitext2 filtering")
@@ -277,6 +373,29 @@ def parse_args():
         choices=["auto", "balanced", "balanced_low_0", "sequential"],
         help="multi-GPU device map strategy; overrides --device/--infer-device when set",
     )
+    parser.add_argument(
+        "--infer-device-map",
+        type=str,
+        default=None,
+        choices=["auto", "balanced", "balanced_low_0", "sequential"],
+        help="optional multi-GPU map used only when reloading the saved checkpoint",
+    )
+    parser.add_argument(
+        "--experts-implementation",
+        choices=["auto", "eager", "batched_mm", "grouped_mm"],
+        default="auto",
+        help="Transformers MoE kernel; auto avoids grouped_mm on pre-Hopper GPUs",
+    )
+    parser.add_argument(
+        "--auto-forward-data-parallel",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "replicate decoder blocks across all visible GPUs during calibration forward; "
+            "disabled by default because Transformers Qwen3-Next layers contain parameters "
+            "that are not safely rehomed by GPTQModel's generic replica path"
+        ),
+    )
     parser.add_argument("--offload-to-disk", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--offload-path",
@@ -286,6 +405,25 @@ def parse_args():
     )
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--prompt", type=str, default="请介绍一下 GPTQ 量化的核心思想。")
+    parser.add_argument(
+        "--check-saved-precision",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="compare source BF16 and reloaded quantized last-token logits",
+    )
+    parser.add_argument("--min-logit-cosine", type=float, default=0.99)
+    parser.add_argument(
+        "--require-top1-match",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="require source and saved checkpoints to select the same next token",
+    )
+    parser.add_argument(
+        "--skip-ppl",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="skip the final wikitext perplexity evaluation",
+    )
     parser.add_argument("--trust-remote-code", action="store_true", default=False)
     parser.add_argument(
         "--rotation",
@@ -351,6 +489,13 @@ def main():
     args = parse_args()
     args.out = args.out or build_default_output_dir(args)
 
+    if not 0.0 <= args.min_logit_cosine <= 1.0:
+        raise ValueError("--min-logit-cosine must be between 0 and 1")
+    if args.check_saved_precision and args.skip_quantize:
+        raise ValueError("--check-saved-precision cannot be combined with --skip-quantize")
+    if args.check_saved_precision and args.rotation:
+        raise ValueError("--check-saved-precision currently requires rotation to be disabled")
+
     if (args.check_rotation_ppl or args.rotated_out or args.stop_after_rotate) and not args.rotation:
         raise ValueError(
             "--check-rotation-ppl/--rotated-out/--stop-after-rotate require --rotation to be set."
@@ -361,13 +506,16 @@ def main():
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
     tokenizer_source = args.model
+    reference_logits = None
+    precision_inputs = None
     if not args.skip_quantize:
         tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True, trust_remote_code=args.trust_remote_code)
         calibration_dataset, calibration_source = build_calibration_dataset(args)
         print(f"[1/5] Calibration samples ({calibration_source}): {len(calibration_dataset)}")
 
         moe_config = build_moe_config(args)
-        dynamic_config = build_dynamic_quant_config(args)
+        model_config = AutoConfig.from_pretrained(args.model, trust_remote_code=args.trust_remote_code)
+        dynamic_config = build_dynamic_quant_config(args, int(model_config.num_hidden_layers))
 
         print(
             "[config] bits: "
@@ -385,6 +533,7 @@ def main():
             moe=moe_config,
             offload_to_disk=args.offload_to_disk,
             offload_to_disk_path=args.offload_path if args.offload_to_disk else None,
+            auto_forward_data_parallel=args.auto_forward_data_parallel,
         )
 
         print("[2/5] Loading fp model ...")
@@ -392,6 +541,13 @@ def main():
         if args.device_map:
             load_kwargs["device_map"] = args.device_map
         model = GPTQModel.load(args.model, quantize_config, **load_kwargs)
+        configure_experts_implementation(model.model, args.experts_implementation)
+
+        if args.check_saved_precision:
+            precision_inputs = build_chat_inputs(tokenizer, args.prompt, "cpu")
+            print("[precision] Capturing source BF16 last-token logits ...")
+            with temporary_ppl_device(model.model, "auto"):
+                reference_logits = capture_last_token_logits(model.model, precision_inputs)
 
         rotation_artifact_requested = any(
             [args.check_rotation_ppl, args.rotated_out is not None, args.stop_after_rotate]
@@ -427,6 +583,20 @@ def main():
         model.quantize(calibration_dataset, batch_size=args.batch_size)
         model.save(args.out)
         print(f"Quantized model saved to: {args.out}")
+        if not args.rotation:
+            copied = copy_missing_tensors_from_source(
+                source_dir=args.model,
+                target_dir=args.out,
+                tensor_name_prefixes=("mtp.",),
+            )
+            mtp_count = validate_tensor_prefix_parity(args.model, args.out, "mtp.")
+            print(f"[mtp] Validated {mtp_count} tensors; copied {copied} to the BF16 sidecar.")
+        else:
+            print("[mtp] Rotation is enabled; unrotated MTP tensors were not restored.")
+        del model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     else:
         print(f"[1/5] Skip quantization, using existing quantized model: {args.out}")
         tokenizer = AutoTokenizer.from_pretrained(args.out, use_fast=True, trust_remote_code=args.trust_remote_code)
@@ -434,16 +604,29 @@ def main():
 
     infer_device = args.infer_device or args.device
     infer_kwargs = dict(trust_remote_code=args.trust_remote_code)
-    if args.device_map:
-        infer_kwargs["device_map"] = args.device_map
-        print(f"[4/5] Loading quantized model with device_map='{args.device_map}' and generating ...")
+    infer_device_map = args.infer_device_map or args.device_map
+    if infer_device_map:
+        infer_kwargs["device_map"] = infer_device_map
+        print(f"[4/5] Loading quantized model with device_map='{infer_device_map}' and generating ...")
     else:
         infer_kwargs["device"] = infer_device
         print(f"[4/5] Loading quantized model on {infer_device} and generating ...")
     model = GPTQModel.load(args.out, **infer_kwargs)
+    configure_experts_implementation(model.model, args.experts_implementation)
     runtime_device = str(model.device)
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, use_fast=True, trust_remote_code=args.trust_remote_code)
+
+    if reference_logits is not None:
+        print("[precision] Capturing reloaded checkpoint last-token logits ...")
+        candidate_logits = capture_last_token_logits(model.model, precision_inputs)
+        metrics = compare_last_token_logits(reference_logits, candidate_logits)
+        precision_path = os.path.join(args.out, "precision_gate.json")
+        with open(precision_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2, sort_keys=True)
+            f.write("\n")
+        print(f"[precision] Metrics saved to {precision_path}: {metrics}")
+        enforce_precision_gate(metrics, args.min_logit_cosine, args.require_top1_match)
     inputs = build_chat_inputs(tokenizer, args.prompt, runtime_device)
 
     with torch.inference_mode():
@@ -456,9 +639,12 @@ def main():
     print("=== Answer ===")
     print(answer)
 
-    print("[5/5] Evaluating perplexity on wikitext2 ...")
-    avg_ppl = calculate_avg_ppl(model, tokenizer)
-    print(f"Quantized model avg PPL (wikitext2): {avg_ppl:.4f}")
+    if args.skip_ppl:
+        print("[5/5] Skipping perplexity evaluation (--skip-ppl).")
+    else:
+        print("[5/5] Evaluating perplexity on wikitext2 ...")
+        avg_ppl = calculate_avg_ppl(model, tokenizer)
+        print(f"Quantized model avg PPL (wikitext2): {avg_ppl:.4f}")
 
 
 if __name__ == "__main__":

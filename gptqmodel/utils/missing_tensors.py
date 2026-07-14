@@ -74,6 +74,7 @@ def _first_numeric_prefix(tensor_name: str):
 def copy_missing_tensors_from_source(
     source_dir: str,
     target_dir: str,
+    tensor_name_prefixes: tuple[str, ...] | None = None,
 ) -> int:
     """Copy tensors from source checkpoint that are absent from the saved output.
 
@@ -97,6 +98,8 @@ def copy_missing_tensors_from_source(
         source_dir: Path to the original (pre-quantization) checkpoint directory.
         target_dir: Directory to which the quantized model was saved.  Must
             contain ``model.safetensors`` or ``model.safetensors.index.json``.
+        tensor_name_prefixes: Optional prefixes restricting which missing
+            tensors may be copied. ``None`` preserves the historical behavior.
 
     Returns:
         Number of tensors copied.
@@ -107,6 +110,11 @@ def copy_missing_tensors_from_source(
         log.debug("copy_missing_tensors: no safetensors found in source %s", source_dir)
         return 0
     source_names = _load_tensor_names(source_shards)
+    if tensor_name_prefixes is not None:
+        source_names = {
+            name for name in source_names
+            if any(name.startswith(prefix) for prefix in tensor_name_prefixes)
+        }
     if not source_names:
         return 0
 
@@ -220,3 +228,31 @@ def copy_missing_tensors_from_source(
 
     log.info("copy_missing_tensors: copied %d tensors to sidecar %s", len(to_copy), sidecar_name)
     return len(to_copy)
+
+
+def validate_tensor_prefix_parity(source_dir: str, target_dir: str, prefix: str) -> int:
+    """Require exact tensor-name parity for a checkpoint prefix."""
+
+    _, source_shards = _get_tensor_files(source_dir)
+    _, target_shards = _get_tensor_files(target_dir)
+    source_names = {
+        name for name in _load_tensor_names(source_shards)
+        if name.startswith(prefix)
+    }
+    target_names = {
+        name for name in _load_tensor_names(target_shards)
+        if name.startswith(prefix)
+    }
+    if not source_names:
+        raise ValueError(f"source checkpoint has no tensors with prefix {prefix!r}")
+
+    missing = source_names - target_names
+    unexpected = target_names - source_names
+    if missing or unexpected:
+        details = []
+        if missing:
+            details.append(f"missing {len(missing)} tensors with prefix {prefix!r}")
+        if unexpected:
+            details.append(f"found {len(unexpected)} unexpected tensors with prefix {prefix!r}")
+        raise ValueError("; ".join(details))
+    return len(source_names)

@@ -11,13 +11,19 @@ from ..moe_lifecycle import GateUpDownMoELifecycleHooks
 
 
 def _patch_defuser_qwen3_next_registry() -> None:
+    import defuser
     import defuser.model_registry as defuser_model_registry
-
-    if getattr(defuser_model_registry, "_gptqmodel_qwen3_next_registry_patch", False):
-        return
 
     registry_entry = defuser_model_registry.MODEL_CONFIG.setdefault("qwen3_next", {})
     registry_entry.setdefault("min_transformers_version", "5.2.0")
+    # Qwen3-Next checkpoints already store one gate/up/down tensor per expert.
+    # Transformers 5.x normally converts those tensors into its packed 3-D
+    # experts container.  Defuser replaces that container with explicit Linear
+    # modules, so retaining the Transformers conversion mapping would target
+    # parameters which no longer exist.  An empty mapping keeps the checkpoint
+    # names unchanged and lets the explicit experts load directly.
+    registry_entry["checkpoint_mapping"] = []
+    defuser.replace_fused_blocks("qwen3_next")
     defuser_model_registry._gptqmodel_qwen3_next_registry_patch = True
 
 
@@ -93,9 +99,9 @@ class Qwen3NextGPTQ(BaseQModel):
     }
 
     def before_model_load(self, load_quantized_model=False):
-        # defuser already knows how to unfuse Qwen3-Next experts once the model
-        # type is registered. Patch the in-process registry instead of modifying
-        # the third-party package on disk.
+        # Patch before Transformers constructs the model so routed experts stay
+        # as quantizable per-expert Linear modules instead of being packed into
+        # opaque 3-D parameters.
         _patch_defuser_qwen3_next_registry()
 
 
