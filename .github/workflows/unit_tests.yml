@@ -133,7 +133,7 @@ jobs:
 
     steps:
       - name: Checkout Codes
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.repo }}
           ref: ${{ env.ref }}
@@ -187,7 +187,7 @@ jobs:
 
     steps:
       - name: Checkout Codes
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.repo }}
           ref: ${{ env.ref }}
@@ -386,7 +386,7 @@ jobs:
     if: always() && !cancelled() && (needs.build.result == 'success') && needs.list-test-files.outputs.torch-files != '[]' #  || github.event.inputs.artifact_id != ''
     steps:
       - name: Checkout Codes
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.repo }}
           ref: ${{ env.ref }}
@@ -749,7 +749,7 @@ jobs:
 #          ls -ahl .
 #
 #      - name: Checkout Codes
-#        uses: actions/checkout@v6
+#        uses: actions/checkout@v7
 #        with:
 #          repository: ${{ env.repo }}
 #          ref: ${{ env.ref }}
@@ -808,7 +808,7 @@ jobs:
 #      GPTQMODEL_FORCE_BUILD: 0
 #    steps:
 #      - name: Checkout Codes
-#        uses: actions/checkout@v6
+#        uses: actions/checkout@v7
 #
 #      - uses: actions/setup-python@v6
 #        with:
