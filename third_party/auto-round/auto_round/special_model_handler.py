@@ -50,6 +50,7 @@ SUPPORT_ONLY_TEXT_MODELS = [
     "qwen3_omni_moe",
     "gemma3",
     "gemma4",
+    "gemma4_unified",
     "qwen3_5",
 ]
 
@@ -58,6 +59,7 @@ NOT_SUPPORT_ONLY_TEXT_MODELS = ["mllama", "mistral3_2"]
 SPECIAL_SHARED_CACHE_KEYS = {
     "Gemma3ForConditionalGeneration": ("position_embeddings_global", "position_embeddings_local"),
     "Gemma4ForConditionalGeneration": ("position_embeddings_global", "position_embeddings_local"),
+    "Gemma4UnifiedForConditionalGeneration": ("position_embeddings_global", "position_embeddings_local"),
 }
 SPECIAL_SHARED_CACHE_KEYS["MiniMaxText01ForCausalLM"] = ("slope_rate",)
 MISTRAL_3_2_MODELS = ["Mistral-Small-3.2", "Magistral-Small", "Devstral-Small"]
@@ -263,6 +265,7 @@ SPECIAL_MULTIMODAL_BLOCK = {
     "qwen3_omni_moe": _get_qwen3_omni_moe_multimodal_block,
     "glm_image": _get_glm_image_multimodal_block,
     "gemma4": _get_gemma4_multimodal_block,
+    "gemma4_unified": _get_gemma4_multimodal_block,
     "qwen3_5": _get_qwen3_5_multimodal_block,
 }
 
