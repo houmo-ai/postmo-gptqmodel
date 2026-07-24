@@ -1,13 +1,122 @@
+import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from gptqmodel.looper.input_cache import InputCache
-from gptqmodel.models.definitions.gemma4 import Gemma4PerLayerInputMixin
+from gptqmodel.models.definitions.gemma4 import (
+    Gemma4PerLayerInputMixin,
+    Gemma4UnifiedForConditionalGenerationGPTQ,
+    _install_rotary_fix_hooks,
+)
+from gptqmodel.recipes.gemma4 import (
+    _copy_hf_auxiliary_files,
+    _infer_variant,
+    _patch_gemma4_quantization_config,
+    _restore_source_config_fields,
+    quantize_gemma4,
+)
 from gptqmodel.utils.looper_helpers import forward_batch_worker
-from gptqmodel.recipes.gemma4 import _copy_hf_auxiliary_files, _patch_gemma4_quantization_config, quantize_gemma4
+
+
+def test_gemma4_unified_has_explicit_quant_model_definition(tmp_path):
+    from gptqmodel.models.auto import MODEL_MAP, check_and_get_model_definition
+
+    model_dir = tmp_path / "gemma-4-12B-it"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "gemma4_unified",
+                "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+                "text_config": {
+                    "model_type": "gemma4_unified_text",
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "head_dim": 16,
+                    "global_head_dim": 16,
+                    "num_global_key_value_heads": 1,
+                    "max_position_embeddings": 128,
+                    "sliding_window": 32,
+                    "layer_types": ["sliding_attention"],
+                    "vocab_size": 128,
+                },
+                "vision_config": {"model_type": "gemma4_unified_vision"},
+                "audio_config": {"model_type": "gemma4_unified_audio"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert MODEL_MAP["gemma4_unified"] is Gemma4UnifiedForConditionalGenerationGPTQ
+    assert (
+        check_and_get_model_definition(str(model_dir))
+        is Gemma4UnifiedForConditionalGenerationGPTQ
+    )
+    assert Gemma4UnifiedForConditionalGenerationGPTQ.lm_head_module == "lm_head"
+    assert (
+        Gemma4UnifiedForConditionalGenerationGPTQ.pre_lm_head_norm_module
+        == "model.language_model.norm"
+    )
+    assert Gemma4UnifiedForConditionalGenerationGPTQ.layer_modules_strict is True
+    blocks = Gemma4UnifiedForConditionalGenerationGPTQ.build_layer_modules(
+        Gemma4UnifiedForConditionalGenerationGPTQ.module_tree
+    )
+    for module_name in (
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "self_attn.o_proj",
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+    ):
+        assert any(module_name in block for block in blocks)
+
+
+def test_gemma4_unified_recomputes_rotary_width_for_each_layer_type():
+    class FakeRotary(torch.nn.Module):
+        def forward(self, hidden_states, position_ids, layer_type):
+            dim = 512 if layer_type == "full_attention" else 256
+            shape = (*position_ids.shape, dim)
+            return torch.zeros(shape), torch.ones(shape)
+
+    class FakeLayer(torch.nn.Module):
+        def forward(self, hidden_states, *, position_embeddings=None, position_ids=None):
+            return position_embeddings[0]
+
+    text_model = torch.nn.Module()
+    text_model.rotary_emb = FakeRotary()
+    text_model.layers = torch.nn.ModuleList([FakeLayer(), FakeLayer()])
+    core_model = torch.nn.Module()
+    core_model.language_model = text_model
+    model = torch.nn.Module()
+    model.model = core_model
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(
+            hidden_size=4,
+            layer_types=["sliding_attention", "full_attention"],
+        )
+    )
+
+    _install_rotary_fix_hooks(model, config)
+    hidden_states = torch.zeros(1, 3, 4)
+    position_ids = torch.arange(3).unsqueeze(0)
+    wrong_position_embeddings = (torch.zeros(1, 3, 256), torch.ones(1, 3, 256))
+
+    actual = text_model.layers[1](
+        hidden_states,
+        position_embeddings=wrong_position_embeddings,
+        position_ids=position_ids,
+    )
+
+    assert actual.shape[-1] == 512
 
 
 def test_gemma4_recipe_dry_run_builds_command(tmp_path):
@@ -49,6 +158,115 @@ def test_gemma4_recipe_dry_run_builds_command(tmp_path):
     assert "--skip-eval" in command
 
 
+def test_gemma4_unified_recipe_reports_12b_variant(tmp_path):
+    model_dir = tmp_path / "gemma-4-12B-it"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "gemma4_unified",
+                "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+                "text_config": {"enable_moe_block": False},
+                "audio_config": {"model_type": "gemma4_unified_audio"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = quantize_gemma4(
+        model_dir=str(model_dir),
+        output_dir=str(tmp_path / "out"),
+        check_quant_text_demo=False,
+        dry_run=True,
+    )
+
+    assert result.variant == "12b_unified"
+    assert result.topology == "dense"
+
+
+def test_gemma4_recipe_treats_non_mapping_config_as_unknown(tmp_path):
+    model_dir = tmp_path / "malformed-config"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("[]", encoding="utf-8")
+
+    assert _infer_variant(model_dir=str(model_dir)) == "unknown"
+
+
+def test_autoround_registers_gemma4_unified_text_only_contract():
+    from auto_round.special_model_handler import (
+        SPECIAL_MULTIMODAL_BLOCK,
+        SPECIAL_SHARED_CACHE_KEYS,
+        SUPPORT_ONLY_TEXT_MODELS,
+    )
+
+    assert "gemma4_unified" in SUPPORT_ONLY_TEXT_MODELS
+    assert (
+        SPECIAL_MULTIMODAL_BLOCK["gemma4_unified"]
+        is SPECIAL_MULTIMODAL_BLOCK["gemma4"]
+    )
+    assert (
+        SPECIAL_SHARED_CACHE_KEYS["Gemma4UnifiedForConditionalGeneration"]
+        == SPECIAL_SHARED_CACHE_KEYS["Gemma4ForConditionalGeneration"]
+    )
+
+
+def test_autoround_patch_supplies_unified_shared_kv_dictionary():
+    script_path = (
+        Path(__file__).resolve().parents[1]
+        / "third_party"
+        / "auto-round"
+        / "scripts_gemma4"
+        / "quantize.py"
+    )
+    spec = importlib.util.spec_from_file_location("gemma4_autoround_quantize", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    patch_position_embeddings = module.patch_position_embeddings
+
+    class FakeRotary(torch.nn.Module):
+        def forward(self, hidden_states, position_ids, layer_type):
+            dim = 8 if layer_type == "full_attention" else 4
+            shape = (*position_ids.shape, dim)
+            return torch.zeros(shape), torch.ones(shape)
+
+    class FakeLayer(torch.nn.Module):
+        def forward(
+            self,
+            hidden_states,
+            *,
+            shared_kv_states=None,
+            position_embeddings=None,
+            **kwargs,
+        ):
+            shared_kv_states["stored"] = hidden_states
+            self.received_shared_kv_states = shared_kv_states
+            return position_embeddings[0]
+
+    text_model = torch.nn.Module()
+    text_model.rotary_emb = FakeRotary()
+    text_model.layers = torch.nn.ModuleList([FakeLayer(), FakeLayer()])
+    core_model = torch.nn.Module()
+    core_model.language_model = text_model
+    model = torch.nn.Module()
+    model.model = core_model
+    model.config = SimpleNamespace(
+        text_config=SimpleNamespace(
+            hidden_size=4,
+            layer_types=["sliding_attention", "full_attention"],
+        )
+    )
+
+    patch_position_embeddings(model, seqlen=3, device="cpu")
+    output = text_model.layers[1](
+        torch.zeros(1, 3, 4),
+        position_ids=torch.arange(3).unsqueeze(0),
+    )
+
+    assert output.shape[-1] == 8
+    assert "stored" in text_model.layers[1].received_shared_kv_states
+
+
 def test_gemma4_recipe_copies_processor_sidecars_without_overwriting_quant_config(tmp_path):
     src = tmp_path / "src"
     out = tmp_path / "out"
@@ -66,6 +284,45 @@ def test_gemma4_recipe_copies_processor_sidecars_without_overwriting_quant_confi
     assert (out / "configuration.json").read_text(encoding="utf-8") == "configuration"
     assert (out / "config.json").read_text(encoding="utf-8") == "quant-config"
     assert not (out / "model.safetensors").exists()
+
+
+def test_gemma4_recipe_restores_source_only_multimodal_config_fields(tmp_path):
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    out.mkdir()
+    source_config = {
+        "model_type": "gemma4_unified",
+        "architectures": ["SourceArchitecture"],
+        "quantization_config": {"bits": 8},
+        "vision_config": {"model_patch_size": 48, "num_soft_tokens": 280},
+        "audio_config": {"audio_samples_per_token": 640},
+        "text_config": {
+            "hidden_size": 3840,
+            "dtype": None,
+            "source_only_runtime_field": True,
+        },
+    }
+    quant_config = {
+        "model_type": "gemma4_unified",
+        "architectures": ["QuantizedArchitecture"],
+        "quantization_config": {"bits": 4, "group_size": 64},
+        "vision_config": {"num_soft_tokens": 280, "dtype": "bfloat16"},
+        "text_config": {"hidden_size": 3840, "dtype": "bfloat16"},
+    }
+    (src / "config.json").write_text(json.dumps(source_config), encoding="utf-8")
+    (out / "config.json").write_text(json.dumps(quant_config), encoding="utf-8")
+
+    _restore_source_config_fields(str(src), str(out))
+
+    actual = json.loads((out / "config.json").read_text(encoding="utf-8"))
+    assert actual["vision_config"]["model_patch_size"] == 48
+    assert actual["audio_config"]["audio_samples_per_token"] == 640
+    assert actual["vision_config"]["dtype"] == "bfloat16"
+    assert actual["text_config"]["dtype"] == "bfloat16"
+    assert actual["quantization_config"] == {"bits": 4, "group_size": 64}
+    assert actual["architectures"] == ["QuantizedArchitecture"]
+    assert "source_only_runtime_field" not in actual["text_config"]
 
 
 def test_gemma4_recipe_patches_hf_quant_reload_scope(tmp_path):

@@ -1,4 +1,4 @@
-"""Gemma4-31B quantization script with 3 operational modes.
+"""Gemma4 dense/Unified quantization script with 3 operational modes.
 
 Modes:
   1. llm-only       : Only quantize LLM (W4G64, no rotation)
@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -64,6 +65,39 @@ def parse_args():
                         help="Save rotated (pre-quant) model for debugging")
 
     return parser.parse_args()
+
+
+def restore_source_config_fields(model_dir, output_dir):
+    """Preserve checkpoint-only multimodal config fields after HF save."""
+
+    source_path = os.path.join(model_dir, "config.json")
+    output_path = os.path.join(output_dir, "config.json")
+    if not os.path.isfile(source_path) or not os.path.isfile(output_path):
+        return
+
+    try:
+        with open(source_path, encoding="utf-8") as file:
+            source_config = json.load(file)
+        with open(output_path, encoding="utf-8") as file:
+            output_config = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(source_config, dict) or not isinstance(output_config, dict):
+        return
+
+    def merge(source, output):
+        merged = dict(source)
+        for key, output_value in output.items():
+            source_value = merged.get(key)
+            if isinstance(source_value, dict) and isinstance(output_value, dict):
+                merged[key] = merge(source_value, output_value)
+            else:
+                merged[key] = output_value
+        return merged
+
+    with open(output_path, "w", encoding="utf-8") as file:
+        json.dump(merge(source_config, output_config), file, ensure_ascii=False, indent=2)
+        file.write("\n")
 
 
 # ─── Rotation helpers ─────────────────────────────────────────────────────────
@@ -480,7 +514,7 @@ def rotate_projection_output(model, Q_llm, device):
     # Rotate output
     _bake_mean_into_linear(proj)
     proj.weight.data = _rotate_weight_out(proj.weight.data, Q_llm, device)
-    print(f"  Rotated projection output → LLM space (fused pre-proj norm)")
+    print("  Rotated projection output → LLM space (fused pre-proj norm)")
 
 
 def rotate_projection_input(model, Q_vision, device):
@@ -492,7 +526,7 @@ def rotate_projection_input(model, Q_vision, device):
     """
     proj, _ = _get_vision_projection(model)
     proj.weight.data = _rotate_weight(proj.weight.data, Q_vision, device)
-    print(f"  Rotated projection input ← vision space")
+    print("  Rotated projection input ← vision space")
 
 
 # ─── Vision layer names (for layer_config) ───────────────────────────────────
@@ -525,6 +559,7 @@ def patch_position_embeddings(model, seqlen, device):
     position_embeddings may not match other layers' requirements. Fix: pre-compute
     both types and have each layer use the correct one based on its type.
     """
+    import inspect
     import types
 
     lm = model.model.language_model
@@ -546,6 +581,9 @@ def patch_position_embeddings(model, seqlen, device):
 
     # Original forward reference
     original_forward = type(lm.layers[0]).forward
+    forward_parameters = inspect.signature(original_forward).parameters
+    supports_per_layer_input = "per_layer_input" in forward_parameters
+    supports_shared_kv_states = "shared_kv_states" in forward_parameters
 
     def make_patched_forward(layer_type_name, orig_fwd):
         cached_pos = pos_emb_cache[layer_type_name]
@@ -556,11 +594,26 @@ def patch_position_embeddings(model, seqlen, device):
             # Replace position_embeddings with the correct type for this layer
             correct_pos = (cached_pos[0].to(hidden_states.device),
                            cached_pos[1].to(hidden_states.device))
-            return orig_fwd(self, hidden_states, per_layer_input=per_layer_input,
-                            position_embeddings=correct_pos,
-                            attention_mask=attention_mask,
-                            position_ids=position_ids,
-                            past_key_values=past_key_values, **kwargs)
+            shared_kv_states = kwargs.pop("shared_kv_states", None)
+            call_kwargs = dict(
+                position_embeddings=correct_pos,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                **kwargs,
+            )
+            if supports_per_layer_input:
+                call_kwargs["per_layer_input"] = per_layer_input
+            if supports_shared_kv_states:
+                # Unified marks the last non-sharing layer of each attention
+                # type as a KV producer even when num_kv_shared_layers=0.
+                # Top-level HF forward always supplies this dictionary, but
+                # AutoRound replays decoder blocks directly and otherwise
+                # reaches those final layers with None.
+                call_kwargs["shared_kv_states"] = (
+                    shared_kv_states if shared_kv_states is not None else {}
+                )
+            return orig_fwd(self, hidden_states, **call_kwargs)
         return patched_forward
 
     for i, layer in enumerate(lm.layers):
@@ -580,7 +633,7 @@ def main():
     need_full_vision_rotation = args.mode == "rotate-full"
 
     print(f"\n{'='*60}")
-    print(f"Gemma4-31B AutoRound Quantization")
+    print("Gemma4 AutoRound Quantization")
     print(f"Mode: {args.mode}")
     print(f"Model: {args.model}")
     print(f"LLM: W{args.llm_bits}G{args.llm_group_size}")
@@ -620,7 +673,14 @@ def main():
     print(f"  LLM: {text_config.num_hidden_layers} layers, hidden={text_config.hidden_size}")
     vis_config = getattr(model.config, 'vision_config', None)
     if vis_config:
-        print(f"  Vision: {vis_config.num_hidden_layers} layers, hidden={vis_config.hidden_size}")
+        vision_layers = getattr(vis_config, "num_hidden_layers", None)
+        if vision_layers is None:
+            print(
+                "  Vision: encoder-free, "
+                f"soft_tokens={getattr(vis_config, 'num_soft_tokens', 'unknown')}"
+            )
+        else:
+            print(f"  Vision: {vision_layers} layers, hidden={vis_config.hidden_size}")
     print(f"  tie_word_embeddings: {model.config.tie_word_embeddings}")
 
     # ── Rotation ──
@@ -726,10 +786,11 @@ def main():
     print(f"\nSaving to: {args.output_dir}")
     os.makedirs(args.output_dir, exist_ok=True)
     ar.save_quantized(args.output_dir, format=args.format)
+    restore_source_config_fields(args.model, args.output_dir)
 
     total_time = time.time() - total_start
     print(f"\n{'='*60}")
-    print(f"✅ Done!")
+    print("✅ Done!")
     print(f"  Mode: {args.mode}")
     print(f"  Output: {args.output_dir}")
     print(f"  Quant time: {quant_time:.1f}s ({quant_time/3600:.2f}h)")

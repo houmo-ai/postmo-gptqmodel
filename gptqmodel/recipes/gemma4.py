@@ -185,6 +185,7 @@ def quantize_gemma4(
             run_env.update({str(key): str(value) for key, value in env.items()})
         subprocess.run(command, cwd=str(_repo_root()), env=run_env, check=True)
         _copy_hf_auxiliary_files(model_dir, output_dir)
+        _restore_source_config_fields(model_dir, output_dir)
         _patch_gemma4_quantization_config(output_dir)
         _write_recipe_provenance(output_dir, provenance)
 
@@ -365,6 +366,8 @@ def _resolve_topology(*, model_dir: str, topology: str | None) -> str:
 def _infer_variant(*, model_dir: str) -> str:
     config = _load_hf_config(model_dir)
     text_config = config.get("text_config", {}) if isinstance(config, Mapping) else {}
+    if config.get("model_type") == "gemma4_unified":
+        return "12b_unified"
     if isinstance(text_config, Mapping) and text_config.get("enable_moe_block"):
         return "26b_a4b"
     if isinstance(config.get("audio_config"), Mapping):
@@ -384,9 +387,10 @@ def _load_hf_config(model_dir: str) -> dict[str, Any]:
     if not config_path.is_file():
         return {}
     try:
-        return json.loads(config_path.read_text(encoding="utf-8"))
+        config = json.loads(config_path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    return config if isinstance(config, dict) else {}
 
 
 def _should_skip_eval(*, run_inference: bool | None, skip_inference: bool | None, check_quant_text_demo: bool) -> bool:
@@ -429,6 +433,57 @@ def _copy_hf_auxiliary_files(model_dir: str, output_dir: str) -> None:
         if target.exists():
             continue
         shutil.copy2(path, target)
+
+
+def _restore_source_config_fields(model_dir: str, output_dir: str) -> None:
+    """Keep checkpoint-specific config fields that HF save may omit.
+
+    Some custom multimodal configs do not declare every serialized checkpoint
+    field as a constructor parameter. ``save_pretrained`` then drops fields
+    such as Unified vision ``model_patch_size`` and audio
+    ``audio_samples_per_token``. Restore only those known source-only fields;
+    all other serialized values remain owned by the quantized output.
+    """
+
+    source_path = Path(model_dir) / "config.json"
+    output_path = Path(output_dir) / "config.json"
+    if not source_path.is_file() or not output_path.is_file():
+        return
+
+    try:
+        source_config = json.loads(source_path.read_text(encoding="utf-8"))
+        output_config = json.loads(output_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(source_config, dict) or not isinstance(output_config, dict):
+        return
+
+    source_only_fields = {
+        "vision_config": ("model_patch_size",),
+        "audio_config": ("audio_samples_per_token",),
+    }
+    changed = False
+    for section_name, field_names in source_only_fields.items():
+        source_section = source_config.get(section_name)
+        output_section = output_config.get(section_name)
+        if not isinstance(source_section, Mapping):
+            continue
+        if output_section is None:
+            output_section = {}
+            output_config[section_name] = output_section
+        if not isinstance(output_section, dict):
+            continue
+        for field_name in field_names:
+            if field_name in output_section or field_name not in source_section:
+                continue
+            output_section[field_name] = source_section[field_name]
+            changed = True
+
+    if changed:
+        output_path.write_text(
+            json.dumps(output_config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 def _patch_gemma4_quantization_config(output_dir: str) -> None:

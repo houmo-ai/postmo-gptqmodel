@@ -506,3 +506,50 @@ class Gemma4ForConditionalGenerationGPTQ(Gemma4PerLayerInputMixin, BaseQModel):
             _install_rotary_fix_hooks(self.model, self.config)
 
         return self.model
+
+
+class Gemma4UnifiedForConditionalGenerationGPTQ(BaseQModel):
+    """GPTQ definition for the encoder-free Gemma4 Unified architecture.
+
+    The text stack has the same projection grouping as Gemma4, but the tied
+    ``lm_head`` is owned by the top-level conditional-generation module rather
+    than ``model``. Unified is dense and has no per-layer-input/MoE lifecycle,
+    but its sliding/full layers still need the per-layer rotary-dimension fix
+    while GPTQ replays cached decoder inputs.
+    """
+
+    support_batch_quantize = False
+    support_offload_to_disk = False
+    pre_lm_head_norm_module = "model.language_model.norm"
+    layer_modules_strict = True
+    module_tree = [
+        "model",
+        "language_model",
+        "layers",
+        "#",
+        {
+            "input_layernorm": ("input_layernorm:!",),
+            "self_attn": (
+                "q_norm:!",
+                "k_norm:!",
+                "v_norm:!",
+                "q_proj:0",
+                "k_proj:0",
+                "v_proj:0",
+                "o_proj:1",
+            ),
+            "post_attention_layernorm": ("post_attention_layernorm:!",),
+            "pre_feedforward_layernorm": ("pre_feedforward_layernorm:!",),
+            "mlp": ("gate_proj:0", "up_proj:0", "down_proj:1"),
+            "post_feedforward_layernorm": ("post_feedforward_layernorm:!",),
+        },
+    ]
+    lm_head_module = "lm_head"
+
+    def after_model_load(self, model, load_quantized_model):
+        self.model = super().after_model_load(model, load_quantized_model)
+
+        if not load_quantized_model:
+            _install_rotary_fix_hooks(self.model, self.config)
+
+        return self.model
