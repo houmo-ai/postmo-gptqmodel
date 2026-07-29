@@ -521,7 +521,11 @@ class Gemma4UnifiedForConditionalGenerationGPTQ(BaseQModel):
     support_batch_quantize = False
     support_offload_to_disk = False
     pre_lm_head_norm_module = "model.language_model.norm"
-    layer_modules_strict = True
+    # Gemma4 Unified 12B sets attention_k_eq_v=True for full-attention
+    # layers, so those layers deliberately have no v_proj (K is reused as V).
+    # Keep v_proj in the common grouping for sliding layers, but treat it as a
+    # conditional module when the per-layer quantization plan is expanded.
+    layer_modules_strict = False
     module_tree = [
         "model",
         "language_model",

@@ -895,6 +895,7 @@ def ModelLoader(cls):
                 device_map=device_map,
                 offload_state_dict=True,
                 offload_buffers=True,
+                hf_key_mapping=cls.HF_KEY_MAPPING,
             )
 
             load_checkpoint_in_model = False
@@ -969,6 +970,7 @@ def ModelLoader(cls):
                 device_map=device_map,
                 # offload_state_dict=True,
                 # offload_buffers=True,
+                hf_key_mapping=cls.HF_KEY_MAPPING,
             )
 
         # TODO: Why are we using this custom function and not dispatch_model?

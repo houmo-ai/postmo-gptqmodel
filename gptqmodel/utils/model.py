@@ -1741,9 +1741,192 @@ def get_state_dict_for_save(model: nn.Module, offload_root: Optional[str] = None
         )
     return state_dict
 
-# Call tied_weights() after load_checkpoint_in_model() to have the weights tied correctly.
+def _get_safetensors_checkpoint_manifest(checkpoint: str) -> tuple[list[str], list[str], Optional[dict]]:
+    """Return tensor keys, shard files and metadata for one safetensors checkpoint."""
+
+    if checkpoint.endswith(".index.json"):
+        with open(checkpoint, encoding="utf-8") as stream:
+            index = json.load(stream)
+        weight_map = index.get("weight_map", {})
+        if not isinstance(weight_map, dict) or not weight_map:
+            return [], [], None
+        checkpoint_dir = os.path.dirname(checkpoint)
+        files = [
+            os.path.join(checkpoint_dir, filename)
+            for filename in dict.fromkeys(weight_map.values())
+        ]
+        return list(weight_map), files, index.get("metadata")
+
+    if checkpoint.endswith(".safetensors"):
+        with safe_open(checkpoint, framework="pt", device="cpu") as stream:
+            keys = list(stream.keys())
+        return keys, [checkpoint], None
+
+    return [], [], None
+
+
+def _try_load_checkpoint_with_transformers_conversion(
+    model: nn.Module,
+    *,
+    checkpoint: Any,
+    device_map: Optional[Dict[str, Any]],
+    dtype: Optional[torch.dtype],
+    offload_buffers: bool,
+    hf_key_mapping: Optional[Dict[str, str]],
+) -> bool:
+    """Use Transformers' ordered conversion pipeline only when a rename is required.
+
+    Accelerate loads checkpoint keys literally.  That is the desirable fast
+    path for native GPTQModel artifacts, but it leaves newly-renamed,
+    non-quantized frontend tensors uninitialized (for example the Gemma4
+    Unified vision frontend introduced by Transformers 5.13).
+
+    Newer Transformers versions expose the same exact-key-first conversion
+    pipeline used by ``from_pretrained``.  Detect a real source->runtime rename
+    before opting into it, so canonical checkpoints and older Transformers
+    versions retain the established Accelerate path.
+    """
+
+    if not isinstance(checkpoint, (str, os.PathLike)):
+        return False
+    checkpoint = os.fspath(checkpoint)
+
+    checkpoint_keys, checkpoint_files, sharded_metadata = _get_safetensors_checkpoint_manifest(
+        checkpoint
+    )
+    if not checkpoint_keys or not checkpoint_files:
+        return False
+
+    try:
+        from transformers.conversion_mapping import WeightConverter, WeightRenaming
+        from transformers.core_model_loading import rename_source_key
+        from transformers.modeling_utils import (
+            LoadStateDictConfig,
+            get_model_conversion_mapping,
+        )
+    except (ImportError, AttributeError):
+        # Older Transformers builds without the ordered conversion API keep
+        # using the literal-key Accelerate implementation below.  Both our
+        # supported 5.5 and 5.13 environments expose this API.
+        return False
+
+    weight_mapping = get_model_conversion_mapping(
+        model,
+        key_mapping=hf_key_mapping,
+    )
+    if not weight_mapping:
+        return False
+
+    renamings = [
+        entry for entry in weight_mapping if isinstance(entry, WeightRenaming)
+    ]
+    converters = [
+        entry for entry in weight_mapping if isinstance(entry, WeightConverter)
+    ]
+    if not renamings and not converters:
+        return False
+
+    model_state = model.state_dict()
+    renamed_examples: list[tuple[str, str]] = []
+    # This loop scans all checkpoint keys until it finds applicable
+    # conversions.  Eight limits only the diagnostic examples retained for
+    # logging; it is not a sample of the first eight checkpoint tensors.
+    for source_key in checkpoint_keys:
+        # Transformers 5.5-5.12 called the fourth argument ``prefix`` and
+        # 5.13 renamed it to ``base_model_prefix``.  Positional arguments keep
+        # the compatibility path inert and importable in both generations.
+        renamed_key, source_pattern = rename_source_key(
+            source_key,
+            renamings,
+            converters,
+            getattr(model, "base_model_prefix", None),
+            model_state,
+        )
+        if renamed_key not in model_state and source_key in model_state:
+            # Match Transformers' exact-key fallback: a registered mapping may
+            # target a different model variant, while this checkpoint already
+            # uses the runtime key.  Prefix normalization still applies.
+            renamed_key, source_pattern = rename_source_key(
+                source_key,
+                [],
+                [],
+                getattr(model, "base_model_prefix", None),
+                model_state,
+            )
+        if renamed_key in model_state and (
+            renamed_key != source_key or source_pattern is not None
+        ):
+            renamed_examples.append((source_key, renamed_key))
+            if len(renamed_examples) >= 8:
+                break
+
+    if not renamed_examples:
+        return False
+
+    # Discovery mutates stateful conversion entries such as
+    # GroupWeightRename.  get_model_conversion_mapping() deep-copies the
+    # registered transforms on every call, so rebuild a pristine pipeline for
+    # the real ordered load rather than reusing the discovery objects.
+    weight_mapping = get_model_conversion_mapping(
+        model,
+        key_mapping=hf_key_mapping,
+    )
+
+    load_config = LoadStateDictConfig(
+        pretrained_model_name_or_path=checkpoint,
+        sharded_metadata=sharded_metadata,
+        device_map=device_map,
+        offload_buffers=offload_buffers,
+        dtype=dtype,
+        dtype_plan=(
+            model._get_dtype_plan(dtype)
+            if callable(getattr(model, "_get_dtype_plan", None))
+            else {}
+        ),
+        weight_mapping=weight_mapping,
+        use_safetensors=True,
+    )
+    log.info(
+        "Loader: applying Transformers checkpoint conversion mapping; "
+        "examples: %s",
+        ", ".join(f"`{source}` -> `{target}`" for source, target in renamed_examples),
+    )
+
+    loader = getattr(type(model), "_load_pretrained_model", None)
+    if not callable(loader):
+        return False
+    loading_info, _ = loader(
+        model,
+        state_dict=None,
+        checkpoint_files=checkpoint_files,
+        load_config=load_config,
+    )
+    if loading_info.error_msgs or loading_info.conversion_errors:
+        raise RuntimeError(
+            "Transformers checkpoint conversion failed: "
+            f"errors={loading_info.error_msgs}, "
+            f"conversion_errors={loading_info.conversion_errors}"
+        )
+    return True
+
+
+# Call tie_weights() after checkpoint loading so shared weights are restored.
 def load_checkpoint_in_model_then_tie_weights(model, *args, **kwargs):
-    accelerate.load_checkpoint_in_model(model, *args, **kwargs)
+    hf_key_mapping = kwargs.pop("hf_key_mapping", None)
+    checkpoint = kwargs.get("checkpoint")
+    if checkpoint is None and args:
+        checkpoint = args[0]
+
+    converted = _try_load_checkpoint_with_transformers_conversion(
+        model,
+        checkpoint=checkpoint,
+        device_map=kwargs.get("device_map"),
+        dtype=kwargs.get("dtype"),
+        offload_buffers=bool(kwargs.get("offload_buffers", False)),
+        hf_key_mapping=hf_key_mapping,
+    )
+    if not converted:
+        accelerate.load_checkpoint_in_model(model, *args, **kwargs)
     model.tie_weights()
 
 

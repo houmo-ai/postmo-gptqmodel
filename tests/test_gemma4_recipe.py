@@ -64,7 +64,9 @@ def test_gemma4_unified_has_explicit_quant_model_definition(tmp_path):
         Gemma4UnifiedForConditionalGenerationGPTQ.pre_lm_head_norm_module
         == "model.language_model.norm"
     )
-    assert Gemma4UnifiedForConditionalGenerationGPTQ.layer_modules_strict is True
+    # Full-attention layers reuse K as V when attention_k_eq_v=True and
+    # therefore intentionally omit self_attn.v_proj.
+    assert Gemma4UnifiedForConditionalGenerationGPTQ.layer_modules_strict is False
     blocks = Gemma4UnifiedForConditionalGenerationGPTQ.build_layer_modules(
         Gemma4UnifiedForConditionalGenerationGPTQ.module_tree
     )

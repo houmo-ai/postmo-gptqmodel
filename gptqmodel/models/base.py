@@ -385,6 +385,13 @@ class BaseQModel(nn.Module):
 
     support_offload_to_disk = True
 
+    # Optional checkpoint-key overrides passed to Transformers' ordered weight
+    # conversion pipeline.  Keep this empty for normal models: registered
+    # Transformers mappings are discovered automatically, and a model
+    # definition should only add entries for names that are not registered
+    # upstream.
+    HF_KEY_MAPPING: Optional[Dict[str, str]] = None
+
     moe_expert_module_name_prefixes = [".expert"]
 
     ATTENTION_MASKS_DTYPE = torch.bool # default to bool
