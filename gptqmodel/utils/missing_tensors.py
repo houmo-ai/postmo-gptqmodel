@@ -56,6 +56,28 @@ def _load_tensor_names(shard_to_path: dict) -> Set[str]:
     return names
 
 
+def count_checkpoint_tensors_with_prefix(model_dir: str, prefix: str) -> int:
+    """Count checkpoint tensors whose names start with ``prefix``.
+
+    Prefer the safetensors index when present so callers can detect optional
+    tensor families, such as Qwen3-Next MTP, without opening every shard.  A
+    single-file checkpoint falls back to reading only its safetensors header.
+    Missing or unsupported checkpoints contain zero matching tensors.
+    """
+
+    index_path = os.path.join(model_dir, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {})
+        return sum(isinstance(name, str) and name.startswith(prefix) for name in weight_map)
+
+    single_path = os.path.join(model_dir, "model.safetensors")
+    if not os.path.exists(single_path):
+        return 0
+    with safe_open(single_path, framework="pt", device="cpu") as f:
+        return sum(isinstance(name, str) and name.startswith(prefix) for name in f.keys())
+
+
 def _first_numeric_prefix(tensor_name: str):
     """Return path up to and including the first numeric segment.
 

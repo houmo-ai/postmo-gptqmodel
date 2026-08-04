@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -10,9 +11,19 @@ def _flag_value(command: list[str], flag: str) -> str:
     return command[command.index(flag) + 1]
 
 
+def _write_checkpoint_index(model_dir: Path, tensor_names: list[str]) -> None:
+    model_dir.mkdir()
+    (model_dir / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: "model-00001.safetensors" for name in tensor_names}}),
+        encoding="utf-8",
+    )
+
+
 def test_first_four_layers_are_exposed_in_command(tmp_path: Path):
+    model_dir = tmp_path / "model"
+    _write_checkpoint_index(model_dir, ["model.layers.0.weight", "mtp.layers.0.weight"])
     result = quantize_qwen3_next(
-        model_dir="weights/Qwen3-Next-80B-A3B-Instruct",
+        model_dir=str(model_dir),
         output_dir=str(tmp_path / "out"),
         max_quant_layers=4,
         rotation=False,
@@ -29,6 +40,19 @@ def test_first_four_layers_are_exposed_in_command(tmp_path: Path):
     assert "--no-auto-forward-data-parallel" in command
     assert result.max_quant_layers == 4
     assert result.has_mtp is True
+
+
+def test_target_only_checkpoint_is_reported_without_mtp(tmp_path: Path):
+    model_dir = tmp_path / "model"
+    _write_checkpoint_index(model_dir, ["model.layers.0.weight"])
+
+    result = quantize_qwen3_next(
+        model_dir=str(model_dir),
+        output_dir=str(tmp_path / "out"),
+        dry_run=True,
+    )
+
+    assert result.has_mtp is False
 
 
 def test_default_recipe_does_not_limit_layers(tmp_path: Path):

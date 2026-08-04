@@ -13,6 +13,7 @@ from safetensors.torch import save_file
 from gptqmodel.quantization.config import dynamic_get
 from gptqmodel.models.definitions.qwen3_next import Qwen3NextGPTQ
 from gptqmodel.utils.missing_tensors import (
+    count_checkpoint_tensors_with_prefix,
     copy_missing_tensors_from_source,
     validate_tensor_prefix_parity,
 )
@@ -121,6 +122,46 @@ def test_restore_copies_only_mtp_and_preserves_bf16(tmp_path: Path):
     ) as handle:
         assert set(handle.keys()) == {"mtp.fc.weight", "mtp.layers.0.norm.weight"}
         assert handle.get_tensor("mtp.fc.weight").dtype == torch.bfloat16
+
+
+def test_target_only_checkpoint_skips_mtp_preservation(tmp_path: Path, capsys):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    save_file(
+        {"model.layers.0.self_attn.q_proj.weight": torch.ones(2, 2)},
+        source / "model.safetensors",
+        metadata={"format": "pt"},
+    )
+    save_file(
+        {"model.layers.0.self_attn.q_proj.qweight": torch.ones(1, 2, dtype=torch.int32)},
+        target / "model.safetensors",
+        metadata={"format": "pt"},
+    )
+
+    assert count_checkpoint_tensors_with_prefix(str(source), "mtp.") == 0
+    assert example.preserve_mtp_tensors_if_present(str(source), str(target), rotation=False) == 0
+    assert "keeping target-only output" in capsys.readouterr().out
+
+
+def test_count_checkpoint_tensors_with_prefix_uses_index(tmp_path: Path):
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.layers.0.weight": "model-00001.safetensors",
+                    "mtp.fc.weight": "model-00002.safetensors",
+                    "mtp.layers.0.norm.weight": "model-00002.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert count_checkpoint_tensors_with_prefix(str(checkpoint), "mtp.") == 2
 
 
 def test_mtp_parity_reports_missing_tensor(tmp_path: Path):

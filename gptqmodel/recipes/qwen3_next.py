@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from ..utils.missing_tensors import count_checkpoint_tensors_with_prefix
+
 
 @dataclass(frozen=True)
 class Qwen3NextQuantRecipeResult:
@@ -69,6 +71,8 @@ def quantize_qwen3_next(
         rotation = None
     if rotation is not None:
         raise ValueError("Qwen3-Next MTP preservation currently requires rotation=False")
+
+    has_mtp = count_checkpoint_tensors_with_prefix(str(model_dir), "mtp.") > 0
 
     command = [
         sys.executable,
@@ -150,7 +154,7 @@ def quantize_qwen3_next(
         method=method,
         artifact_format=artifact_format,
         model_family="qwen3_next",
-        has_mtp=True,
+        has_mtp=has_mtp,
         max_quant_layers=max_quant_layers,
         provenance=provenance,
     )

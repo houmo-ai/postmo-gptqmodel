@@ -20,6 +20,7 @@ from transformers import AutoConfig, AutoTokenizer
 from gptqmodel import GPTQModel, QuantizeConfig
 from gptqmodel.quantization.config import ExpertsRoutingBypass, ExpertsRoutingOverride, MoEConfig
 from gptqmodel.utils.missing_tensors import (
+    count_checkpoint_tensors_with_prefix,
     copy_missing_tensors_from_source,
     validate_tensor_prefix_parity,
 )
@@ -245,6 +246,27 @@ def configure_experts_implementation(model, requested):
         model.config._experts_implementation = implementation
     print(f"[experts] Using Transformers experts implementation: {implementation}")
     return implementation
+
+
+def preserve_mtp_tensors_if_present(source_dir, target_dir, rotation):
+    """Preserve optional Qwen3-Next MTP tensors after the target model is saved."""
+
+    source_mtp_count = count_checkpoint_tensors_with_prefix(source_dir, "mtp.")
+    if source_mtp_count == 0:
+        print("[mtp] Source checkpoint has no mtp.* tensors; keeping target-only output.")
+        return 0
+    if rotation:
+        print("[mtp] Rotation is enabled; unrotated MTP tensors were not restored.")
+        return 0
+
+    copied = copy_missing_tensors_from_source(
+        source_dir=source_dir,
+        target_dir=target_dir,
+        tensor_name_prefixes=("mtp.",),
+    )
+    mtp_count = validate_tensor_prefix_parity(source_dir, target_dir, "mtp.")
+    print(f"[mtp] Validated {mtp_count} tensors; copied {copied} to the BF16 sidecar.")
+    return mtp_count
 
 
 def build_moe_config(args):
@@ -583,16 +605,7 @@ def main():
         model.quantize(calibration_dataset, batch_size=args.batch_size)
         model.save(args.out)
         print(f"Quantized model saved to: {args.out}")
-        if not args.rotation:
-            copied = copy_missing_tensors_from_source(
-                source_dir=args.model,
-                target_dir=args.out,
-                tensor_name_prefixes=("mtp.",),
-            )
-            mtp_count = validate_tensor_prefix_parity(args.model, args.out, "mtp.")
-            print(f"[mtp] Validated {mtp_count} tensors; copied {copied} to the BF16 sidecar.")
-        else:
-            print("[mtp] Rotation is enabled; unrotated MTP tensors were not restored.")
+        preserve_mtp_tensors_if_present(args.model, args.out, args.rotation)
         del model
         gc.collect()
         if torch.cuda.is_available():
