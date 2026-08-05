@@ -481,7 +481,7 @@ def parse_args():
     parser.add_argument(
         "--moe-routing",
         type=str,
-        default="none",
+        default="bypass",
         choices=["none", "bypass", "override"],
         help="MoE routing mode: none keeps model routing, bypass forwards calibration to all experts, override forces top-k routing",
     )
