@@ -151,7 +151,7 @@ def _check_divisible_by_32(ar):
     else:
         default_dict = asdict(ar.scheme)
     skipped_layers = []
-    if default_dict["data_type"] == "int" and default_dict["act_bits"] >= 16:
+    if "int" in str(default_dict["data_type"]).lower() and default_dict["act_bits"] >= 16:
         for n, m in ar.model.named_modules():
             if type(m) in ar.supported_types or m.__class__.__name__ in ar.inner_supported_types:
                 if m.weight.shape[0] % 32 or m.weight.shape[1] % 32:

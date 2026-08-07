@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,6 +32,49 @@ def _parser_flags(script_path: str) -> set[str]:
     return flags
 
 
+def _parser_default(script_path: str, flag: str) -> str:
+    tree = ast.parse(Path(script_path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "add_argument":
+            continue
+        if not any(isinstance(arg, ast.Constant) and arg.value == flag for arg in node.args):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "default" and isinstance(keyword.value, ast.Constant):
+                return str(keyword.value.value)
+    raise AssertionError(f"{flag} has no constant default in {script_path}")
+
+
+def _parser_set_default(script_path: str, name: str) -> str:
+    tree = ast.parse(Path(script_path).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Attribute) or node.func.attr != "set_defaults":
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == name and isinstance(keyword.value, ast.Constant):
+                return str(keyword.value.value)
+    raise AssertionError(f"{name} has no constant parser default in {script_path}")
+
+
+def _autoround_data_type_values(script_path: str) -> list[str]:
+    tree = ast.parse(Path(script_path).read_text(encoding="utf-8"))
+    values: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name) or node.func.id != "AutoRound":
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "data_type":
+                values.append(ast.unparse(keyword.value))
+                break
+        else:
+            raise AssertionError(f"AutoRound call at line {node.lineno} does not pass data_type")
+    return values
+
+
 def _emitted_flags(command: list[str]) -> set[str]:
     return {item for item in command[2:] if item.startswith("--")}
 
@@ -57,6 +101,7 @@ def test_autoround_dense_mode1_matches_wrapper_defaults(tmp_path: Path):
     assert _flag_value(command, "--mode") == "llm-only"
     assert _flag_value(command, "--llm_bits") == "4"
     assert _flag_value(command, "--llm_group_size") == "64"
+    assert _flag_value(command, "--data_type") == "int_sym_gptq"
     assert _flag_value(command, "--iters") == "200"
     assert _flag_value(command, "--nsamples") == "128"
     assert _flag_value(command, "--seqlen") == "2048"
@@ -64,6 +109,7 @@ def test_autoround_dense_mode1_matches_wrapper_defaults(tmp_path: Path):
     assert _flag_value(command, "--dataset") == "NeelNanda/pile-10k"
     assert _flag_value(command, "--format") == "auto_gptq"
     assert result.provenance["log_file"] == str(output_dir / "qwen35_autoround_quantize.log")
+    assert result.provenance["data_type"] == "int_sym_gptq"
     assert "--sym" in command
 
 
@@ -111,6 +157,7 @@ def test_autoround_moe_mode1_matches_wrapper_defaults(tmp_path: Path):
     assert _flag_value(command, "--mode") == "llm-only"
     assert _flag_value(command, "--llm_bits") == "4"
     assert _flag_value(command, "--llm_group_size") == "64"
+    assert _flag_value(command, "--data_type") == "int_sym_gptq"
     assert _flag_value(command, "--device_map") == "0"
     assert _flag_value(command, "--batch_size") == "8"
     assert _flag_value(command, "--gradient_accumulate_steps") == "1"
@@ -121,6 +168,43 @@ def test_autoround_moe_mode1_matches_wrapper_defaults(tmp_path: Path):
     assert result.provenance["log_file"] == str(output_dir / "qwen35_autoround_quantize.log")
     assert "--low_gpu_mem_usage" in command
     assert "--sym" in command
+
+
+def test_autoround_data_type_can_restore_signed_full_range(tmp_path: Path):
+    result = quantize_qwen35_autoround(
+        model_dir="weights/Qwen3.5-9B",
+        output_dir=str(tmp_path / "dense-ar-signed"),
+        topology="dense",
+        data_type="int",
+        dry_run=True,
+    )
+
+    assert _flag_value(_cmd(result), "--data_type") == "int"
+    assert result.provenance["data_type"] == "int"
+
+
+def test_autoround_asymmetric_mode_requires_compatible_data_type(tmp_path: Path):
+    with pytest.raises(ValueError, match="requires sym=True"):
+        quantize_qwen35_autoround(
+            model_dir="weights/Qwen3.5-9B",
+            output_dir=str(tmp_path / "dense-ar-invalid-asym"),
+            topology="dense",
+            sym=False,
+            dry_run=True,
+        )
+
+    result = quantize_qwen35_autoround(
+        model_dir="weights/Qwen3.5-9B",
+        output_dir=str(tmp_path / "dense-ar-asym"),
+        topology="dense",
+        sym=False,
+        data_type="int",
+        dry_run=True,
+    )
+    command = _cmd(result)
+    assert "--asym" in command
+    assert "--sym" not in command
+    _assert_backend_accepts_command(command)
 
 
 def test_autoround_default_commands_are_backend_supported(tmp_path: Path):
@@ -139,3 +223,70 @@ def test_autoround_default_commands_are_backend_supported(tmp_path: Path):
 
     _assert_backend_accepts_command(_cmd(dense))
     _assert_backend_accepts_command(_cmd(moe))
+
+
+@pytest.mark.parametrize(
+    "script_path",
+    [
+        "third_party/auto-round/scripts/quantize.py",
+        "third_party/auto-round/scripts_qwen35moe/quantize_moe.py",
+    ],
+)
+def test_autoround_backends_default_and_forward_positive_scale_data_type(script_path: str):
+    assert _parser_default(script_path, "--data_type") == "int_sym_gptq"
+    assert _parser_set_default(script_path, "sym") == "True"
+    assert "--asym" in _parser_flags(script_path)
+    assert _autoround_data_type_values(script_path) == ["args.data_type"] * 3
+
+
+def test_int_sym_gptq_scale_is_always_positive():
+    torch = pytest.importorskip("torch")
+    from auto_round.data_type.int import quant_tensor_sym_gptq
+
+    weight = torch.tensor(
+        [
+            [-1.0, 2.0, 0.5, -0.25],
+            [-2.0, 1.0, -0.5, 0.25],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    _, scale, zero_point = quant_tensor_sym_gptq(
+        weight,
+        bits=4,
+        group_size=4,
+        v=torch.tensor(0.2),
+        min_scale=torch.tensor(0.3),
+        max_scale=torch.tensor(0.7),
+        scale_dtype=torch.float32,
+    )
+
+    assert torch.isfinite(scale).all()
+    assert (scale > 0).all()
+    assert (zero_point == 8).all()
+
+
+def test_int_sym_gptq_skips_layers_that_cannot_be_packed():
+    torch = pytest.importorskip("torch")
+    from auto_round.formats import _check_divisible_by_32
+    from auto_round.schemes import QuantizationScheme
+
+    autoround = SimpleNamespace(
+        scheme=QuantizationScheme(
+            bits=4,
+            group_size=64,
+            sym=True,
+            data_type="int_sym_gptq",
+            act_bits=16,
+        ),
+        model=torch.nn.Sequential(torch.nn.Linear(64, 1, bias=False)),
+        supported_types=(torch.nn.Linear,),
+        inner_supported_types=(),
+        layer_config=None,
+    )
+
+    _check_divisible_by_32(autoround)
+
+    assert autoround.layer_config["0"]["bits"] == 16
+    assert autoround.layer_config["0"]["data_type"] == "fp"
+    assert autoround.layer_config["0"]["fixed_by_user"] is True

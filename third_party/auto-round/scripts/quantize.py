@@ -51,12 +51,18 @@ def parse_args():
     # LLM quantization params
     parser.add_argument("--llm_bits", type=int, default=4)
     parser.add_argument("--llm_group_size", type=int, default=64)
+    parser.add_argument("--data_type", type=str, default="int_sym_gptq",
+                        help="AutoRound weight data type (default: positive-scale GPTQ symmetric int)")
     # Vision quantization params (mode 4 only)
     parser.add_argument("--vision_bits", type=int, default=8)
     parser.add_argument("--vision_group_size", type=int, default=64)
 
-    parser.add_argument("--sym", action="store_true", default=False,
-                        help="Use symmetric quantization (default: asymmetric)")
+    symmetry = parser.add_mutually_exclusive_group()
+    symmetry.add_argument("--sym", dest="sym", action="store_true",
+                          help="Use symmetric quantization (default)")
+    symmetry.add_argument("--asym", dest="sym", action="store_false",
+                          help="Use asymmetric quantization; requires a compatible --data_type")
+    parser.set_defaults(sym=True)
     parser.add_argument("--iters", type=int, default=200, help="SignSGD iterations (0=RTN)")
     parser.add_argument("--nsamples", type=int, default=128)
     parser.add_argument("--seqlen", type=int, default=2048)
@@ -81,7 +87,12 @@ def parse_args():
     parser.add_argument("--two_stage", action="store_true", default=False,
                         help="(Mode 4) Two-stage calibration: LLM with pile-10k, vision with llava_conv_58k")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.data_type == "int_sym_gptq" and not args.sym:
+        parser.error(
+            "--data_type int_sym_gptq requires symmetric quantization; remove --asym or use --data_type int"
+        )
+    return args
 
 
 # ─── Rotation helpers (adapted from GPTQModel rotation.py) ────────────────────
@@ -412,6 +423,7 @@ def _run_two_stage(model, tokenizer, processor, args, ar_kwargs):
         bits=args.llm_bits,
         group_size=args.llm_group_size,
         sym=args.sym,
+        data_type=args.data_type,
         iters=args.iters,
         seqlen=args.seqlen,
         nsamples=args.nsamples,
@@ -498,6 +510,7 @@ def _run_two_stage(model, tokenizer, processor, args, ar_kwargs):
         bits=args.vision_bits,
         group_size=args.vision_group_size,
         sym=args.sym,
+        data_type=args.data_type,
         iters=args.iters,
         seqlen=512,
         nsamples=args.nsamples,
@@ -864,6 +877,7 @@ def main():
             bits=args.llm_bits,
             group_size=args.llm_group_size,
             sym=args.sym,
+            data_type=args.data_type,
             iters=args.iters,
             seqlen=args.seqlen,
             nsamples=args.nsamples,

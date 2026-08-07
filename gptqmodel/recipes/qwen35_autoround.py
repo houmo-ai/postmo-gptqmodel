@@ -35,6 +35,7 @@ def quantize_qwen35_autoround(
     bits: int = 4,
     group_size: int = 64,
     sym: bool = True,
+    data_type: str = "int_sym_gptq",
     iters: int = 200,
     nsamples: int = 128,
     seqlen: int = 2048,
@@ -63,6 +64,11 @@ def quantize_qwen35_autoround(
         raise ValueError("Qwen3.5 AutoRound API currently exposes mode='llm-only' only")
     if int(group_size) != 64:
         raise ValueError(f"Qwen3.5 AutoRound group_size must be 64, got {group_size!r}")
+    data_type = str(data_type)
+    if data_type == "int_sym_gptq" and not sym:
+        raise ValueError(
+            "data_type='int_sym_gptq' requires sym=True; use data_type='int' for asymmetric quantization"
+        )
 
     if topology == "moe":
         batch_size = 8 if batch_size is None else batch_size
@@ -93,6 +99,7 @@ def quantize_qwen35_autoround(
         bits=bits,
         group_size=group_size,
         sym=sym,
+        data_type=data_type,
         iters=iters,
         nsamples=nsamples,
         seqlen=seqlen,
@@ -119,6 +126,7 @@ def quantize_qwen35_autoround(
         if topology == "dense"
         else "third_party/auto-round/scripts_qwen35moe/quantize_moe.py",
         "command": command,
+        "data_type": str(data_type),
         "log_file": _normalize_path(_default_log_file(output_dir)),
         "dry_run": bool(dry_run),
     }
@@ -154,6 +162,7 @@ def _build_command(
     bits: int,
     group_size: int,
     sym: bool,
+    data_type: str,
     iters: int,
     nsamples: int,
     seqlen: int,
@@ -190,6 +199,8 @@ def _build_command(
         str(int(bits)),
         "--llm_group_size",
         str(int(group_size)),
+        "--data_type",
+        str(data_type),
         "--seed",
         str(int(seed)),
         "--iters",
@@ -209,8 +220,7 @@ def _build_command(
         command.extend(["--device_map", str(device_map)])
     elif topology == "dense" and device:
         command.extend(["--device", str(device)])
-    if sym:
-        command.append("--sym")
+    command.append("--sym" if sym else "--asym")
     if low_gpu_mem_usage:
         command.append("--low_gpu_mem_usage")
     if gradient_accumulate_steps is not None:

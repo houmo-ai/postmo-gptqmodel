@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 import json
 from pathlib import Path
@@ -210,6 +211,52 @@ def test_autoround_registers_gemma4_unified_text_only_contract():
         SPECIAL_SHARED_CACHE_KEYS["Gemma4UnifiedForConditionalGeneration"]
         == SPECIAL_SHARED_CACHE_KEYS["Gemma4ForConditionalGeneration"]
     )
+
+
+@pytest.mark.parametrize(
+    "script_path",
+    [
+        "scripts_gemma4/quantize.py",
+        "scripts_gemma4_moe/quantize_moe.py",
+    ],
+)
+def test_gemma4_autoround_defaults_and_forwards_positive_scale_data_type(script_path):
+    path = Path(__file__).resolve().parents[1] / "third_party" / "auto-round" / script_path
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+
+    parser_flags = set()
+    data_type_default = None
+    sym_default = None
+    autoround_data_types = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "add_argument":
+            flags = [
+                arg.value
+                for arg in node.args
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and arg.value.startswith("--")
+            ]
+            parser_flags.update(flags)
+            if "--data_type" in flags:
+                data_type_default = next(
+                    keyword.value.value
+                    for keyword in node.keywords
+                    if keyword.arg == "default" and isinstance(keyword.value, ast.Constant)
+                )
+        elif isinstance(node.func, ast.Attribute) and node.func.attr == "set_defaults":
+            for keyword in node.keywords:
+                if keyword.arg == "sym" and isinstance(keyword.value, ast.Constant):
+                    sym_default = keyword.value.value
+        elif isinstance(node.func, ast.Name) and node.func.id == "AutoRound":
+            autoround_data_types.extend(
+                ast.unparse(keyword.value) for keyword in node.keywords if keyword.arg == "data_type"
+            )
+
+    assert data_type_default == "int_sym_gptq"
+    assert sym_default is True
+    assert "--asym" in parser_flags
+    assert autoround_data_types == ["args.data_type"]
 
 
 def test_autoround_patch_supplies_unified_shared_kv_dictionary():
