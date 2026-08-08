@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 
 from auto_round.compressors.utils import set_layer_config
+from auto_round.schemes import QuantizationScheme
 
 # ---------------------------------------------------------------------------
 # Minimal test models
@@ -63,12 +64,18 @@ _DEFAULT_SCHEME = "W4A16"
 _SCALE_DTYPE = torch.float16
 
 
-def _call_set_layer_config(model, layer_config=None, ignore_layers="", quant_lm_head=False):
+def _call_set_layer_config(
+    model,
+    layer_config=None,
+    ignore_layers="",
+    quant_lm_head=False,
+    default_scheme=_DEFAULT_SCHEME,
+):
     """Thin wrapper so tests don't repeat all positional args."""
     return set_layer_config(
         model=model,
         layer_config=layer_config or {},
-        default_scheme=_DEFAULT_SCHEME,
+        default_scheme=default_scheme,
         default_scale_dtype=_SCALE_DTYPE,
         supported_types=_SUPPORTED_TYPES,
         inner_supported_types=_INNER_SUPPORTED_TYPES,
@@ -131,3 +138,22 @@ class TestUnmatchedLayerConfigWarns:
         # The warning should mention the bad name
         warning_messages = " ".join(str(call) for call in mock_warn.call_args_list)
         assert "nonexistent_layer" in warning_messages
+
+
+class TestIntegerDataTypeShapeDivisibility:
+    def test_positive_scale_gptq_marks_unpacked_layers_fp16_before_block_dispatch(self):
+        model = _SimpleModel(num_layers=1, size=33)
+        scheme = QuantizationScheme(
+            bits=4,
+            group_size=64,
+            sym=True,
+            data_type="int_sym_gptq",
+            act_bits=16,
+        )
+
+        layer_config, _, _ = _call_set_layer_config(model, default_scheme=scheme)
+
+        for name in ("layers.0.fc1", "layers.0.fc2"):
+            assert layer_config[name]["bits"] == 16
+            assert layer_config[name]["data_type"] == "fp"
+            assert layer_config[name]["in_blocks"] is True

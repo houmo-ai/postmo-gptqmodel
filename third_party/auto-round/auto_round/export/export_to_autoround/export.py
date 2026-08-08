@@ -343,9 +343,10 @@ def save_quantized_as_autoround(
 
     scheme_keys = [f.name for f in fields(QuantizationScheme)]
     for layer_name, cfg in layer_config.items():
-        if not cfg["in_blocks"] and cfg["bits"] <= 8:  # lm head
+        in_blocks = cfg.get("in_blocks", False)
+        if not in_blocks and cfg["bits"] <= 8:  # lm head
             extra_config[layer_name] = {key: cfg.get(key) for key in scheme_keys}
-        elif cfg["in_blocks"] or (
+        elif in_blocks or (
             block_name_to_quantize is not None and check_start_with_block_name(layer_name, block_name_to_quantize)
         ):
             neq_keys = check_neq_config(cfg, **{k: quantization_config[k] for k in scheme_keys})

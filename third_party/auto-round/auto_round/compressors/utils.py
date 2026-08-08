@@ -472,7 +472,11 @@ def set_layer_config(
         layer_config.pop(lm_head_name, None)
 
     # 8. enforce shape divisibility for int weight-only
-    if default_dict["data_type"] == "int" and default_dict["act_bits"] >= 16 and not gguf_name:
+    if (
+        "int" in str(default_dict["data_type"]).lower()
+        and default_dict["act_bits"] >= 16
+        and not gguf_name
+    ):
         for n, m in model.named_modules():
             if type(m) in supported_types or m.__class__.__name__ in inner_supported_types:
                 if m.weight.shape[0] % 32 or m.weight.shape[1] % 32:
