@@ -146,6 +146,7 @@ from .longcat_flash import LongCatFlashQModel
 from .apertus import ApertusQModel
 from .klear import KlearQModel
 from .llava_qwen2 import LlavaQwen2QModel
+from .ling_3_flash import Ling3FlashQModel
 from .nemotron_h import NemotronHQModel
 from .qwen3_omni_moe import Qwen3OmniMoeGPTQ
 from .mistral3 import Mistral3GPTQ

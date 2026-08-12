@@ -40,11 +40,25 @@ if TYPE_CHECKING:  # pragma: no cover - type hints only
     from .module_looper import ModuleLooper
 
 
+def _collect_hook_skip_modules(planning_layer_modules: List[List[str]]) -> set[str]:
+    """Collect module paths explicitly marked non-quantized by module planning."""
+
+    skip_modules: set[str] = set()
+    for block in planning_layer_modules:
+        for module_name in block:
+            if ":!" in module_name:
+                path = module_name.split(":", 1)[0]
+                if path:
+                    skip_modules.add(path)
+    return skip_modules
+
+
 def run_layer_stage(
     looper: 'ModuleLooper',
     *,
     layers: List[torch.nn.Module],
     layer_modules: List[List[str]],
+    planning_layer_modules: Optional[List[List[str]]] = None,
     layers_prefix: Optional[str],
     failsafe,
     shared_kv_cache_dict: Dict[int, torch.Tensor],
@@ -56,6 +70,7 @@ def run_layer_stage(
 ) -> None:
     """Execute the main per-layer quantization loop."""
     log = logger or setup_logger()
+    hook_skip_modules = _collect_hook_skip_modules(planning_layer_modules or [])
     for layer_index in pb:
         # Iterate over every transformer layer (plus lm_head when enabled) as
         # progress-bar controlled units of work.
@@ -86,7 +101,11 @@ def run_layer_stage(
                 converter = MODULE_CONVERTER_MAP[model_type]
                 module = converter(module, looper.gptq_model.model.config.text_config)
 
-            replace_module_with_hooked_legacy(module, quant_lm_head=looper.gptq_model.quantize_config.lm_head)
+            replace_module_with_hooked_legacy(
+                module,
+                quant_lm_head=looper.gptq_model.quantize_config.lm_head,
+                skip_module_paths=hook_skip_modules,
+            )
 
             layers[layer_index] = module
 

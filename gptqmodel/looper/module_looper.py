@@ -1470,6 +1470,11 @@ class ModuleLooper():
         requires_activation_capture = any(
             getattr(proc, "enable_activation_capture", False) for proc in self.processors
         )
+        planning_layer_modules = self.gptq_model.full_layer_modules(
+            model_config=self.gptq_model.model.config,
+            is_awq_quantize=is_awq_quantize,
+            include_capture_only=requires_activation_capture,
+        )
         layer_modules = self.gptq_model.simple_layer_modules(
             model_config=self.gptq_model.model.config,
             quantize_config=self.gptq_model.quantize_config,
@@ -1507,6 +1512,7 @@ class ModuleLooper():
             self,
             layers=layers,
             layer_modules=layer_modules,
+            planning_layer_modules=planning_layer_modules,
             layers_prefix=layers_prefix,
             failsafe=failsafe,
             shared_kv_cache_dict=shared_kv_cache_dict,

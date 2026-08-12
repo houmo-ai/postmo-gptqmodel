@@ -122,6 +122,7 @@ from .definitions.llada2 import LLaDA2MoeQModel
 from .definitions.llama import LlamaQModel  # noqa: E402
 from .definitions.llama4 import Llama4QModel  # noqa: E402
 from .definitions.llava_qwen2 import LlavaQwen2QModel  # noqa: E402
+from .definitions.ling_3_flash import Ling3FlashQModel  # noqa: E402
 from .definitions.longcat_flash import LongCatFlashQModel  # noqa: E402
 from .definitions.mimo import MimoQModel  # noqa: E402
 from .definitions.minicpm import MiniCPMGPTQ  # noqa: E402
@@ -308,6 +309,7 @@ MODEL_MAP = {
     "llava_qwen2": LlavaQwen2QModel,
     "nemotron_h": NemotronHQModel,
     "bailing_moe": BailingMoeQModel,
+    "bailing_hybrid": Ling3FlashQModel,
     "lfm2_moe": LFM2MoeQModel,
     "deepseek_v2": DeepSeekV2QModel,
     "deepseek_v2_ocr": DeepSeekV2OCRQModel,
