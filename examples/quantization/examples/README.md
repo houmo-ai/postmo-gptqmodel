@@ -191,6 +191,44 @@ python examples/quantization/examples/example_qwen35dense.py \
 
 MoE 使用 `example_qwen35moe.py`，并把 `--model` / `--rotated-out` 换成对应目录。
 
+# Ling-3-Flash GPTQ 量化
+
+`example_ling3_flash.py` 通过
+`gptqmodel.recipes.ling3_flash.quantize_ling3_flash` 执行 Ling-3-Flash
+文本模型量化，固定部署精度为：普通 Linear/attention/shared expert W8、
+routed experts W4、G64、对称量化；KDA decay/beta 投影保持 BF16。
+
+当前已验证的 Ling recipe 使用 `offload_to_disk=False`，因此默认并推荐显式
+关闭 disk offload。`--offload-to-disk` 仅保留给专项验证；启用后必须重新验证
+生成 checkpoint 的完整性与推理结果。
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/quantization/examples/example_ling3_flash.py \
+  --model /path/to/Ling-3.0-flash \
+  --out work_dirs/ling-3-flash-gptq-w8w4-g64 \
+  --calibration-jsonl /path/to/calibration.jsonl \
+  --nsamples 128 \
+  --seqlen 2048 \
+  --batch-size 1 \
+  --no-offload-to-disk \
+  --wait-for-submodule-finalizers \
+  --device cuda:0
+```
+
+xh2modelzoo 等下游调用方应直接使用 recipe API，不应自行构造 Ling 的
+`QuantizeConfig`：
+
+```python
+from gptqmodel.recipes.ling3_flash import quantize_ling3_flash
+
+quantize_ling3_flash(
+    model_dir="/path/to/Ling-3.0-flash",
+    output_dir="work_dirs/ling-3-flash-gptq-w8w4-g64",
+    calibration_jsonl="/path/to/calibration.jsonl",
+    offload_to_disk=False,
+)
+```
+
 # Gemma4-26B-A4B量化使用说明
 
 由于gemma4-moe结构的特殊性，在gptqmodel中无需旋转，因此，量化指令如下：
