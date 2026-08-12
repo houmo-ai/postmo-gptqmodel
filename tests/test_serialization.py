@@ -108,3 +108,41 @@ class TestSerialization(unittest.TestCase):
         self.assertIsInstance(meta, dict)
         self.assertIn("gptaq", meta)
         self.assertIsNone(meta["gptaq"])
+
+    def test_offload_fields_roundtrip_from_meta(self):
+        disabled = QuantizeConfig(
+            offload_to_disk=False,
+            offload_to_disk_path=None,
+        )
+        restored_disabled = QuantizeConfig.from_quant_config(disabled.to_dict())
+        self.assertFalse(restored_disabled.offload_to_disk)
+        self.assertIsNone(restored_disabled.offload_to_disk_path)
+
+        enabled = QuantizeConfig(
+            offload_to_disk=True,
+            offload_to_disk_path="./explicit-offload",
+        )
+        restored_enabled = QuantizeConfig.from_quant_config(enabled.to_dict())
+        self.assertTrue(restored_enabled.offload_to_disk)
+        self.assertEqual(restored_enabled.offload_to_disk_path, "./explicit-offload")
+
+    def test_from_pretrained_applies_explicit_runtime_overrides(self):
+        payload = QuantizeConfig(
+            offload_to_disk=True,
+            offload_to_disk_path="./checkpoint-offload",
+        ).to_dict()
+        payload["meta"].pop("offload_to_disk")
+        payload["meta"].pop("offload_to_disk_path")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, "config.json"), "w", encoding="utf-8") as handle:
+                json.dump({"quantization_config": payload}, handle)
+
+            restored = QuantizeConfig.from_pretrained(
+                tmpdir,
+                offload_to_disk=False,
+                offload_to_disk_path=None,
+            )
+
+        self.assertFalse(restored.offload_to_disk)
+        self.assertIsNone(restored.offload_to_disk_path)

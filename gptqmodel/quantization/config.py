@@ -1357,6 +1357,13 @@ class QuantizeConfig():
                 normalized[QUANT_METHOD_FIELD] = METHOD.AUTO_ROUND
         if "gc_mode" not in normalized and isinstance(meta_payload, dict) and "gc_mode" in meta_payload:
             normalized["gc_mode"] = meta_payload.get("gc_mode")
+        # These fields are intentionally serialized under ``meta``. Restore
+        # them before constructing the dataclass; otherwise a checkpoint that
+        # explicitly saved ``offload_to_disk=False`` falls back to the legacy
+        # dataclass default (True) and unexpectedly starts a disk-offload load.
+        for key in ("offload_to_disk", "offload_to_disk_path"):
+            if key not in normalized and isinstance(meta_payload, dict) and key in meta_payload:
+                normalized[key] = meta_payload.get(key)
         if (
             "wait_for_submodule_finalizers" not in normalized
             and isinstance(meta_payload, dict)
@@ -1385,6 +1392,12 @@ class QuantizeConfig():
     @classmethod
     def from_pretrained(cls, save_dir: str, **kwargs):
         format = kwargs.pop("format", None)
+        field_names = {item.name for item in fields(cls)}
+        explicit_overrides = {
+            key: value
+            for key, value in kwargs.items()
+            if key in field_names
+        }
 
         transformers_config = False
         resolved_config_file = None
@@ -1405,6 +1418,12 @@ class QuantizeConfig():
 
             if transformers_config:
                 args_from_json = args_from_json["quantization_config"]
+
+            # Loading options supplied by the caller must win over checkpoint
+            # defaults. Historically every kwarg except ``format`` was
+            # discarded here, so a checkpoint that omitted offload metadata
+            # could not override the legacy ``offload_to_disk=True`` default.
+            args_from_json.update(explicit_overrides)
 
             return cls.from_quant_config(args_from_json, format)
 
