@@ -102,6 +102,39 @@ def test_unfuse_experts_weights():
         ), f"down weight mismatch for expert {i}"
 
 
+def test_unfuse_experts_weights_infers_laguna_layout():
+    """Laguna has hidden_dim > 2 * intermediate_dim but stores nn.Linear layout."""
+    from auto_round.modeling.fused_moe.moe_experts_interface import _unfuse_experts_weights_inplace
+
+    num_experts = 2
+    hidden_dim = 12
+    intermediate_dim = 4
+
+    class MockLagunaExperts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hidden_dim = hidden_dim
+            self.intermediate_dim = intermediate_dim
+            self.gate_up_proj = nn.Parameter(torch.randn(num_experts, 2 * intermediate_dim, hidden_dim))
+            self.down_proj = nn.Parameter(torch.randn(num_experts, hidden_dim, intermediate_dim))
+            self.act_fn = nn.SiLU()
+            self.num_experts = num_experts
+
+    module = MockLagunaExperts()
+    original_gate_up = module.gate_up_proj.data.clone()
+    original_down = module.down_proj.data.clone()
+
+    assert _unfuse_experts_weights_inplace(module, check_decorator=False)
+
+    for expert_idx in range(num_experts):
+        expert = getattr(module, str(expert_idx))
+        assert expert.gate_proj.in_features == hidden_dim
+        assert expert.gate_proj.out_features == intermediate_dim
+        assert torch.equal(expert.gate_proj.weight, original_gate_up[expert_idx, :intermediate_dim])
+        assert torch.equal(expert.up_proj.weight, original_gate_up[expert_idx, intermediate_dim:])
+        assert torch.equal(expert.down_proj.weight, original_down[expert_idx])
+
+
 def test_unfuse_experts_weights_transposed():
     """Test unfusing transposed expert weights (Llama4/GptOss style)."""
     from auto_round.modeling.fused_moe.moe_experts_interface import _unfuse_experts_weights_inplace
