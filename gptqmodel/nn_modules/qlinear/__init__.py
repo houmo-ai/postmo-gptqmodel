@@ -796,7 +796,12 @@ class PackableQuantLinear(BaseQuantLinear):
             s_blk_T = scales.index_select(0, gsel).T  # [out, blk]
 
             # int_block = round((W + scale_zeros[g_idx]^T) / scales[g_idx]^T)
-            int_block = t.round((Wblk + sz_blk_T) / s_blk_T).to(t.int32)  # [out, blk]
+            # Learned/min-max tuned scales may intentionally clip a small
+            # fraction of the source weights.  Fake quantization clamps those
+            # values, so packing must do the same.  Letting 16 reach a W4
+            # bit-pack, for example, truncates it to 0 and turns a small
+            # clipping error into a full-range sign error.
+            int_block = t.round((Wblk + sz_blk_T) / s_blk_T).clamp_(0, int(self.maxq)).to(t.int32)
             int_block = int_block.T.contiguous()  # [blk, out]
 
             groups32 = blk // word_bits
@@ -1010,7 +1015,7 @@ class PackableQuantLinear(BaseQuantLinear):
             sz_blk_T = scale_zeros_dev.index_select(0, gsel).T
             s_blk_T = scales_dev.index_select(0, gsel).T
 
-            int_block = t.round((Wblk + sz_blk_T) / s_blk_T).to(t.int32)
+            int_block = t.round((Wblk + sz_blk_T) / s_blk_T).clamp_(0, int(self.maxq)).to(t.int32)
             int_block = int_block.T.contiguous()
 
             groups32 = blk // word_bits
@@ -1084,7 +1089,11 @@ class PackableQuantLinear(BaseQuantLinear):
                 # self.bias = linear.bias.clone().to(dtype=t.float16)
                 self.register_buffer("bias", linear.bias.to(dtype=t.float16))
 
-            int_weight = t.round((W + scale_zeros[self.g_idx].T) / scales[self.g_idx].T).to(t.int32)
+            int_weight = (
+                t.round((W + scale_zeros[self.g_idx].T) / scales[self.g_idx].T)
+                .clamp_(0, int(self.maxq))
+                .to(t.int32)
+            )
             int_weight = int_weight.T.contiguous()
             int_weight = int_weight.numpy().astype(self.pack_np_math_dtype)
 

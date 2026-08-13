@@ -10,7 +10,9 @@ import torch.nn as nn
 from gptqmodel.nn_modules.qlinear import BaseQuantLinear
 from gptqmodel.quantization import FORMAT, METHOD
 from gptqmodel.utils.model import (
+    convert_gptq_v1_to_v2_format,
     convert_gptq_v1_to_v2_format_module,
+    convert_gptq_v2_to_v1_format,
     convert_gptq_v2_to_v1_format_module,
 )
 
@@ -64,6 +66,30 @@ def test_qzero_offsets_roundtrip(bits: int, pack_dtype: torch.dtype) -> None:
     )
 
     assert torch.equal(module.qzeros.data, original)
+
+
+@torch.inference_mode()
+def test_mixed_precision_conversion_uses_each_modules_physical_bits() -> None:
+    class _Kernel(_TestQuantLinear):
+        pass
+
+    model = nn.Module()
+    model.w8 = _Kernel(bits=8, pack_dtype=torch.int32, columns=1)
+    model.w4 = _Kernel(bits=4, pack_dtype=torch.int32, columns=1)
+    config = SimpleNamespace(
+        bits=8,
+        pack_dtype=torch.int32,
+        quant_method=METHOD.AUTO_ROUND,
+        format=FORMAT.GPTQ,
+    )
+
+    convert_gptq_v1_to_v2_format(model, config, _Kernel)
+    assert torch.equal(model.w8.qzeros, torch.tensor([[0x0101_0101]], dtype=torch.int32))
+    assert torch.equal(model.w4.qzeros, torch.tensor([[0x1111_1111]], dtype=torch.int32))
+
+    convert_gptq_v2_to_v1_format(model, config, _Kernel)
+    assert torch.equal(model.w8.qzeros, torch.zeros_like(model.w8.qzeros))
+    assert torch.equal(model.w4.qzeros, torch.zeros_like(model.w4.qzeros))
 
 
 @torch.inference_mode()

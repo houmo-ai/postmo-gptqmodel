@@ -138,6 +138,30 @@ class TritonV2QuantLinear(TorchQuantLinear):
         if self.training:
             return super().forward(x)
 
+        # A few model families deliberately keep normalization parameters in
+        # FP32.  Their outputs can therefore arrive here as FP32 even inside an
+        # FP16/BF16 autocast region.  Unlike ``nn.Linear``, this custom
+        # quantized function is not on autocast's built-in cast list, so make
+        # the same compute-dtype transition explicitly.  Besides matching the
+        # activation contract, this prevents the dequantizer from
+        # materializing an unnecessary FP32 copy of every low-bit weight.
+        device_type = x.device.type
+        try:
+            autocast_enabled = torch.is_autocast_enabled(device_type)
+        except TypeError:  # PyTorch versions predating the device argument
+            autocast_enabled = torch.is_autocast_enabled()
+        if autocast_enabled:
+            try:
+                autocast_dtype = torch.get_autocast_dtype(device_type)
+            except AttributeError:
+                autocast_dtype = (
+                    torch.get_autocast_gpu_dtype()
+                    if device_type == "cuda"
+                    else None
+                )
+            if autocast_dtype in self.SUPPORTS_DTYPES and x.dtype != autocast_dtype:
+                x = x.to(dtype=autocast_dtype)
+
         # if in_features is padded, we need to pad the input as well
         # if x.size(-1) != self.padded_infeatures:
         #     x = F.pad(x, (0, self.padded_infeatures - self.in_features))
@@ -161,7 +185,8 @@ class TritonV2QuantLinear(TorchQuantLinear):
         if self.adapter:
             out = self.adapter.apply(x=x, out=out)
 
-        return out.to(dtype=x.dtype)
+        # Keep the actual compute dtype, matching ``nn.Linear`` under autocast.
+        return out
 
 
 __all__ = ["TritonV2QuantLinear"]
