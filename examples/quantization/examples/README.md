@@ -1,3 +1,92 @@
+# DeepSeek-V4-Flash-0731 W8/W4-G64
+
+DeepSeek-V4 Flash 的原始 checkpoint 混合了 FP8 E4M3-B128×128 和 routed-expert E2M1-FP4-B32，不能直接作为普通 BF16 GPTQ/AutoRound 输入。示例会按 shard 流式反量化，并支持物理裁剪前 N 层。部署 profile 固定为：非共享 routed experts W4，其余已登记的普通量化 Linear（包括 shared expert 和主 attention 投影）W8，group size 64，对称量化；Grouped `o_a`、compressor/indexer、router、norm、mHC 保持浮点。
+
+前 6 层（覆盖 SWA、CSA、HCA）的 GPTQ 推荐命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=4 conda run -n xhquant_55 \
+python examples/quantization/examples/example_deepseek_v4_flash.py \
+  --model /data01/datasets/DeepSeek-V4-Flash-0731 \
+  --prepared-model work_dirs/deepseek-v4-flash-bf16-first6 \
+  --out work_dirs/deepseek-v4-flash-first6-GPTQ-W8E4G64 \
+  --num-layers 6 \
+  --method gptq \
+  --bits 8 \
+  --expert-bits 4 \
+  --group-size 64 \
+  --nsamples 128 \
+  --seqlen 2048
+```
+
+AutoRound 使用相同的 mixed-precision 规则：
+
+```bash
+CUDA_VISIBLE_DEVICES=4 conda run -n xhquant_55 \
+python examples/quantization/examples/example_deepseek_v4_flash.py \
+  --model /data01/datasets/DeepSeek-V4-Flash-0731 \
+  --prepared-model work_dirs/deepseek-v4-flash-bf16-first6 \
+  --out work_dirs/deepseek-v4-flash-first6-AutoRoundV2-W8E4G64 \
+  --num-layers 6 \
+  --method autoround \
+  --auto-round-version v2 \
+  --auto-round-iters 200
+```
+
+两条路径均默认 `offload_to_disk=False`；只有显式添加 `--offload-to-disk` 才会创建 offload 目录。GPTQ 和 AutoRound 按 decoder layer、subset、MoE module chunk 串行推进，实测单层峰值约 24 GiB，因此默认只暴露一张 80-GiB GPU。`auto_forward_data_parallel` 也默认关闭，避免把当前层复制到每张可见 GPU；暴露多卡只会提供可选 expert worker pool，并不是容量要求。完整 43 层去掉 `--num-layers 6`，同样使用单卡，并为 BF16 staging 和最终量化产物预留足够空间。前三层虽然使用 `tid2eid` Hash 路由，但 256 个真实 expert 的 gate/up/down 仍统一走 W4。该流程保留 latent/shared-KV 与 grouped `o_a/o_b` 分解，不会展开传统 K/V 投影，也不会合并 `o_a/o_b`。
+
+## FP4 → INT4 权重误差审计
+
+`audit_deepseek_v4_fp4_to_int4.py` 不生成新 checkpoint，而是直接按 shard
+读取原生 routed-expert 权重并流式统计。0731 checkpoint 的真实布局是：每个
+signed byte 按 low-nibble-first 存两个 E2M1 数值，`Float8_e8m0fnu` scale 是
+直接乘数，且每个 scale 精确覆盖 32 个逻辑输入列。原始 G32 block 可以直接
+沿用，G64 则必须合并相邻两个原生 block。
+
+单卡小样：
+
+```bash
+python examples/quantization/examples/audit_deepseek_v4_fp4_to_int4.py \
+  --model /data01/datasets/DeepSeek-V4-Flash-0731 \
+  --output work_dirs/deepseek-v4-fp4-int4-smoke.json \
+  --tensor-records work_dirs/deepseek-v4-fp4-int4-smoke.jsonl \
+  --rows-per-tensor 64 \
+  --devices cuda:0 \
+  --max-tensors 3 \
+  --lloyd-iterations 3
+```
+
+四卡覆盖全部 33,024 个 routed-expert tensor、每个 tensor 均匀抽 64 行：
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
+python examples/quantization/examples/audit_deepseek_v4_fp4_to_int4.py \
+  --model /data01/datasets/DeepSeek-V4-Flash-0731 \
+  --output work_dirs/deepseek-v4-fp4-int4-all-r64.json \
+  --tensor-records work_dirs/deepseek-v4-fp4-int4-all-r64.jsonl \
+  --rows-per-tensor 64 \
+  --devices cuda:0,cuda:1,cuda:2,cuda:3 \
+  --lloyd-iterations 3
+```
+
+脚本同时报告普通 RTN、baicai1145 公布的六候选 scale 网格以及多起点
+Lloyd/least-squares scale refinement。Lloyd 的每轮先固定 scale 计算
+`q=clamp(round(w/s),-8,7)`，再固定 `q` 更新
+`s=sum(w*q)/sum(q*q)`；最后以实际存储为 FP16 后的重构误差选择最优起点。
+`--rows-per-tensor 0` 会对命中的权重逐元素全量计算，适合复核少数离群 expert。
+
+若只下载了 baicai1145 W4A16 的单个 safetensor shard，可逐元素验证成品
+packing 和量化算法，无需下载完整模型：
+
+```bash
+python examples/quantization/examples/verify_deepseek_v4_w4a16_tensor.py \
+  --native-model /data01/datasets/DeepSeek-V4-Flash-0731 \
+  --converted-shard /path/to/model-00020-of-00034.safetensors \
+  --tensor layers.29.ffn.experts.126.w1.weight \
+  --device cuda:0 \
+  --output work_dirs/baicai-layer29-expert126-w1-verification.json
+```
+
 # Qwen3.5 / Qwen3.5-MoE 旋转量化流程
 
 本目录的 Qwen3.5 脚本用于完整 VLM checkpoint 的 GPTQ 量化：
