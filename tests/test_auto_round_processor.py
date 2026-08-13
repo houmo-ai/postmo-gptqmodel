@@ -112,3 +112,119 @@ def test_auto_round_processor_quantizes_moe_expert_projection():
     assert named.state["q_scales"].shape[0] == config.moe_intermediate_size
     assert named.state["q_g_idx"].numel() == config.hidden_size
     assert torch.isfinite(expert_proj.weight).all()
+
+
+def _fake_quantize_from_round_value(weight, state):
+    """Test quantizer whose serialized weight exposes the optimizer state."""
+    rows, cols = weight.shape
+    groups = (cols + state.qcfg.group_size - 1) // state.qcfg.group_size
+    qdq_weight = state.value.to(weight.dtype)
+    scales = torch.ones((rows, groups), dtype=torch.float32, device=weight.device)
+    zeros = torch.full_like(scales, 7.5)
+    g_idx = torch.arange(cols, dtype=torch.int32, device=weight.device) // state.qcfg.group_size
+    return qdq_weight, scales, zeros, g_idx
+
+
+def _prepare_single_step_processor(monkeypatch):
+    processor = _make_processor(version=AutoRoundVersion.V1)
+    processor.qcfg.iters = 1
+    processor.qcfg.lr = 10.0
+    processor.qcfg.minmax_lr = 10.0
+    linear = torch.nn.Linear(8, 1, bias=False)
+    with torch.no_grad():
+        linear.weight.fill_(1.0 / 8.0)
+    named = NamedModule(linear, name="proj", full_name="layer.proj", layer_index=0)
+    processor.preprocess(named)
+    inputs = torch.ones(1, 8)
+    processor.pre_process_fwd_hook("proj")(linear, (inputs,), linear(inputs))
+    monkeypatch.setattr(
+        "gptqmodel.looper.auto_round_processor.auto_round_fake_quantize",
+        _fake_quantize_from_round_value,
+    )
+    return processor, linear, named
+
+
+def test_auto_round_single_step_does_not_save_unevaluated_worse_state(monkeypatch):
+    processor, linear, named = _prepare_single_step_processor(monkeypatch)
+
+    processor.process(named, device=torch.device("cpu"))
+
+    # Initial state predicts zero (loss 1). Adam(lr=10) moves the eight round
+    # values to about 10, whose prediction/loss is vastly worse. The old code
+    # assigned loss 1 to that post-step state and serialized it.
+    assert torch.equal(linear.weight, torch.zeros_like(linear.weight))
+    assert processor.log[-1]["auto_round_best_step"] == "0"
+    assert processor.log[-1]["loss"] == "1.0000000000"
+
+
+def test_auto_round_non_finite_update_restores_last_evaluated_state(monkeypatch):
+    processor, linear, named = _prepare_single_step_processor(monkeypatch)
+    processor.tasks["proj"].qcfg.not_use_best_mse = True
+
+    def non_finite_after_update(weight, state):
+        result = list(_fake_quantize_from_round_value(weight, state))
+        if torch.count_nonzero(state.value.detach()).item():
+            result[0] = result[0] * float("nan")
+        return tuple(result)
+
+    monkeypatch.setattr(
+        "gptqmodel.looper.auto_round_processor.auto_round_fake_quantize",
+        non_finite_after_update,
+    )
+    processor.process(named, device=torch.device("cpu"))
+
+    assert torch.isfinite(linear.weight).all()
+    assert torch.equal(linear.weight, torch.zeros_like(linear.weight))
+    assert processor.log[-1]["auto_round_fallback"] == "non_finite_loss"
+    assert processor.log[-1]["loss"] == "failsafe(rtn): 1.0000000000"
+
+
+def test_auto_round_not_use_best_mse_saves_evaluated_final_state(monkeypatch):
+    processor, linear, named = _prepare_single_step_processor(monkeypatch)
+    processor.tasks["proj"].qcfg.not_use_best_mse = True
+
+    processor.process(named, device=torch.device("cpu"))
+
+    assert torch.count_nonzero(linear.weight).item() == linear.weight.numel()
+    assert processor.log[-1]["auto_round_best_step"] == "1"
+    reference = torch.tensor([[1.0]])
+    selected_loss = torch.mean((torch.nn.functional.linear(torch.ones(1, 8), linear.weight) - reference) ** 2)
+    assert float(processor.log[-1]["loss"]) == pytest.approx(selected_loss.item())
+
+
+def test_auto_round_low_sample_failsafe_skips_optimizer(monkeypatch):
+    processor, linear, named = _prepare_single_step_processor(monkeypatch)
+    processor.tasks["proj"].failsafe.threshold = "50%"
+
+    processor.process(named, device=torch.device("cpu"))
+
+    # Calibration has four expected tokens but only one captured row.
+    assert torch.equal(linear.weight, torch.zeros_like(linear.weight))
+    assert processor.log[-1]["samples"] == "1"
+    assert processor.log[-1]["auto_round_fallback"] == "insufficient_samples"
+    assert processor.log[-1]["loss"] == "failsafe(rtn): 1.0000000000"
+
+
+def test_auto_round_unactivated_expert_uses_weight_only_failsafe(monkeypatch):
+    processor = _make_processor(version=AutoRoundVersion.V1)
+    linear = torch.nn.Linear(8, 1, bias=False)
+    with torch.no_grad():
+        linear.weight.fill_(1.0 / 8.0)
+    named = NamedModule(
+        linear,
+        name="down_proj",
+        full_name="model.layers.0.mlp.experts.7.down_proj",
+        layer_index=0,
+    )
+    processor.preprocess(named)
+    monkeypatch.setattr(
+        "gptqmodel.looper.auto_round_processor.auto_round_fake_quantize",
+        _fake_quantize_from_round_value,
+    )
+
+    processor.process(named, device=torch.device("cpu"))
+
+    assert torch.equal(linear.weight, torch.zeros_like(linear.weight))
+    assert processor.log[-1]["samples"] == "0"
+    assert processor.log[-1]["auto_round_fallback"] == "insufficient_samples"
+    assert processor.log[-1]["loss"] == "failsafe(rtn): 0.0156250000"

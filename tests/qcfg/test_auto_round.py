@@ -63,7 +63,7 @@ def test_auto_round_v2_requires_symmetric_quantization():
         )
 
 
-def test_auto_round_quantize_config_to_dict_roundtrip():
+def test_auto_round_quantize_config_serializes_gptq_storage_and_roundtrips():
     cfg = QuantizeConfig(auto_round_enabled=True, 
         bits=4,
         group_size=128,
@@ -83,7 +83,7 @@ def test_auto_round_quantize_config_to_dict_roundtrip():
     payload = cfg.to_dict()
     loaded = QuantizeConfig.from_quant_config(payload)
 
-    assert payload["quant_method"] == METHOD.AUTO_ROUND
+    assert payload["quant_method"] == METHOD.GPTQ
     assert payload["checkpoint_format"] == FORMAT.GPTQ
     assert payload["sym"] is False
     assert payload["group_size"] == 128

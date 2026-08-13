@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -38,7 +39,7 @@ from ..quantization.auto_round import (
     snapshot_auto_round_state,
 )
 from ..quantization.config import METHOD, QuantizeConfig
-from ..utils.failsafe import normalize_failsafe
+from ..utils.failsafe import normalize_failsafe, should_use_failsafe
 from ..utils.logger import setup_logger
 
 
@@ -129,8 +130,23 @@ class AutoRoundProcessor(GPTQProcessor):
         del subset, name_index, return_fp_outputs, previous_subset, subset_index, subset_total, kwargs
 
         task = self.tasks[module.name]
-        if not task.inputs:
-            raise ValueError(f"Auto-Round captured no calibration inputs for `{module.full_name}`.")
+
+        # Count token rows, not merely forward batches.  Captured tensors can
+        # be [tokens, hidden] or [batch, sequence, hidden].
+        nsamples = sum(
+            max(int(t.numel() // t.shape[-1]), 1) if t.ndim > 1 else 1
+            for t in task.inputs
+        )
+        fallback_requested = should_use_failsafe(
+            task.failsafe,
+            observed_samples=float(nsamples),
+            expected_total_samples=getattr(self, "total_calibration_tokens", None),
+        )
+        if not task.inputs and not fallback_requested:
+            raise ValueError(
+                f"Auto-Round captured no calibration inputs for `{module.full_name}` "
+                "and its failsafe threshold is disabled."
+            )
 
         with torch.inference_mode(False):
             target_device = device if isinstance(device, torch.device) else torch.device(device or module.weight.device)
@@ -138,7 +154,7 @@ class AutoRoundProcessor(GPTQProcessor):
             inputs = [tensor.to(device=target_device, dtype=base_weight.dtype).clone() for tensor in task.inputs]
             outputs = [tensor.to(device=target_device, dtype=torch.float32).clone() for tensor in task.outputs]
 
-            hessian_diag = build_input_hessian(inputs) if task.qcfg.hessian_mse else None
+            hessian_diag = build_input_hessian(inputs) if task.qcfg.hessian_mse and inputs else None
             state = init_auto_round_state(base_weight, task.qcfg, hessian_diag=hessian_diag)
 
             params = [state.value]
@@ -147,9 +163,52 @@ class AutoRoundProcessor(GPTQProcessor):
                 if state.min_scale is not None:
                     params.append(state.min_scale)
 
-            best_loss = float("inf")
+            # The initial state is the safe weight-only RTN candidate.  Keep it
+            # independently of optimizer state so a non-finite update can
+            # always be rolled back.
             best_snapshot = snapshot_auto_round_state(state)
-            iterations = max(int(task.qcfg.iters), 0)
+            best_loss = float("inf")
+            best_step = None
+            last_evaluated_loss = None
+            last_evaluated_step = None
+            optimization_failed = False
+            iterations = 0 if fallback_requested else max(int(task.qcfg.iters), 0)
+
+            def evaluate_current_state() -> torch.Tensor:
+                qdq_weight, _, _, _ = auto_round_fake_quantize(base_weight, state)
+                total_loss = None
+                for inp, ref_out in zip(inputs, outputs):
+                    pred = self._module_forward(module.module, inp.to(dtype=qdq_weight.dtype), qdq_weight)
+                    batch_loss = auto_round_loss(pred, ref_out, qcfg=task.qcfg)
+                    total_loss = batch_loss if total_loss is None else total_loss + batch_loss
+                if total_loss is None:
+                    # An unactivated MoE expert has no calibration pair.  Its
+                    # enabled failsafe is necessarily weight-only, so rank the
+                    # initial candidate by reconstruction MSE.
+                    total_loss = torch.mean(
+                        (qdq_weight.to(torch.float32) - base_weight.to(torch.float32)) ** 2
+                    )
+                return total_loss
+
+            def record_current_candidate(total_loss: torch.Tensor, step: int) -> bool:
+                nonlocal best_loss, best_snapshot, best_step
+                nonlocal last_evaluated_loss, last_evaluated_step
+                loss_value = float(total_loss.detach().item())
+                if not math.isfinite(loss_value):
+                    return False
+                last_evaluated_loss = loss_value
+                last_evaluated_step = step
+                if loss_value < best_loss:
+                    # Snapshot before optimizer.step: this exact state produced
+                    # total_loss.  The previous implementation snapshotted the
+                    # post-step state while assigning it the pre-step loss.
+                    best_loss = loss_value
+                    # Step zero is the already-snapshotted initial state; reuse
+                    # it to avoid a transient second full-size round tensor.
+                    if step != 0:
+                        best_snapshot = snapshot_auto_round_state(state)
+                    best_step = step
+                return True
 
             if params and iterations > 0:
                 param_groups = [{"params": [state.value], "lr": task.qcfg.lr}]
@@ -160,31 +219,44 @@ class AutoRoundProcessor(GPTQProcessor):
                     param_groups.append({"params": tune_params, "lr": task.qcfg.minmax_lr})
                 optimizer = torch.optim.Adam(param_groups)
 
-                for _ in range(iterations):
+                for step in range(iterations):
                     optimizer.zero_grad(set_to_none=True)
-                    qdq_weight, _, _, _ = auto_round_fake_quantize(base_weight, state)
-                    total_loss = 0.0
-                    for inp, ref_out in zip(inputs, outputs):
-                        pred = self._module_forward(module.module, inp.to(dtype=qdq_weight.dtype), qdq_weight)
-                        total_loss = total_loss + auto_round_loss(pred, ref_out, qcfg=task.qcfg)
+                    total_loss = evaluate_current_state()
+                    if not record_current_candidate(total_loss, step):
+                        optimization_failed = True
+                        break
                     total_loss.backward()
                     optimizer.step()
                     clamp_auto_round_state_(state)
 
-                    loss_value = float(total_loss.detach().item())
-                    if loss_value < best_loss:
-                        best_loss = loss_value
-                        best_snapshot = snapshot_auto_round_state(state)
+                # The final optimizer update has not appeared as the input to
+                # another iteration.  Evaluate it once so every state eligible
+                # for serialization has a loss measured on that exact state.
+                if not optimization_failed:
+                    with torch.no_grad():
+                        final_loss = evaluate_current_state()
+                    if not record_current_candidate(final_loss, iterations):
+                        optimization_failed = True
             else:
-                qdq_weight, _, _, _ = auto_round_fake_quantize(base_weight, state)
-                total_loss = 0.0
-                for inp, ref_out in zip(inputs, outputs):
-                    pred = self._module_forward(module.module, inp.to(dtype=qdq_weight.dtype), qdq_weight)
-                    total_loss = total_loss + auto_round_loss(pred, ref_out, qcfg=task.qcfg)
-                best_loss = float(total_loss.detach().item())
+                with torch.no_grad():
+                    initial_loss = evaluate_current_state()
+                if not record_current_candidate(initial_loss, 0):
+                    optimization_failed = True
 
-            if not task.qcfg.not_use_best_mse:
+            # A non-finite candidate is never allowed to escape, even when the
+            # caller explicitly requests the last state.  Otherwise preserve
+            # not_use_best_mse semantics for finite optimizer trajectories.
+            use_last_state = (
+                task.qcfg.not_use_best_mse
+                and not optimization_failed
+                and not fallback_requested
+                and last_evaluated_loss is not None
+            )
+            if not use_last_state:
                 restore_auto_round_state(state, best_snapshot)
+
+            selected_loss = last_evaluated_loss if use_last_state else best_loss
+            selected_step = last_evaluated_step if use_last_state else best_step
 
             start = time.perf_counter()
             qdq_weight, q_scales, q_zeros, q_g_idx = auto_round_fake_quantize(base_weight, state)
@@ -208,14 +280,24 @@ class AutoRoundProcessor(GPTQProcessor):
                     }
                 )
 
-        nsamples = sum(int(t.shape[0]) if t.ndim > 1 else 1 for t in task.inputs)
+        fallback_reason = None
+        if fallback_requested:
+            fallback_reason = "insufficient_samples"
+        elif optimization_failed:
+            fallback_reason = "non_finite_loss"
+        if fallback_reason is None:
+            loss_display = f"{selected_loss:.10f}"
+        elif math.isfinite(selected_loss):
+            loss_display = f"failsafe(rtn): {selected_loss:.10f}"
+        else:
+            loss_display = "failsafe(rtn): non-finite loss"
         stat = {
             PROCESS_LOG_NAME: self.name(),
             PROCESS_LOG_LAYER: module.layer_index,
             PROCESS_LOG_MODULE: module.name,
             MODULE_FEATURE_COLUMN: self.module_feature_summary(module),
             DTYPE_SIZE_COLUMN: self.module_dtype_size_summary(module),
-            QUANT_LOG_LOSS: f"{best_loss:.10f}",
+            QUANT_LOG_LOSS: loss_display,
             QUANT_LOG_NSAMPLES: f"{nsamples}",
             QUANT_LOG_DAMP: "0.00000",
             PROCESS_LOG_TIME: f"{duration:.3f}",
@@ -224,9 +306,14 @@ class AutoRoundProcessor(GPTQProcessor):
         }
         if self.qcfg.dynamic is not None:
             stat["dynamic"] = self.qcfg.dynamic_get(layer_name=module.full_name)
+        if selected_step is not None:
+            stat["auto_round_best_step"] = str(selected_step)
+        if fallback_reason is not None:
+            stat["auto_round_fallback"] = fallback_reason
 
         with self.lock:
-            self.avg_losses.append(best_loss)
+            if math.isfinite(selected_loss):
+                self.avg_losses.append(selected_loss)
             self.durations.append(duration)
             self.module_names.append(f"layer-{module.layer_index}-{module.name}")
             self.log.append(stat)

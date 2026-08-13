@@ -1513,13 +1513,23 @@ class QuantizeConfig():
             self.vram_strategy.value if isinstance(self.vram_strategy, VramStrategy) else self.vram_strategy
         )
 
+        # AutoRound selects the calibration algorithm; it does not define a
+        # different on-disk packing contract.  These checkpoints use the GPTQ
+        # packing contract and external runtimes (including vLLM) dispatch on
+        # this field, so keep the algorithm identity in ``meta.auto_round`` and
+        # advertise the interoperable storage method here.
+        serialized_quant_method = (
+            METHOD.GPTQ
+            if self.quant_method == METHOD.AUTO_ROUND
+            else self.quant_method
+        )
         out = {
             "bits": self.bits,
             "dynamic": self.dynamic,
             "group_size": self.group_size,
             "desc_act": self.desc_act,
             "lm_head": self.lm_head,
-            QUANT_METHOD_FIELD:self.quant_method,
+            QUANT_METHOD_FIELD: serialized_quant_method,
             FORMAT_FIELD_CHECKPOINT: self.format,
             # torch.dtype convert to string
             PACK_DTYPE_FIELD: str(self.pack_dtype).split(".")[-1],

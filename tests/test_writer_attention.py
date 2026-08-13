@@ -2,11 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import csv
 from types import SimpleNamespace
 
 import pytest
 
-from gptqmodel.models.writer import ModelWriter
+from gptqmodel.models.writer import (
+    PROCESS_LOG_LAYER,
+    PROCESS_LOG_MODULE,
+    PROCESS_LOG_TIME,
+    QUANT_LOG_DAMP,
+    QUANT_LOG_LOSS,
+    QUANT_LOG_NSAMPLES,
+    ModelWriter,
+)
 from gptqmodel.quantization.config import FORMAT, METHOD
 
 
@@ -124,3 +133,28 @@ def test_save_quantized_strips_attention_before_serialization(tmp_path, monkeypa
 
     assert writer.model.config.attn_implementation == "flash_attention_2"
     assert writer.model.config._attn_implementation == "flash_attention_2"
+
+
+def test_save_quantized_writes_samples_in_quant_log_csv(tmp_path, monkeypatch):
+    tracker = {}
+    writer = _build_dummy_model_writer()
+    writer.model = _DummyModel(tracker)
+    writer.quant_log = [{
+        PROCESS_LOG_LAYER: 3,
+        PROCESS_LOG_MODULE: "mlp.experts.7.down_proj",
+        QUANT_LOG_LOSS: "0.125",
+        QUANT_LOG_NSAMPLES: "4096",
+        QUANT_LOG_DAMP: "0.05000",
+        PROCESS_LOG_TIME: "0.250",
+    }]
+    monkeypatch.setattr("gptqmodel.models.writer.get_model_files_size", lambda _: 1)
+
+    with pytest.raises(RuntimeError, match="stop after checks"):
+        writer.save_quantized(save_dir=str(tmp_path))
+
+    with (tmp_path / "quant_log.csv").open(newline="") as handle:
+        rows = list(csv.reader(handle))
+    assert rows == [
+        ["layer", "module", "loss", "samples", "damp", "time"],
+        ["3", "mlp.experts.7.down_proj", "0.125", "4096", "0.05000", "0.250"],
+    ]
