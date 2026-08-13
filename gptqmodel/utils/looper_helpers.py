@@ -71,6 +71,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "device_ctx",
+    "module_forward_autocast",
     "rehome_module_to_device",
     "clear_non_picklable_state",
     "select_forward_devices",
@@ -98,6 +99,27 @@ def device_ctx(dev: Optional[torch.device | "DEVICE"]):
 
     # cpu/mps/meta -> nothing special needed
     yield
+
+
+@contextmanager
+def module_forward_autocast(module: torch.nn.Module, device: torch.device):
+    """Enable an opt-in autocast context for cached layer replay.
+
+    A few model families deliberately keep numerically sensitive normalization
+    and routing parameters in fp32 while their linear weights remain fp16 or
+    bf16.  Their normal inference path relies on autocast to bridge those
+    dtypes.  Quantization replays decoder layers directly, so preserve that
+    contract when the model definition marks the materialized layer.
+    """
+
+    dtype = getattr(module, "_gptqmodel_replay_autocast_dtype", None)
+    device = torch.device(device)
+    if dtype is None or device.type not in {"cpu", "cuda", "xpu"}:
+        yield
+        return
+
+    with torch.autocast(device_type=device.type, dtype=dtype):
+        yield
 
 _rehome_lock = threading.Lock()
 
@@ -408,10 +430,11 @@ def forward_batch_worker(
     module_output = None
     kv_next = None
     try:
-        if is_lm_head_module:
-            module_output = module(*inputs)
-        else:
-            module_output = module(*inputs, **additional_inputs)
+        with module_forward_autocast(module, module_device):
+            if is_lm_head_module:
+                module_output = module(*inputs)
+            else:
+                module_output = module(*inputs, **additional_inputs)
     except StopForward:
         module_output = None
     finally:

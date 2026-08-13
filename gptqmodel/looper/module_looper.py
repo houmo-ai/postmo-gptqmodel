@@ -48,6 +48,7 @@ from ..utils.looper_helpers import (
     clone_module_for_devices,
     device_ctx,
     forward_batch_worker,
+    module_forward_autocast,
     normalize_device_like,
     rehome_module_to_device,
     select_forward_devices,
@@ -991,10 +992,11 @@ class ModuleLooper():
                 with self.MoERoutingOverrideContext(module, self.moe_routing_override) if self.moe_routing_override else self.MoELifecycleContext(self, module, processor, self._current_subset) if self.moe_routing_bypass else nullcontext():
                     module_output = None
                     try:
-                        if is_lm_head_module:
-                            module_output = module(*layer_input)
-                        else:
-                            module_output = module(*layer_input, **additional_inputs)
+                        with module_forward_autocast(module, exec_device):
+                            if is_lm_head_module:
+                                module_output = module(*layer_input)
+                            else:
+                                module_output = module(*layer_input, **additional_inputs)
                     except StopForward:
                         module_output = None
                     finally:
@@ -1387,12 +1389,13 @@ class ModuleLooper():
 
         return pre_hook
 
-    def cache_inputs(self, layers, calibration_data, use_cache):
+    def cache_inputs(self, layers, calibration_data, use_cache, layer_names=None):
         capture_stage = StageInputsCapture(self, logger=log)
         return capture_stage.cache_inputs(
             layers=layers,
             calibration_data=calibration_data,
             use_cache=use_cache,
+            layer_names=layer_names,
         )
 
     def loop(self, failsafe=None, **kwargs):
@@ -1447,6 +1450,7 @@ class ModuleLooper():
                 continue
 
             input_cache = self.cache_inputs(layers=layers,
+                                            layer_names=layer_names,
                                             calibration_data=processor.calibration_dataset,
                                             use_cache=False)
             processor.receive_input_cache(input_cache)

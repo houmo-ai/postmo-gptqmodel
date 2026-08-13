@@ -13,6 +13,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 
 from gptqmodel.utils.model import (
     _try_load_checkpoint_with_transformers_conversion,
+    load_checkpoint_in_model_then_tie_weights,
 )
 
 
@@ -33,6 +34,10 @@ class _MixedTinyModel(_TinyModel):
     def __init__(self, config):
         super().__init__(config)
         self.register_buffer("exact_buffer", torch.zeros(2))
+
+
+class _StrictFp32TinyModel(_TinyModel):
+    _keep_in_fp32_modules_strict = ["frontend"]
 
 
 @pytest.mark.skipif(
@@ -245,3 +250,23 @@ def test_transformers_checkpoint_conversion_unavailable_uses_fast_path(
     )
 
     assert converted is False
+
+
+def test_exact_key_accelerate_load_honors_strict_fp32_dtype_plan(tmp_path):
+    checkpoint = tmp_path / "model.safetensors"
+    expected = torch.tensor(
+        [[1.0001, 1.0002], [1.0003, 1.0004]],
+        dtype=torch.float32,
+    )
+    save_file({"frontend.weight": expected}, checkpoint)
+
+    model = _StrictFp32TinyModel(_TinyConfig())
+    load_checkpoint_in_model_then_tie_weights(
+        model,
+        checkpoint=str(checkpoint),
+        device_map={"": "cpu"},
+        dtype=torch.float16,
+    )
+
+    assert model.frontend.weight.dtype == torch.float32
+    torch.testing.assert_close(model.frontend.weight, expected, rtol=0, atol=0)

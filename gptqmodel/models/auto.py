@@ -86,6 +86,7 @@ from .definitions.decilm import DeciLMQModel  # noqa: E402
 from .definitions.deepseek_v2 import DeepSeekV2QModel  # noqa: E402
 from .definitions.deepseek_v2_ocr import DeepSeekV2OCRQModel  # noqa: E402
 from .definitions.deepseek_v3 import DeepSeekV3QModel  # noqa: E402
+from .definitions.deepseek_v4 import DeepSeekV4QModel  # noqa: E402
 from .definitions.dots1 import Dots1QModel  # noqa: E402
 from .definitions.dream import DreamQModel  # noqa: E402
 from .definitions.ernie4_5 import Ernie4_5QModel  # noqa: E402
@@ -283,6 +284,7 @@ MODEL_MAP = {
     "dbrx_converted": DbrxConvertedQModel,
     "deepseek_v2_ocr": DeepSeekV2OCRQModel,
     "deepseek_v3": DeepSeekV3QModel,
+    "deepseek_v4": DeepSeekV4QModel,
     "dots1": Dots1QModel,
     "exaone": ExaOneQModel,
     "exaone4": Exaone4QModel,

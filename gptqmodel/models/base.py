@@ -366,6 +366,12 @@ class BaseQModel(nn.Module):
     # some models have broken attention mask codes so we need to only use batch 1 with no masks
     support_batch_quantize = True
 
+    # Optional dtype used by decoder-layer replay during quantization.  Models
+    # that intentionally mix fp32 normalization/routing parameters with lower
+    # precision linear weights can opt in to the same autocast contract used by
+    # their regular inference path.
+    replay_autocast_dtype: Optional[torch.dtype] = None
+
     # allow models to define optional notes that output messages to users that want to use this model
     # list of supported keys: [ "notes" = print the notes value on model load ]
     info: Dict[str, str] = {}
@@ -1473,14 +1479,16 @@ class BaseQModel(nn.Module):
 
     def pre_quantize(self, module: nn.Module) -> nn.Module:
         if get_device(module) == META:
-            return self.shell_module_materialize(
+            module = self.shell_module_materialize(
                 target_submodule=module,
                 device=self.quantize_config.device,
             )
         elif get_device(module) == CPU and self.quantize_config.device != CPU:
-            return move_to(module, device=self.quantize_config.device)
-        else:
-            return module
+            module = move_to(module, device=self.quantize_config.device)
+
+        if self.replay_autocast_dtype is not None:
+            module._gptqmodel_replay_autocast_dtype = self.replay_autocast_dtype
+        return module
 
     def post_quantize(self, module: nn.Module) -> nn.Module:
         #return self.offload_to_disk(module=module)
@@ -1926,6 +1934,11 @@ class BaseQModel(nn.Module):
                         low_cpu_mem_usage=True,
                         **reload_kwargs,
                     )
+                    # Keep a reloaded source model structurally aligned with
+                    # the already-defused shell used by disk-offload mode.
+                    import defuser
+
+                    defuser.convert_model(new_model, cleanup_original=False)
                     new_model._model_init_kwargs = reload_kwargs
                     new_model.eval()
                     self.turtle_model = new_model
@@ -1942,6 +1955,7 @@ class BaseQModel(nn.Module):
             target_submodule: torch.nn.Module,
             device: torch.device,
             non_blocking: bool = False,
+            module_path: Optional[str] = None,
     ) -> torch.nn.Module:
         with self._turtle_lock:
             turtle_model = self.turtle_model
@@ -1957,6 +1971,7 @@ class BaseQModel(nn.Module):
                 turtle_model=turtle_model,
                 target_submodule=target_submodule,
                 device=device,
+                module_path=module_path,
             )
         self._maybe_auto_reload_after_alias(module, target_submodule)
         return module

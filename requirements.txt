@@ -22,7 +22,7 @@ pyarrow>=21.0
 dill>=0.3.8
 torchao>=0.14.1
 kernels>=0.12.2
-defuser>=0.0.6
+defuser>=0.0.25
 py-cpuinfo
 tqdm
 pydantic

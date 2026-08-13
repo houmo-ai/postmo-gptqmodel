@@ -189,8 +189,19 @@ def move_to(obj: torch.Tensor | nn.Module, device: torch.device, dtype: torch.dt
 def nested_move_to(v, device, dtype: torch.dtype = None):
     if isinstance(v, torch.Tensor):
         return move_to(v, device=device, dtype=dtype)
+
+    elif isinstance(v, dict):
+        return {
+            k: nested_move_to(val, device=device, dtype=dtype)
+            for k, val in v.items()
+        }
+
     elif isinstance(v, (list, tuple)):
-        return type(v)([nested_move_to(e, device=device, dtype=dtype) for e in v])
+        return type(v)(
+            nested_move_to(e, device=device, dtype=dtype)
+            for e in v
+        )
+
     else:
         return v
 
@@ -728,6 +739,20 @@ def convert_gptq_v1_to_v2_format_module(module: BaseQuantLinear, bits: int, pack
     module.qzero_format(format=2)
     return module
 
+
+def _module_qzero_format(module: BaseQuantLinear, quantize_config: QuantizeConfig) -> tuple[int, torch.dtype]:
+    """Resolve qzero packing from the physical module, including dynamic overrides.
+
+    Mixed-precision checkpoints carry one global QuantizeConfig plus per-module
+    bit widths.  The qzero offset is a packed-bit pattern, so using the global
+    width for a W4 module inside a W8 model produces a non-standard checkpoint.
+    """
+
+    bits = int(getattr(module, "bits", quantize_config.bits))
+    pack_dtype = getattr(module, "pack_dtype", quantize_config.pack_dtype)
+    return bits, pack_dtype
+
+
 # Optionally convert weight from gptq_v1 to v2 format if Kernel is compatible with v2
 @torch.inference_mode()
 def convert_gptq_v1_to_v2_format(
@@ -755,7 +780,11 @@ def convert_gptq_v1_to_v2_format(
         if isinstance(submodule, BaseQuantLinear) and (
             isinstance(submodule, qlinear_kernel) or getattr(submodule, "REQUIRES_FORMAT_V2", False)
         ):
-            convert_gptq_v1_to_v2_format_module(module=submodule, bits=cfg.bits, pack_dtype=cfg.pack_dtype)
+            convert_gptq_v1_to_v2_format_module(
+                module=submodule,
+                bits=int(getattr(submodule, "bits", cfg.bits)),
+                pack_dtype=getattr(submodule, "pack_dtype", cfg.pack_dtype),
+            )
 
         #log.info(f"Format: Conversion complete: {time.time() - t}s")
 
@@ -785,22 +814,47 @@ def convert_gptq_v2_to_v1_format_module(
 
     log.info.once("Format: Converting GPTQ v2 to v1")
 
-    if quantize_config.bits == 2:
-        module.qzeros.data -= 0b01010101010101010101010101010101
-    elif quantize_config.bits == 3:
-        module.qzeros.data[:, range(0, module.qzeros.data.shape[1], 3)] -= (
-            0b00100100100100100100100100100100
-        )
-        module.qzeros.data[:, range(1, module.qzeros.data.shape[1], 3)] -= (
-            0b10010010010010010010010010010010
-        )
-        module.qzeros.data[:, range(2, module.qzeros.data.shape[1], 3)] -= (
-            0b01001001001001001001001001001001
-        )
-    elif quantize_config.bits == 4:
-        module.qzeros.data -= 0b00010001000100010001000100010001
-    elif quantize_config.bits == 8 or quantize_config.bits == 5:
-        module.qzeros.data -= 0b00000001000000010000000100000001
+    bits, pack_dtype = _module_qzero_format(module, quantize_config)
+
+    if bits == 2:
+        offsets = {
+            torch.int64: 0x5555555555555555,
+            torch.int32: 0x55555555,
+            torch.int16: 0x5555,
+            torch.int8: 0x55,
+        }
+        module.qzeros.data -= offsets[pack_dtype]
+    elif bits == 3:
+        offsets = {
+            torch.int64: (0x2492492492492492, 0x9249249249249249, 0x4924924924924924),
+            torch.int32: (0x24924924, 0x92492492, 0x49249249),
+            torch.int16: (0x2492, 0x9249, 0x4924),
+            torch.int8: (0x24, 0x92, 0x49),
+        }[pack_dtype]
+        for column, offset in enumerate(offsets):
+            # Construct through the storage dtype so unsigned-looking bit
+            # patterns (for example 0x92 in int8) retain two's-complement
+            # semantics without Python integer overflow errors.
+            if pack_dtype is torch.int64 and offset >= 2**63:
+                offset -= 2**64
+            typed_offset = torch.tensor(offset, dtype=torch.int64).to(pack_dtype)
+            module.qzeros.data[:, range(column, module.qzeros.data.shape[1], 3)] -= typed_offset
+    elif bits == 4:
+        offsets = {
+            torch.int64: 0x1111111111111111,
+            torch.int32: 0x11111111,
+            torch.int16: 0x1111,
+            torch.int8: 0x11,
+        }
+        module.qzeros.data -= offsets[pack_dtype]
+    elif bits == 8 or bits == 5:
+        offsets = {
+            torch.int64: 0x0101010101010101,
+            torch.int32: 0x01010101,
+            torch.int16: 0x0101,
+            torch.int8: 0x01,
+        }
+        module.qzeros.data -= offsets[pack_dtype]
     else:
         raise NotImplementedError("Only 2,3,4,8 bits are supported.")
 
@@ -1926,6 +1980,24 @@ def load_checkpoint_in_model_then_tie_weights(model, *args, **kwargs):
         hf_key_mapping=hf_key_mapping,
     )
     if not converted:
+        # Accelerate's literal-key loader predates Transformers' dtype plan.
+        # Forward the FP32 subset explicitly on its FP16 path so exact-key
+        # quantized checkpoints do not silently downcast mHC/Sinkhorn and other
+        # numerically sensitive parameters.  Renamed checkpoints use the
+        # Transformers loader above, which already receives the full plan.
+        dtype = kwargs.get("dtype")
+        if (
+            dtype == torch.float16
+            and kwargs.get("keep_in_fp32_modules") is None
+            and callable(getattr(model, "_get_dtype_plan", None))
+        ):
+            dtype_plan = model._get_dtype_plan(dtype)
+            fp32_modules = [
+                name for name, planned_dtype in dtype_plan.items()
+                if planned_dtype == torch.float32
+            ]
+            if fp32_modules:
+                kwargs["keep_in_fp32_modules"] = fp32_modules
         accelerate.load_checkpoint_in_model(model, *args, **kwargs)
     model.tie_weights()
 

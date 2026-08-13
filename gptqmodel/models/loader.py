@@ -286,6 +286,11 @@ def ModelLoader(cls):
                     low_cpu_mem_usage=True,
                     **model_init_kwargs,
                 )
+                # The meta shell is defused above, so the checkpoint-backed
+                # source model must expose the same module/parameter names for
+                # per-submodule materialization.  Use Defuser's official model
+                # conversion on both sides instead of maintaining an alias shim.
+                defuser.convert_model(turtle_model, cleanup_original=False)
             finally:
                 turtle_spinner.close()
 

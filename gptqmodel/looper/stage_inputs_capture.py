@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence
 
 import torch
 
@@ -39,6 +39,7 @@ class StageInputsCapture:
         layers: Sequence[torch.nn.Module],
         calibration_data: Iterable[Dict[str, torch.Tensor]],
         use_cache: bool,
+        layer_names: Optional[List[str]] = None,
     ) -> InputCache:
         layer_inputs: List[List[torch.Tensor]] = []
         attention_masks: List[torch.Tensor | None] = []
@@ -50,13 +51,31 @@ class StageInputsCapture:
         layer_label = None
         if layers:
             first_layer = layers[0]
-            layer_label = getattr(first_layer, "full_name", None)
-            if layer_label is None:
-                layer_label = getattr(getattr(first_layer, "__class__", None), "__name__", None)
-            if layer_label is None:
-                layer_label = type(first_layer).__name__
+            full_name = getattr(first_layer, "full_name", None)
+            module_path = None
+            if layer_names and layer_names[0]:
+                module_path = layer_names[0]
+                if full_name and full_name != module_path:
+                    self.logger.warn(
+                        f"cache_inputs: using caller-supplied layer_name {module_path!r} "
+                        f"instead of layer.full_name {full_name!r} for materialization"
+                    )
+            elif full_name:
+                module_path = full_name
+            if not module_path:
+                for name, mod in self.gptq_model.model.named_modules():
+                    if mod is first_layer:
+                        module_path = name
+                        break
+
+            # A class name is useful for display, but is not a valid checkpoint
+            # path and must never be sent to the materializer.
+            layer_label = module_path or full_name or getattr(
+                getattr(first_layer, "__class__", None), "__name__", None
+            ) or type(first_layer).__name__
             capture_source = f"cache_inputs:{layer_label}"
         else:
+            module_path = None
             capture_source = "cache_inputs"
         start_time = time.perf_counter() if timer else None
 
@@ -81,6 +100,7 @@ class StageInputsCapture:
         layers[0] = self.gptq_model.shell_module_materialize(
             target_submodule=layers[0],
             device=CPU,
+            module_path=module_path,
         )
         cur_layer_device = CPU
         data_device = cur_layer_device
@@ -134,6 +154,12 @@ class StageInputsCapture:
             # and wait for the first instance this callback is called
             raise STOP_FORWARD_EXCEPTION
 
+        def _resolve_module_name(mod: torch.nn.Module) -> Optional[str]:
+            for name, candidate in self.gptq_model.model.named_modules():
+                if candidate is mod:
+                    return name
+            return None
+
         ori_outside_layer_module_devices: Dict[str, torch.device] = {}
         for module_name in self.gptq_model.get_base_modules(self.gptq_model.model):
             module, _ = get_module_by_name_prefix(self.gptq_model.model, [module_name])
@@ -146,6 +172,7 @@ class StageInputsCapture:
             self.gptq_model.shell_module_materialize(
                 target_submodule=module,
                 device=cur_layer_device,
+                module_path=_resolve_module_name(module),
             )
 
         handle = layers[0].register_forward_pre_hook(store_input_hook, with_kwargs=True)
