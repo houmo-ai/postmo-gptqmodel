@@ -36,7 +36,9 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help=(
             "Opt-in only: the validated Ling recipe keeps disk offload "
-            "disabled; revalidate the resulting checkpoint when enabling it"
+            "disabled because the related Qwen3.5 hybrid/MoE path has "
+            "produced invalid quantized checkpoints; revalidate the result "
+            "when enabling it"
         ),
     )
     parser.add_argument("--offload-path")
