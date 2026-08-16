@@ -39,7 +39,6 @@ class StageInputsCapture:
         layers: Sequence[torch.nn.Module],
         calibration_data: Iterable[Dict[str, torch.Tensor]],
         use_cache: bool,
-        layer_names: Optional[List[str]] = None,
     ) -> InputCache:
         layer_inputs: List[List[torch.Tensor]] = []
         attention_masks: List[torch.Tensor | None] = []
@@ -53,20 +52,12 @@ class StageInputsCapture:
             first_layer = layers[0]
             full_name = getattr(first_layer, "full_name", None)
             module_path = None
-            if layer_names and layer_names[0]:
-                module_path = layer_names[0]
-                if full_name and full_name != module_path:
-                    self.logger.warn(
-                        f"cache_inputs: using caller-supplied layer_name {module_path!r} "
-                        f"instead of layer.full_name {full_name!r} for materialization"
-                    )
-            elif full_name:
-                module_path = full_name
+            for name, mod in self.gptq_model.model.named_modules():
+                if mod is first_layer:
+                    module_path = name
+                    break
             if not module_path:
-                for name, mod in self.gptq_model.model.named_modules():
-                    if mod is first_layer:
-                        module_path = name
-                        break
+                module_path = full_name
 
             # A class name is useful for display, but is not a valid checkpoint
             # path and must never be sent to the materializer.

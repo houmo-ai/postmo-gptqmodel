@@ -53,6 +53,86 @@ def test_cache_inputs_delegates_to_stage_capture(monkeypatch):
     assert captured["kwargs"]["calibration_data"] is data
 
 
+def test_loop_does_not_reference_unbound_layer_names(monkeypatch):
+    """The generic looper relies on capture's model-tree path resolution."""
+
+    class _StopLoop(Exception):
+        pass
+
+    class _Processor:
+        calibration_dataset = []
+
+        def verify_calibration_dataset(self, _index):
+            return True
+
+        def receive_input_cache(self, input_cache):
+            self.input_cache = input_cache
+
+        def release_calibration_dataset(self):
+            pass
+
+    layers = [torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)]
+    config = types.SimpleNamespace(
+        lm_head=False,
+        true_sequential=True,
+        offload_to_disk=False,
+        failsafe=None,
+    )
+    model = types.SimpleNamespace(config=types.SimpleNamespace(use_cache=True))
+    qmodel = types.SimpleNamespace(
+        model=model,
+        quantize_config=config,
+        quant_region_timer=None,
+        extract_layers_node=lambda: ["model.layers"],
+        full_layer_modules=lambda **_: [["weight"]],
+        simple_layer_modules=lambda **_: [["weight"]],
+    )
+    processor = _Processor()
+    looper = ModuleLooper.__new__(ModuleLooper)
+    looper.gptq_model = qmodel
+    looper.processors = [processor]
+
+    captured = {}
+
+    def fake_cache_inputs(**kwargs):
+        captured["kwargs"] = kwargs
+        return object()
+
+    class _Progress:
+        def manual(self):
+            return self
+
+        def set(self, **_kwargs):
+            return self
+
+    monkeypatch.setattr(
+        "gptqmodel.looper.module_looper.get_module_by_name_prefix",
+        lambda *_args, **_kwargs: (layers, "model.layers"),
+    )
+    monkeypatch.setattr(looper, "cache_inputs", fake_cache_inputs)
+    monkeypatch.setattr(
+        "gptqmodel.looper.module_looper.log.pb",
+        lambda *_args, **_kwargs: _Progress(),
+    )
+
+    def stop_after_capture(*_args, **_kwargs):
+        raise _StopLoop
+
+    monkeypatch.setattr(
+        "gptqmodel.looper.module_looper.run_layer_stage",
+        stop_after_capture,
+    )
+
+    try:
+        looper._loop_impl()
+    except _StopLoop:
+        pass
+    else:
+        raise AssertionError("the test hook did not stop the layer stage")
+
+    assert "layer_names" not in captured["kwargs"]
+
+
 class _TinyLayer(torch.nn.Module):
     def forward(self, hidden_states, attention_mask=None, position_ids=None, **kwargs):
         return hidden_states
@@ -86,7 +166,7 @@ class _TinyGptqModel:
         self._hook_started = False
         self._hook_finished = False
 
-    def shell_module_materialize(self, target_submodule, device):
+    def shell_module_materialize(self, target_submodule, device, module_path=None):
         target_submodule.to(device)
         return target_submodule
 
@@ -98,6 +178,9 @@ class _TinyGptqModel:
 
     def pre_quantize_generate_hook_end(self):
         self._hook_finished = True
+
+    def build_layer_extra_inputs_cache(self, _example, _device):
+        return None
 
 
 class _TinyLooper:
@@ -272,6 +355,9 @@ def test_run_layer_stage_invokes_subset_stage(monkeypatch):
 
         def lm_head_pre_quantize_generate_hook(self, value):
             return value
+
+        def prepare_layer_inputs_for_quantize(self, layer_inputs, _input_cache, _layer_index):
+            return layer_inputs
 
     class DummyLooper:
         def __init__(self):
