@@ -54,7 +54,7 @@ def test_cache_inputs_delegates_to_stage_capture(monkeypatch):
 
 
 def test_loop_does_not_reference_unbound_layer_names(monkeypatch):
-    """The generic looper relies on capture's model-tree path resolution."""
+    """The generic looper does not carry checkpoint-path state."""
 
     class _StopLoop(Exception):
         pass
@@ -166,7 +166,7 @@ class _TinyGptqModel:
         self._hook_started = False
         self._hook_finished = False
 
-    def shell_module_materialize(self, target_submodule, device, module_path=None):
+    def shell_module_materialize(self, target_submodule, device):
         target_submodule.to(device)
         return target_submodule
 

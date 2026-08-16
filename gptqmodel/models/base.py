@@ -1955,7 +1955,6 @@ class BaseQModel(nn.Module):
             target_submodule: torch.nn.Module,
             device: torch.device,
             non_blocking: bool = False,
-            module_path: Optional[str] = None,
     ) -> torch.nn.Module:
         with self._turtle_lock:
             turtle_model = self.turtle_model
@@ -1971,7 +1970,6 @@ class BaseQModel(nn.Module):
                 turtle_model=turtle_model,
                 target_submodule=target_submodule,
                 device=device,
-                module_path=module_path,
             )
         self._maybe_auto_reload_after_alias(module, target_submodule)
         return module

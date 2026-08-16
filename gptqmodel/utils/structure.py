@@ -524,18 +524,19 @@ def alias_from_turtle_for_submodule(
     target_submodule: torch.nn.Module,
     device: torch.device,
     non_blocking: bool = False,
-    module_path: Optional[str] = None,
 ) -> torch.nn.Module:
     # removed cpu from list to allow materialize from meta to cpu
     assert device not in [None, torch.device("meta")]
     # print(f"alias device = {device}")
 
     # Resolve path & source submodule (on CPU/mmap)
-    path = module_path or _get_qualified_name(target_model, target_submodule)
-    src_map: Dict[str, nn.Module] = dict(turtle_model.named_modules())
-    if path not in src_map:
-        raise KeyError(f"Path '{path}' not found in turtle_model.")
-    src_sub = src_map[path]
+    path = _get_qualified_name(target_model, target_submodule)
+    try:
+        src_sub = turtle_model.get_submodule(path)
+    except AttributeError as exc:
+        raise KeyError(
+            f"Path '{path}' resolved from target_model but was not found in turtle_model."
+        ) from exc
 
     # ---- copy params/buffers CPU->GPU into target_submodule (your existing code) ----
     t_params = dict(target_submodule.named_parameters(recurse=True))
