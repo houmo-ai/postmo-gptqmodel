@@ -263,6 +263,7 @@ def make_quant(
     pack: bool = False,
     device: DEVICE = None,
     from_quantized: bool = False,
+    allow_meta: bool = False,
 ) -> Type[BaseQuantLinear]:
 
     bits = qcfg.bits
@@ -294,6 +295,7 @@ def make_quant(
             backend=backend,
             lm_head_name=lm_head_name,
             device=device,
+            allow_meta=allow_meta,
         )
 
     # returns multiple validated kernels
@@ -337,6 +339,7 @@ def make_quant(
                 pack_dtype=pack_dtype,
                 backend=backend,
                 adapter=qcfg.adapter,
+                allow_meta=allow_meta,
             )
             log.info(f"Kernel: selected -> `{linear_cls.__name__}`.")
             return linear_cls
@@ -357,6 +360,7 @@ def _make_quant_per_layer_dynamic(
     backend: BACKEND,
     lm_head_name: str,
     device: DEVICE,
+    allow_meta: bool = False,
 ) -> Type[BaseQuantLinear]:
     """Per-layer kernel selection for models with `dynamic` config.
 
@@ -458,6 +462,7 @@ def _make_quant_per_layer_dynamic(
             pack_dtype=base_pack_dtype,
             backend=backend,
             adapter=adapter,
+            allow_meta=allow_meta,
         )
 
     if chosen_classes:
@@ -491,6 +496,7 @@ def create_quant_module(
     backend: BACKEND = BACKEND.AUTO,
     register_buffers: bool = True,
     adapter: Optional[Adapter] = None,
+    allow_meta: bool = False,
 
 ):
     # unwrap named module
@@ -506,9 +512,13 @@ def create_quant_module(
     else:
         ori_layer_device = submodule.list_buffers()[0].device
 
-    if ori_layer_device.type != CPU.type:
+    allowed_device_types = {CPU.type}
+    if allow_meta:
+        allowed_device_types.add("meta")
+    if ori_layer_device.type not in allowed_device_types:
         raise AssertionError(
-            f"Expected `{name}` to reside on CPU during quant module creation, "
+            f"Expected `{name}` to reside on "
+            f"{'CPU or meta' if allow_meta else 'CPU'} during quant module creation, "
             f"but found tensors on `{ori_layer_device}`."
         )
 
@@ -605,6 +615,7 @@ def create_quant_layer(
         pack_dtype: torch.dtype,
         backend: BACKEND,
         adapter: Optional[Adapter] = None,
+        allow_meta: bool = False,
 
 ) -> Type[BaseQuantLinear]:
     if isinstance(module, linear_cls):
@@ -629,6 +640,7 @@ def create_quant_layer(
             pack_dtype=pack_dtype,
             backend=backend,
             adapter=adapter,
+            allow_meta=allow_meta,
         )
 
     return linear_cls

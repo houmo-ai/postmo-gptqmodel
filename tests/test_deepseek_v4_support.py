@@ -48,9 +48,13 @@ def test_deepseek_v4_replays_mixed_precision_layers_under_bfloat16_autocast():
     assert DeepSeekV4QModel.replay_autocast_dtype is torch.bfloat16
 
 
-def test_deepseek_v4_disables_full_turtle_auto_reload():
+def test_deepseek_v4_uses_shared_turtle_reload_policy(monkeypatch):
+    monkeypatch.delenv("GPTQMODEL_RELOAD_THRESHOLD", raising=False)
     model = DeepSeekV4QModel.__new__(DeepSeekV4QModel)
-    assert model._resolve_turtle_reload_threshold() == 0
+    model.quantize_config = SimpleNamespace(offload_to_disk=True)
+
+    assert "_resolve_turtle_reload_threshold" not in DeepSeekV4QModel.__dict__
+    assert model._resolve_turtle_reload_threshold() == 512 * 1024**2
 
 
 def test_nested_move_to_moves_deepseek_v4_position_embedding_dict():

@@ -130,10 +130,14 @@ def patch_position_embeddings(model, seqlen):
                 cached_pos[0].to(hidden_states.device),
                 cached_pos[1].to(hidden_states.device),
             )
+            shared_kv_states = kwargs.pop("shared_kv_states", None)
             return orig_fwd(
                 self,
                 hidden_states,
                 per_layer_input=per_layer_input,
+                shared_kv_states=(
+                    shared_kv_states if shared_kv_states is not None else {}
+                ),
                 position_embeddings=correct_pos,
                 attention_mask=attention_mask,
                 position_ids=position_ids,

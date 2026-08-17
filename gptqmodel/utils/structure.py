@@ -531,12 +531,10 @@ def alias_from_turtle_for_submodule(
 
     # Resolve path & source submodule (on CPU/mmap)
     path = _get_qualified_name(target_model, target_submodule)
-    try:
-        src_sub = turtle_model.get_submodule(path)
-    except AttributeError as exc:
-        raise KeyError(
-            f"Path '{path}' resolved from target_model but was not found in turtle_model."
-        ) from exc
+    src_map: Dict[str, nn.Module] = dict(turtle_model.named_modules())
+    if path not in src_map:
+        raise KeyError(f"Path '{path}' not found in turtle_model.")
+    src_sub = src_map[path]
 
     # ---- copy params/buffers CPU->GPU into target_submodule (your existing code) ----
     t_params = dict(target_submodule.named_parameters(recurse=True))

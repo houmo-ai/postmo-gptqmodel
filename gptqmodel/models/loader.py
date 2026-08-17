@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Union
 
 import torch
 import transformers
+from accelerate import init_empty_weights
 
 from ..utils.modelscope import ensure_modelscope_available
 from ..utils.structure import print_module_tree
@@ -286,11 +287,6 @@ def ModelLoader(cls):
                     low_cpu_mem_usage=True,
                     **model_init_kwargs,
                 )
-                # The meta shell is defused above, so the checkpoint-backed
-                # source model must expose the same module/parameter names for
-                # per-submodule materialization.  Use Defuser's official model
-                # conversion on both sides instead of maintaining an alias shim.
-                defuser.convert_model(turtle_model, cleanup_original=False)
             finally:
                 turtle_spinner.close()
 
@@ -348,6 +344,7 @@ def ModelLoader(cls):
             adapter: Optional[Adapter] = None,
             dtype: [str | torch.dtype] = "auto",
             trust_remote_code: bool = False,
+            use_meta_shell: bool = False,
             **kwargs,
     ):
 
@@ -570,7 +567,16 @@ def ModelLoader(cls):
 
         transformers.modeling_utils._init_weights = False
 
-        init_contexts = [no_init_weights()]
+        if use_meta_shell:
+            log.info("Loader: constructing the quantized model shell on meta device")
+            # Keep model-created buffers (for example non-persistent rotary
+            # frequencies) materialized. They are not necessarily present in
+            # the checkpoint. QuantLinear buffers are created under a nested
+            # include_buffers=True context below so the packed checkpoint can
+            # materialize them directly without allocating zero-filled copies.
+            init_contexts = [init_empty_weights(include_buffers=False)]
+        else:
+            init_contexts = [no_init_weights()]
 
         with (ContextManagers(init_contexts)):
             cls.before_model_load(cls, load_quantized_model=True)
@@ -674,14 +680,26 @@ def ModelLoader(cls):
                     f"Loader: {skipped_missing_qweight} modules have no `.qweight` in checkpoint and were left unquantized."
                 )
 
-            preload_qlinear_kernel = make_quant(
-                model,
-                qcfg=qcfg,
-                quant_result=modules,
-                backend=backend,
-                lm_head_name=cls.lm_head,
-                device=device,
-            )
+            if use_meta_shell:
+                with init_empty_weights(include_buffers=True):
+                    preload_qlinear_kernel = make_quant(
+                        model,
+                        qcfg=qcfg,
+                        quant_result=modules,
+                        backend=backend,
+                        lm_head_name=cls.lm_head,
+                        device=device,
+                        allow_meta=True,
+                    )
+            else:
+                preload_qlinear_kernel = make_quant(
+                    model,
+                    qcfg=qcfg,
+                    quant_result=modules,
+                    backend=backend,
+                    lm_head_name=cls.lm_head,
+                    device=device,
+                )
 
         if isinstance(device_map, str) and device_map not in [
                 "auto",
@@ -898,8 +916,12 @@ def ModelLoader(cls):
                 # This is very hacky but works due to https://github.com/huggingface/accelerate/blob/bd72a5f1a80d5146554458823f8aeda0a9db5297/src/accelerate/utils/modeling.py#L292
                 checkpoint=model_save_name,
                 device_map=device_map,
-                offload_state_dict=True,
-                offload_buffers=True,
+                # A meta shell has no resident dense state to protect from a
+                # checkpoint-sized peak. Load each shard directly into its
+                # final packed buffers instead of duplicating the checkpoint
+                # through a temporary offload directory.
+                offload_state_dict=not use_meta_shell,
+                offload_buffers=not use_meta_shell,
                 hf_key_mapping=cls.HF_KEY_MAPPING,
             )
 
@@ -977,6 +999,19 @@ def ModelLoader(cls):
                 # offload_buffers=True,
                 hf_key_mapping=cls.HF_KEY_MAPPING,
             )
+
+        if use_meta_shell:
+            remaining_meta = [
+                name
+                for name, tensor in chain(model.named_parameters(), model.named_buffers())
+                if tensor.device.type == "meta"
+            ]
+            if remaining_meta:
+                preview = ", ".join(remaining_meta[:8])
+                raise RuntimeError(
+                    "Quantized meta shell was not fully materialized from the checkpoint: "
+                    f"remaining={len(remaining_meta)}, first=[{preview}]"
+                )
 
         # TODO: Why are we using this custom function and not dispatch_model?
         model = simple_dispatch_model(model, device_map)

@@ -1934,11 +1934,6 @@ class BaseQModel(nn.Module):
                         low_cpu_mem_usage=True,
                         **reload_kwargs,
                     )
-                    # Keep a reloaded source model structurally aligned with
-                    # the already-defused shell used by disk-offload mode.
-                    import defuser
-
-                    defuser.convert_model(new_model, cleanup_original=False)
                     new_model._model_init_kwargs = reload_kwargs
                     new_model.eval()
                     self.turtle_model = new_model

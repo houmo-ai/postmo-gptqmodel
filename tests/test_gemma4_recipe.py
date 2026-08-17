@@ -259,13 +259,19 @@ def test_gemma4_autoround_defaults_and_forwards_positive_scale_data_type(script_
     assert autoround_data_types == ["args.data_type"]
 
 
-def test_autoround_patch_supplies_unified_shared_kv_dictionary():
+@pytest.mark.parametrize(
+    ("script_path", "patch_kwargs"),
+    [
+        ("scripts_gemma4/quantize.py", {"device": "cpu"}),
+        ("scripts_gemma4_moe/quantize_moe.py", {}),
+    ],
+)
+def test_autoround_patch_supplies_shared_kv_dictionary(script_path, patch_kwargs):
     script_path = (
         Path(__file__).resolve().parents[1]
         / "third_party"
         / "auto-round"
-        / "scripts_gemma4"
-        / "quantize.py"
+        / script_path
     )
     spec = importlib.util.spec_from_file_location("gemma4_autoround_quantize", script_path)
     assert spec is not None and spec.loader is not None
@@ -306,7 +312,7 @@ def test_autoround_patch_supplies_unified_shared_kv_dictionary():
         )
     )
 
-    patch_position_embeddings(model, seqlen=3, device="cpu")
+    patch_position_embeddings(model, seqlen=3, **patch_kwargs)
     output = text_model.layers[1](
         torch.zeros(1, 3, 4),
         position_ids=torch.arange(3).unsqueeze(0),

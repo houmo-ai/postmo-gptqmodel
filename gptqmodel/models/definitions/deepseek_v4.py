@@ -45,16 +45,4 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         },
     ]
 
-    def _resolve_turtle_reload_threshold(self) -> int:
-        """Keep one defused source model instead of reloading a huge checkpoint.
-
-        Materialization copies tensors into the shell and does not consume the
-        source tensor. Reloading after the generic 512 MiB threshold would read
-        the complete 43-layer BF16 staging checkpoint once per decoder layer and
-        can transiently hold two copies in host memory.
-        """
-
-        return 0
-
-
 __all__ = ["DeepSeekV4QModel"]
