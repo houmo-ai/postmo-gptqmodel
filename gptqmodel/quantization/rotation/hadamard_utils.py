@@ -98,12 +98,46 @@ def matmul_hadUt(X):
     return matmul_hadU(X, transpose=True)
 
 
+def _validate_hadamard_matrix(matrix, size):
+    """Validate that ``matrix`` is a finite, normalized Hadamard matrix."""
+    if matrix.shape != (size, size):
+        raise RuntimeError(
+            f"Invalid Hadamard matrix shape: expected {(size, size)}, "
+            f"got {tuple(matrix.shape)}"
+        )
+    if not torch.isfinite(matrix).all():
+        raise RuntimeError("Generated Hadamard matrix contains non-finite values")
+
+    expected_magnitude = matrix.new_full((), 1 / math.sqrt(size))
+    if not torch.allclose(matrix.abs(), expected_magnitude, atol=1e-5, rtol=1e-5):
+        raise RuntimeError("Generated Hadamard matrix must contain values ±1/sqrt(size)")
+
+    identity = torch.eye(size, dtype=matrix.dtype, device=matrix.device)
+    gram = matrix.transpose(0, 1) @ matrix
+    if not torch.allclose(gram, identity, atol=1e-5, rtol=1e-5):
+        raise RuntimeError("Generated Hadamard matrix is not orthogonal")
+
+
 def random_hadamard_matrix(size, device):
     # See https://cornell-relaxml.github.io/quip-sharp/ , Section "Randomized Hadamard Transformation"
     Q = torch.randint(low=0, high=2, size=(size,)).to(torch.float64)
     Q = Q * 2 - 1
     Q = torch.diag(Q)
-    return matmul_hadU(Q).to(device)
+    target = torch.device(device)
+    if not torch.cuda.is_available():
+        result = matmul_hadU(Q).to(device=target)
+        _validate_hadamard_matrix(result, size)
+        return result
+
+    # The CUDA kernel only accepts fp16/bf16/fp32. Building Q on GPU avoids the
+    # CPU float64 GEMM in matmul_hadU, which is sensitive to dual OpenMP runtimes.
+    hadK, K = get_hadK(size)
+    cuda_device = target if target.type == "cuda" else torch.device("cuda")
+    Q_cuda = Q.to(device=cuda_device, dtype=torch.float32)
+    Q_cuda = matmul_hadU_cuda(Q_cuda, hadK, K)
+    result = Q_cuda.to(device=target, dtype=torch.float64)
+    _validate_hadamard_matrix(result, size)
+    return result
 
 def random_block_hadamard_matrix(size, device, block_size: int = 64):
     """

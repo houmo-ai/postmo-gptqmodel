@@ -5,6 +5,7 @@ import pathlib
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -35,6 +36,43 @@ def _load_hadamard_utils_module():
 
 
 had_utils = _load_hadamard_utils_module()
+
+
+class TestRandomHadamardMatrix(unittest.TestCase):
+    def test_cpu_fallback_returns_valid_matrix(self):
+        with patch.object(had_utils.torch.cuda, "is_available", return_value=False):
+            matrix = had_utils.random_hadamard_matrix(8, "cpu")
+
+        self.assertEqual(matrix.device.type, "cpu")
+        self.assertEqual(matrix.dtype, torch.float64)
+        torch.testing.assert_close(
+            matrix.transpose(0, 1) @ matrix,
+            torch.eye(8, dtype=matrix.dtype),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+    def test_validation_rejects_invalid_matrices(self):
+        identity = torch.eye(8, dtype=torch.float64)
+        with self.assertRaisesRegex(RuntimeError, "values ±1/sqrt"):
+            had_utils._validate_hadamard_matrix(identity, 8)
+
+        invalid = torch.full((8, 8), 1 / (8**0.5), dtype=torch.float64)
+        with self.assertRaisesRegex(RuntimeError, "not orthogonal"):
+            had_utils._validate_hadamard_matrix(invalid, 8)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
+    def test_cuda_path_returns_valid_matrix_on_requested_device(self):
+        matrix = had_utils.random_hadamard_matrix(344, "cuda:0")
+
+        self.assertEqual(matrix.device, torch.device("cuda:0"))
+        self.assertEqual(matrix.dtype, torch.float64)
+        torch.testing.assert_close(
+            matrix.transpose(0, 1) @ matrix,
+            torch.eye(344, dtype=matrix.dtype, device=matrix.device),
+            atol=1e-5,
+            rtol=1e-5,
+        )
 
 
 class TestHadamardFallbackCompare(unittest.TestCase):
