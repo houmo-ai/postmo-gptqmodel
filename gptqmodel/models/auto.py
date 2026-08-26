@@ -128,6 +128,7 @@ from .definitions.longcat_flash import LongCatFlashQModel  # noqa: E402
 from .definitions.mimo import MimoQModel  # noqa: E402
 from .definitions.minicpm import MiniCPMGPTQ  # noqa: E402
 from .definitions.minicpm3 import MiniCpm3QModel  # noqa: E402
+from .definitions.minicpm5 import MiniCPM5MoEQModel  # noqa: E402
 from .definitions.minicpm_o_4_5 import MiniCPMO45QModel  # noqa: E402
 from .definitions.minimax_m2 import MiniMaxM2GPTQ  # noqa: E402
 from .definitions.mistral3 import Mistral3GPTQ
@@ -249,6 +250,7 @@ MODEL_MAP = {
     "mpt": MptQModel,
     "minicpm": MiniCPMGPTQ,
     "minicpm3": MiniCpm3QModel,
+    "minicpm5_moe": MiniCPM5MoEQModel,
     "minicpmo": MiniCPMO45QModel,
     "minimax": MiniMaxM2GPTQ,
     "minimax_m2": MiniMaxM2GPTQ,
