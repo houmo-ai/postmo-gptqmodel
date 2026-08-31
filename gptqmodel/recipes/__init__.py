@@ -8,6 +8,7 @@ from .deepseek_v4_flash import (
     quantize_deepseek_v4_flash,
 )
 from .ling3_flash import Ling3FlashQuantRecipeResult, quantize_ling3_flash
+from .laguna_autoround import LagunaAutoRoundRecipeResult, quantize_laguna_autoround
 from .minicpm_o_4_5 import MiniCPMO45QuantRecipeResult, quantize_minicpm_o_4_5
 from .minicpm5 import MiniCPM5QuantRecipeResult, quantize_minicpm5
 from .qwen3_next import Qwen3NextQuantRecipeResult, quantize_qwen3_next
@@ -19,6 +20,7 @@ __all__ = [
     "DeepSeekV4FlashPreparationResult",
     "DeepSeekV4FlashQuantRecipeResult",
     "Ling3FlashQuantRecipeResult",
+    "LagunaAutoRoundRecipeResult",
     "MiniCPMO45QuantRecipeResult",
     "MiniCPM5QuantRecipeResult",
     "Qwen3NextQuantRecipeResult",
@@ -28,6 +30,7 @@ __all__ = [
     "prepare_deepseek_v4_flash_bf16",
     "quantize_deepseek_v4_flash",
     "quantize_ling3_flash",
+    "quantize_laguna_autoround",
     "quantize_minicpm_o_4_5",
     "quantize_minicpm5",
     "quantize_qwen3_next",

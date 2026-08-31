@@ -281,6 +281,22 @@ def _is_mxfp4_model(model_path, trust_remote_code=True):
     return quant_method == "mxfp4" and model_type in _MXFP4_SUPPORTED_MODEL_TYPES
 
 
+def _get_tokenizer_load_kwargs(model_path, platform="hf", trust_remote_code=True):
+    tokenizer_kwargs = {"trust_remote_code": trust_remote_code}
+    if platform == "model_scope":
+        return tokenizer_kwargs
+
+    from transformers import AutoConfig
+
+    try:
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+        if getattr(config, "model_type", None) == "laguna":
+            tokenizer_kwargs["fix_mistral_regex"] = True
+    except (OSError, EnvironmentError):
+        pass
+    return tokenizer_kwargs
+
+
 def llm_load_model(
     pretrained_model_name_or_path: str,
     platform: str = "hf",
@@ -333,7 +349,12 @@ def llm_load_model(
 
     is_glm = bool(re.search("chatglm", pretrained_model_name_or_path.lower()))
 
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, trust_remote_code=trust_remote_code)
+    tokenizer_kwargs = _get_tokenizer_load_kwargs(
+        pretrained_model_name_or_path,
+        platform=platform,
+        trust_remote_code=trust_remote_code,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, **tokenizer_kwargs)
 
     model_cls = AutoModel if is_glm else AutoModelForCausalLM
     if "deepseek" in pretrained_model_name_or_path.lower() and trust_remote_code:
