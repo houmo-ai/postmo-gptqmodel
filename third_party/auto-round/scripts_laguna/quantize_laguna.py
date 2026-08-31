@@ -1,4 +1,4 @@
-"""AutoRound mixed-bit quantization for Laguna S 2.1.
+"""QuaRot followed by AutoRound mixed-bit quantization for Laguna S 2.1.
 
 Routed expert projections use W4 while all other quantized linear layers use W8.
 Embeddings, normalization weights, and lm_head remain BF16 unless
@@ -6,8 +6,10 @@ Embeddings, normalization weights, and lm_head remain BF16 unless
 """
 
 import argparse
+import gc
 import os
 import re
+import time
 from pathlib import Path
 
 import torch
@@ -34,6 +36,24 @@ def parse_args():
     parser.add_argument("--device-map", default="0,1,2,3")
     parser.add_argument("--format", default="auto_round")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--rotation", choices=("none", "hadamard"), default="hadamard")
+    parser.add_argument("--rotation-device", default="cuda:0")
+    parser.add_argument(
+        "--rotation-headwise-v-o",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply the exact per-head V/O Hadamard used by the repository QuaRot path.",
+    )
+    parser.add_argument("--rotation-chunk-rows", type=int, default=1024)
+    parser.add_argument("--rotation-chunk-columns", type=int, default=1024)
+    parser.add_argument("--rotation-matrix-batch", type=int, default=4)
+    parser.add_argument(
+        "--rotation-compute-dtype",
+        choices=("float32", "float64"),
+        default="float64",
+    )
+    parser.add_argument("--save-rotated", default=None, help="Optional BF16 pre-quant checkpoint directory")
+    parser.add_argument("--rotation-only", action="store_true", help="Rotate/save and exit before AutoRound")
     parser.add_argument("--quant-lm-head", action="store_true")
     parser.add_argument("--low-gpu-mem-usage", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--low-cpu-mem-usage", action=argparse.BooleanOptionalAction, default=True)
@@ -51,12 +71,67 @@ def build_layer_config(expert_bits: int, group_size: int, sym: bool) -> dict:
     }
 
 
-def default_output_dir(model: str, expert_bits: int, rest_bits: int, group_size: int) -> str:
+def default_output_dir(
+    model: str,
+    expert_bits: int,
+    rest_bits: int,
+    group_size: int,
+    rotation: str,
+) -> str:
     model_name = Path(model.rstrip("/")).name
+    rotation_label = "quarot-" if rotation != "none" else ""
     return str(
         Path("work_dirs")
-        / f"{model_name}-autoround-expert-w{expert_bits}-rest-w{rest_bits}-g{group_size}"
+        / f"{model_name}-{rotation_label}autoround-expert-w{expert_bits}-rest-w{rest_bits}-g{group_size}"
     )
+
+
+def load_and_rotate_model(args):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from scripts_laguna.rotation_utils import apply_quarot
+
+    print("Loading Laguna BF16 model on CPU for QuaRot...")
+    load_start = time.time()
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        trust_remote_code=True,
+        fix_mistral_regex=True,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        dtype=torch.bfloat16,
+        device_map={"": "cpu"},
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    )
+    print(f"Loaded {type(model).__name__} in {(time.time() - load_start) / 60:.1f} min")
+
+    compute_dtype = getattr(torch, args.rotation_compute_dtype)
+    rotation_start = time.time()
+    model, rotation_matrix = apply_quarot(
+        model,
+        mode=args.rotation,
+        device=args.rotation_device,
+        seed=args.seed,
+        headwise_v_o=args.rotation_headwise_v_o,
+        chunk_rows=args.rotation_chunk_rows,
+        chunk_columns=args.rotation_chunk_columns,
+        matrix_batch=args.rotation_matrix_batch,
+        compute_dtype=compute_dtype,
+    )
+    del rotation_matrix
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"QuaRot completed in {(time.time() - rotation_start) / 60:.1f} min")
+
+    if args.save_rotated:
+        print(f"Saving rotated BF16 checkpoint to: {args.save_rotated}")
+        model.save_pretrained(args.save_rotated, max_shard_size="5GB", safe_serialization=True)
+        tokenizer.save_pretrained(args.save_rotated)
+
+    return model, tokenizer
 
 
 def validate_environment(model_path: str):
@@ -137,6 +212,10 @@ def main() -> None:
     if args.inspect_only:
         inspect_model(args.model)
         return
+    if args.rotation_only and args.rotation == "none":
+        raise ValueError("--rotation-only requires --rotation hadamard")
+    if args.rotation_only and not args.save_rotated:
+        raise ValueError("--rotation-only requires --save-rotated")
 
     from auto_round import AutoRound
 
@@ -145,6 +224,7 @@ def main() -> None:
         args.expert_bits,
         args.rest_bits,
         args.group_size,
+        args.rotation,
     )
     layer_config = build_layer_config(args.expert_bits, args.group_size, args.sym)
     print(
@@ -152,10 +232,23 @@ def main() -> None:
         f"other eligible linears=W{args.rest_bits}G{args.group_size}, lm_head="
         f"{'W' + str(args.rest_bits) if args.quant_lm_head else 'BF16'}"
     )
-    print(f"AutoRound device_map={args.device_map}, output={output_dir}, format={args.format}")
+    print(
+        f"Pipeline: rotation={args.rotation}, headwise_v_o={args.rotation_headwise_v_o}, "
+        f"AutoRound device_map={args.device_map}, output={output_dir}, format={args.format}"
+    )
+
+    if args.rotation != "none":
+        model_or_path, tokenizer = load_and_rotate_model(args)
+        if args.rotation_only:
+            print(f"Rotated checkpoint saved to: {args.save_rotated}")
+            return
+    else:
+        model_or_path = args.model
+        tokenizer = None
 
     autoround = AutoRound(
-        model=args.model,
+        model=model_or_path,
+        tokenizer=tokenizer,
         bits=args.rest_bits,
         group_size=args.group_size,
         sym=args.sym,
