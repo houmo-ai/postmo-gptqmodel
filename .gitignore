@@ -200,3 +200,4 @@ gptqmodel_offload_*
 /auto-round
 /work_dirs
 *weights
+.codegraph/codegraph.db
