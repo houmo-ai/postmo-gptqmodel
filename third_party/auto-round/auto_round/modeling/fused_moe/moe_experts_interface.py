@@ -364,6 +364,52 @@ def _infer_dimensions(param: nn.Parameter, config: dict, is_transposed: bool) ->
     return in_features, out_features
 
 
+def _infer_expert_weights_transposed(module: nn.Module, proj_name: str, config: dict) -> bool:
+    explicit_layout = getattr(module, "is_transposed", None)
+    if explicit_layout is not None:
+        return bool(explicit_layout)
+
+    hidden_dim = next(
+        (getattr(module, name) for name in ("hidden_dim", "hidden_size") if getattr(module, name, None)),
+        None,
+    )
+    intermediate_dim = next(
+        (
+            getattr(module, name)
+            for name in ("intermediate_dim", "intermediate_size")
+            if getattr(module, name, None)
+        ),
+        None,
+    )
+
+    if hidden_dim is not None and intermediate_dim is not None:
+        down_proj = getattr(module, "down_proj", None)
+        if isinstance(down_proj, nn.Parameter) and down_proj.dim() == 3:
+            down_shape = tuple(down_proj.shape[1:])
+            if down_shape == (hidden_dim, intermediate_dim):
+                return False
+            if down_shape == (intermediate_dim, hidden_dim):
+                return True
+
+        param = getattr(module, proj_name)
+        multiplier = config.get("output_multiplier", 1)
+        if config.get("is_input_proj", True):
+            in_features = hidden_dim
+            out_features = intermediate_dim * multiplier
+        else:
+            in_features = intermediate_dim
+            out_features = hidden_dim * multiplier
+        projection_shape = tuple(param.shape[1:])
+        if projection_shape == (out_features, in_features):
+            return False
+        if projection_shape == (in_features, out_features):
+            return True
+
+    param = getattr(module, proj_name)
+    dim1, dim2 = param.shape[1], param.shape[2]
+    return dim1 < dim2
+
+
 def _unfuse_single_projection(
     module: nn.Module,
     proj_name: str,
@@ -509,11 +555,11 @@ def _unfuse_experts_weights_inplace(
     num_experts = first_param.shape[0]
 
     # Detect if transposed
-    is_transposed = getattr(module, "is_transposed", None)
-    if is_transposed is None:
-        # Infer from shape: typically hidden_dim < intermediate_dim
-        dim1, dim2 = first_param.shape[1], first_param.shape[2]
-        is_transposed = dim1 < dim2
+    is_transposed = _infer_expert_weights_transposed(
+        module,
+        first_proj_name,
+        detected_projections[first_proj_name],
+    )
 
     dtype = first_param.dtype
     target_device = first_param.device if first_param.device.type != "meta" else "cpu"
