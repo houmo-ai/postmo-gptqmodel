@@ -118,7 +118,7 @@ def test_ling_calibration_honors_seqlen():
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
-        ({"method": "autoround"}, "method must be 'gptq'"),
+        ({"method": "unknown"}, "method must be 'gptq' or 'autoround'"),
         ({"bits": 4}, "requires base W8"),
         ({"expert_bits": 8}, "routed experts W4"),
         ({"group_size": 128}, "group_size=64"),

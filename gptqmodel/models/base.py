@@ -1450,6 +1450,10 @@ class BaseQModel(nn.Module):
     def after_model_load(self, model, load_quantized_model):
         return model
 
+    def after_model_save(self, save_dir):
+        """Finalize model-specific artifacts after weights and remote code are saved."""
+        pass
+
     def pre_quantize_generate_hook_start(self):
         pass
 

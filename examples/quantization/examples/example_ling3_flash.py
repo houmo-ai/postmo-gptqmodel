@@ -14,12 +14,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Ling-3-Flash HF checkpoint")
     parser.add_argument("--out", required=True, help="GPTQModel HF output directory")
+    parser.add_argument("--method", choices=("gptq", "autoround"), default="gptq")
+    parser.add_argument(
+        "--mla-weight-layout", choices=("hf_unabsorbed", "xh2_absorbed_v1"),
+        default="hf_unabsorbed", help="XH2: absorb floating MLA projections before quantization",
+    )
+    parser.add_argument("--data-type", default="int_sym_xh")
+    parser.add_argument("--iters", type=int, default=400)
+    parser.add_argument("--device-map", default="0")
     parser.add_argument("--bits", type=int, default=8)
     parser.add_argument("--expert-bits", type=int, default=4)
     parser.add_argument("--group-size", type=int, default=64)
     parser.add_argument("--sym", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--nsamples", type=int, default=128)
+    parser.add_argument("--nsamples", type=int, default=None, help="AutoRound: 256; GPTQ: 128")
     parser.add_argument("--seqlen", type=int, default=2048)
     parser.add_argument("--calibration-jsonl")
     parser.add_argument("--calibration-dataset", default="NeelNanda/pile-10k")
@@ -69,6 +77,11 @@ def main() -> None:
     result = quantize_ling3_flash(
         model_dir=args.model,
         output_dir=args.out,
+        method=args.method,
+        mla_weight_layout=args.mla_weight_layout,
+        data_type=args.data_type,
+        iters=args.iters,
+        device_map=args.device_map,
         bits=args.bits,
         expert_bits=args.expert_bits,
         group_size=args.group_size,

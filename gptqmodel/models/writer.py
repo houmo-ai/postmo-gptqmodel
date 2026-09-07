@@ -530,6 +530,8 @@ def ModelWriter(cls):
                         json.dump(saved_tokenizer_config, f, indent=2, ensure_ascii=False)
 
 
+        self.after_model_save(save_dir)
+
     cls.save_quantized = save_quantized
 
     def get_model_with_quantize(self, qcfg, model_id_or_path):

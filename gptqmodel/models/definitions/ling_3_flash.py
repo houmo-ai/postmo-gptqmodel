@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM
@@ -126,6 +127,40 @@ def patch_ling_3_flash_remote_code() -> None:
                     model_cls._tied_weights_keys = {}
 
 
+def load_ling_3_flash_config(model_dir: str):
+    """Load the checkpoint config after normalizing its remote class metadata."""
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+
+    patch_ling_3_flash_remote_code()
+    config_cls = get_class_from_dynamic_module(
+        "configuration_bailing_moe_v3.BailingMoeV3Config", str(model_dir),
+    )
+    _patch_config_class(config_cls)
+    config = config_cls.from_pretrained(str(model_dir))
+    config._name_or_path = str(Path(model_dir).expanduser().resolve())
+    return config
+
+
+def refresh_ling_rotary_buffers(model):
+    """Rebuild derived RoPE buffers after HF meta loading.
+
+    Ling's remote _init_weights only initializes Linear/Embedding. HF 5.x can
+    materialize its non-persistent inv_freq from meta as uninitialized storage;
+    it is absent from the checkpoint, so a clean missing-keys report is not
+    sufficient. Recompute from the rotary module's own (RoPE-dimension) config.
+    """
+    for module in model.modules():
+        if type(module).__name__ != "BailingMoeV3RotaryEmbedding":
+            continue
+        device = module.inv_freq.device
+        if device.type == "meta":
+            continue  # Empty export skeleton: materialize at its normal boundary.
+        inv_freq, scaling = module.rope_init_fn(module.config, device)
+        module.register_buffer("inv_freq", inv_freq.float(), persistent=False)
+        module.original_inv_freq = module.inv_freq
+        module.attention_scaling = scaling
+
+
 class Ling3FlashQModel(BaseQModel):
     """Quantization layout for Ling-3-Flash's hybrid KDA/MLA decoder."""
 
@@ -160,10 +195,13 @@ class Ling3FlashQModel(BaseQModel):
                 "b_proj:!",
                 "q_b_proj:1",
                 "kv_b_proj:1",
+                "q_absorbed_proj:1",
+                "q_rope_proj:1",
                 "g_b_proj:1",
                 "f_b_proj:!",
                 "o_proj:2",
                 "dense:2",
+                "absorbed_dense:2",
             ),
             "post_attention_layernorm": ("post_attention_layernorm:!",),
             "mlp:0": ("gate_proj:0", "up_proj:0", "down_proj:1"),
@@ -191,11 +229,22 @@ class Ling3FlashQModel(BaseQModel):
             if isinstance(getattr(model_cls, "_tied_weights_keys", None), list):
                 model_cls._tied_weights_keys = {}
         _shield_short_convolutions_from_gptq_hooks(model)
+        refresh_ling_rotary_buffers(model)
+        from .ling3_flash_mla import validate_ling_mla_model
+
+        validate_ling_mla_model(model)
         return model
+
+    def after_model_save(self, save_dir):
+        from .ling3_flash_mla import XH2_MLA_LAYOUT, finalize_ling_mla_checkpoint
+
+        if getattr(self.model.config, "ling_mla_layout", None) == XH2_MLA_LAYOUT:
+            finalize_ling_mla_checkpoint(save_dir)
 
 
 __all__ = [
     "Ling3FlashQModel",
+    "load_ling_3_flash_config",
     "_shield_short_convolutions_from_gptq_hooks",
     "patch_ling_3_flash_remote_code",
 ]

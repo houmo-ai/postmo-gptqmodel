@@ -1,4 +1,4 @@
-"""Stable GPTQ recipe API for Ling-3-Flash checkpoints.
+"""Stable GPTQ/AutoRound recipe API for Ling-3-Flash checkpoints.
 
 The recipe owns the Ling-specific W8/W4 profile, calibration tokenization,
 MoE routing, GPTQModel load/quantize/save lifecycle, and the conservative
@@ -113,7 +113,7 @@ def quantize_ling3_flash(
     group_size: int = 64,
     sym: bool = True,
     batch_size: int = 1,
-    nsamples: int = 128,
+    nsamples: int | None = None,
     seqlen: int = 2048,
     calibration_jsonl: str | None = None,
     calibration_text_key: str = "text",
@@ -130,6 +130,10 @@ def quantize_ling3_flash(
     max_quant_layers: int | None = None,
     seed: int = 42,
     dry_run: bool = False,
+    data_type: str = "int_sym_xh",
+    iters: int = 400,
+    device_map: str = "0",
+    mla_weight_layout: str = "hf_unabsorbed",
 ) -> Ling3FlashQuantRecipeResult:
     """Quantize Ling-3-Flash with routed experts W4 and other linears W8.
 
@@ -140,6 +144,18 @@ def quantize_ling3_flash(
     """
 
     method = str(method).lower().replace("-", "_")
+    from gptqmodel.models.definitions.ling3_flash_mla import (
+        XH2_MLA_LAYOUT, validate_mla_layout,
+    )
+
+    validate_mla_layout(mla_weight_layout)
+    if mla_weight_layout == XH2_MLA_LAYOUT and (offload_to_disk or offload_path is not None):
+        raise ValueError("xh2_absorbed_v1 requires fully materialized FP source weights; disable disk offload")
+    if method == "auto_round":
+        method = "autoround"
+    if method == "autoround" and mla_weight_layout == XH2_MLA_LAYOUT and data_type in {"int", "int_sym"}:
+        raise ValueError("xh2_absorbed_v1 requires positive scales: use int_sym_xh or int_sym_gptq, not signed int_sym")
+    nsamples = (256 if method == "autoround" else 128) if nsamples is None else int(nsamples)
     artifact_format = str(artifact_format).lower()
     _validate_recipe_args(
         method=method,
@@ -154,6 +170,25 @@ def quantize_ling3_flash(
         moe_routing_batch_size=moe_routing_batch_size,
         max_quant_layers=max_quant_layers,
     )
+    if method == "autoround":
+        if trust_remote_code is not True:
+            raise ValueError("Ling AutoRound requires trust_remote_code=True for the checkpoint-side model code")
+        if data_type not in {"int", "int_sym", "int_sym_gptq", "int_sym_xh"}:
+            raise ValueError(f"Unsupported Ling AutoRound data_type: {data_type!r}")
+        if int(iters) < 0:
+            raise ValueError("AutoRound iters must be non-negative")
+        if (
+            max_quant_layers is not None or offload_to_disk or offload_path is not None
+            or moe_routing_batch_size is not None or auto_forward_data_parallel
+            or hessian_mse is not True or wait_for_submodule_finalizers is not True
+        ):
+            raise ValueError(
+                "Ling AutoRound does not consume GPTQ-only partial-layer, disk-offload, "
+                "MoE routing, hessian_mse or finalizer overrides"
+            )
+        from .ling3_flash_autoround import _autoround_device_map
+
+        _autoround_device_map(device_map)
 
     model_path = Path(model_dir).expanduser().resolve()
     output_path = Path(output_dir).expanduser().resolve()
@@ -228,6 +263,28 @@ def quantize_ling3_flash(
         ),
         "dynamic": dynamic,
     }
+    if method == "autoround":
+        provenance = {
+            "recipe": "gptqmodel.recipes.ling3_flash.quantize_ling3_flash",
+            "backend": "auto_round",
+            "dry_run": bool(dry_run),
+            "attention_backend": _QUANTIZATION_ATTENTION_BACKEND,
+            "mla_weight_layout": mla_weight_layout,
+            "data_type": str(data_type),
+            "iters": int(iters),
+            "batch_size": int(batch_size),
+            "gradient_accumulate_steps": 1,
+            "device_map": str(device_map),
+            "seed": int(seed),
+            "low_gpu_mem_usage": True,
+            "low_cpu_mem_usage": True,
+            "enable_quanted_input": True,
+            "format": "auto_round:gptqmodel",
+            "decoder_layers": decoder_layers,
+            "mtp_layers": None if total_layers is None else total_layers - decoder_layers,
+        }
+    else:
+        provenance["mla_weight_layout"] = mla_weight_layout
     result = Ling3FlashQuantRecipeResult(
         output_dir=str(output_path),
         method=method,
@@ -245,6 +302,30 @@ def quantize_ling3_flash(
         raise FileExistsError(f"Refusing to overwrite non-empty output directory: {output_path}")
 
     import torch
+
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if method == "autoround":
+        from .ling3_flash_autoround import quantize_autoround
+
+        source = autoround_calibration_source(
+            calibration_data=calibration_data,
+            calibration_jsonl=calibration_path,
+            calibration_dataset=calibration_dataset,
+            calibration_text_key=calibration_text_key,
+        )
+        quantize_autoround(
+            model_dir=str(model_path), output_dir=str(output_path),
+            calibration_source=source, bits=int(bits), expert_bits=int(expert_bits),
+            group_size=int(group_size), data_type=str(data_type),
+            nsamples=int(nsamples), seqlen=int(seqlen), iters=int(iters),
+            batch_size=int(batch_size), device_map=str(device_map), seed=int(seed),
+            trust_remote_code=bool(trust_remote_code),
+            mla_weight_layout=mla_weight_layout,
+        )
+        _write_provenance(output_path, result)
+        return result
+
     from transformers import AutoTokenizer
 
     from gptqmodel import GPTQModel, QuantizeConfig
@@ -253,8 +334,6 @@ def quantize_ling3_flash(
     )
     from gptqmodel.quantization.config import ExpertsRoutingBypass, MoEConfig
 
-    random.seed(seed)
-    torch.manual_seed(seed)
     texts = _load_calibration_texts(
         calibration_data=calibration_data,
         calibration_jsonl=calibration_path,
@@ -285,6 +364,10 @@ def quantize_ling3_flash(
         trust_remote_code=bool(trust_remote_code),
         attn_implementation=_QUANTIZATION_ATTENTION_BACKEND,
     )
+    if mla_weight_layout == XH2_MLA_LAYOUT:
+        from gptqmodel.models.definitions.ling3_flash_mla import absorb_ling_mla
+
+        absorb_ling_mla(model.model)
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_path),
         trust_remote_code=bool(trust_remote_code),
@@ -315,8 +398,8 @@ def _validate_recipe_args(
     moe_routing_batch_size: int | None,
     max_quant_layers: int | None,
 ) -> None:
-    if method != "gptq":
-        raise ValueError("Ling-3-Flash recipe method must be 'gptq'")
+    if method not in {"gptq", "autoround"}:
+        raise ValueError("Ling-3-Flash recipe method must be 'gptq' or 'autoround'")
     if artifact_format != "gptqmodel_hf":
         raise ValueError("artifact_format must be 'gptqmodel_hf'")
     if (int(bits), int(expert_bits), int(group_size)) != (8, 4, 64):
@@ -419,6 +502,53 @@ def _load_calibration_texts(
             f"Calibration source yielded {len(texts)} samples, need {nsamples}"
         )
     return texts
+
+
+def autoround_calibration_source(
+    *,
+    calibration_data: Iterable[str | Mapping[str, Any]] | None = None,
+    calibration_jsonl: str | Path | None = None,
+    calibration_dataset: str | None = "NeelNanda/pile-10k",
+    calibration_text_key: str = "text",
+):
+    """Keep the full corpus; AutoRound shuffles and selects full-length rows.
+
+    Truncating raw documents to nsamples before tokenization loses short rows
+    and can silently leave far fewer effective calibration samples.
+    """
+    if calibration_data is None and calibration_text_key == "text":
+        if calibration_jsonl is not None:
+            path = Path(calibration_jsonl).expanduser().resolve()
+            if not path.is_file():
+                raise FileNotFoundError(f"Calibration JSONL not found: {path}")
+            return str(path)
+        if not calibration_dataset:
+            raise ValueError("Provide calibration_data, calibration_jsonl, or calibration_dataset")
+        return calibration_dataset
+
+    from datasets import Dataset, load_dataset
+
+    if calibration_data is not None:
+        source = calibration_data
+    elif calibration_jsonl is not None:
+        path = Path(calibration_jsonl).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Calibration JSONL not found: {path}")
+        with path.open(encoding="utf-8") as stream:
+            source = [json.loads(line) for line in stream if line.strip()]
+    elif calibration_dataset:
+        source = load_dataset(calibration_dataset, split="train")
+    else:
+        raise ValueError("Provide calibration_data, calibration_jsonl, or calibration_dataset")
+    rows = []
+    for index, record in enumerate(source, 1):
+        text = record if isinstance(record, str) else record.get(calibration_text_key)
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"Invalid calibration field {calibration_text_key!r} at row {index}")
+        rows.append({"text": text})
+    if not rows:
+        raise ValueError("AutoRound calibration corpus is empty")
+    return Dataset.from_list(rows)
 
 
 def _write_provenance(
