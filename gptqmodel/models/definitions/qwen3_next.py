@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
+from pathlib import Path
+
 from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
 
 from ...quantization import METHOD
@@ -103,6 +105,16 @@ class Qwen3NextGPTQ(BaseQModel):
         # as quantizable per-expert Linear modules instead of being packed into
         # opaque 3-D parameters.
         _patch_defuser_qwen3_next_registry()
+
+    def after_model_load(self, model, load_quantized_model):
+        # HF's target-only model intentionally has no MTP modules. Tell the
+        # existing writer to retain the sidecars on load -> save as well.
+        root = Path(self.model_local_path) if self.model_local_path else None
+        self.out_of_model_tensor_files = [
+            name for name in ("model_extra_tensors.safetensors", "missing_tensors_passthrough.safetensors")
+            if root is not None and (root / name).is_file()
+        ]
+        return model
 
 
 Qwen3NextQModel = Qwen3NextGPTQ
