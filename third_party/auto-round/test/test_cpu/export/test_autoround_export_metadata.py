@@ -8,7 +8,7 @@ from auto_round.export.export_to_autoround.export import save_quantized_as_autor
 from auto_round.schemes import QuantizationScheme
 
 
-def test_gptqmodel_export_tolerates_layer_config_without_in_blocks():
+def test_gptqmodel_export_preserves_int_sym_xh_metadata_without_in_blocks():
     model = nn.Module()
     model.register_parameter("dummy", nn.Parameter(torch.zeros(1)))
     model.config = SimpleNamespace()
@@ -16,7 +16,7 @@ def test_gptqmodel_export_tolerates_layer_config_without_in_blocks():
         bits=4,
         group_size=64,
         sym=True,
-        data_type="int_sym_gptq",
+        data_type="int_sym_xh",
         act_bits=16,
     )
     serialization_dict = {
@@ -40,3 +40,4 @@ def test_gptqmodel_export_tolerates_layer_config_without_in_blocks():
     )
 
     assert model.config.quantization_config["extra_config"]["outside_layer"]["bits"] == 8
+    assert model.config.quantization_config["data_type"] == "int_sym_xh"

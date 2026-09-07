@@ -36,8 +36,8 @@ def quantize_qwen35_autoround(
     group_size: int = 64,
     sym: bool = True,
     data_type: str = "int_sym_gptq",
-    iters: int = 200,
-    nsamples: int = 128,
+    iters: int = 400,
+    nsamples: int = 256,
     seqlen: int = 2048,
     batch_size: int | None = None,
     dataset: str = "NeelNanda/pile-10k",
@@ -65,9 +65,9 @@ def quantize_qwen35_autoround(
     if int(group_size) != 64:
         raise ValueError(f"Qwen3.5 AutoRound group_size must be 64, got {group_size!r}")
     data_type = str(data_type)
-    if data_type == "int_sym_gptq" and not sym:
+    if data_type in {"int_sym_gptq", "int_sym_xh"} and not sym:
         raise ValueError(
-            "data_type='int_sym_gptq' requires sym=True; use data_type='int' for asymmetric quantization"
+            f"data_type={data_type!r} requires sym=True; use data_type='int' for asymmetric quantization"
         )
 
     if topology == "moe":

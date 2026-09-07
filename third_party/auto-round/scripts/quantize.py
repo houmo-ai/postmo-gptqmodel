@@ -63,8 +63,8 @@ def parse_args():
     symmetry.add_argument("--asym", dest="sym", action="store_false",
                           help="Use asymmetric quantization; requires a compatible --data_type")
     parser.set_defaults(sym=True)
-    parser.add_argument("--iters", type=int, default=200, help="SignSGD iterations (0=RTN)")
-    parser.add_argument("--nsamples", type=int, default=128)
+    parser.add_argument("--iters", type=int, default=400, help="SignSGD iterations (0=RTN)")
+    parser.add_argument("--nsamples", type=int, default=256)
     parser.add_argument("--seqlen", type=int, default=2048)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulate_steps", type=int, default=1,
@@ -88,9 +88,10 @@ def parse_args():
                         help="(Mode 4) Two-stage calibration: LLM with pile-10k, vision with llava_conv_58k")
 
     args = parser.parse_args()
-    if args.data_type == "int_sym_gptq" and not args.sym:
+    if args.data_type in {"int_sym_gptq", "int_sym_xh"} and not args.sym:
         parser.error(
-            "--data_type int_sym_gptq requires symmetric quantization; remove --asym or use --data_type int"
+            f"--data_type {args.data_type} requires symmetric quantization; "
+            "remove --asym or use --data_type int"
         )
     return args
 

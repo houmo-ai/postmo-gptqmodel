@@ -119,6 +119,8 @@ def get_quant_func(dtype: str, bits: int, sym: bool, disable_opt_rtn=False, grou
         function: The quantization function corresponding to the specified parameters.
         str
     """
+    if dtype in {"int_sym_gptq", "int_sym_xh"} and not sym:
+        raise ValueError(f"data_type={dtype!r} requires symmetric quantization (sym=True)")
 
     def pad_sym(data_type):
         if sym:

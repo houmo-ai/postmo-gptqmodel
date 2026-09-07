@@ -169,6 +169,56 @@ def quant_tensor_sym(
     return qdq_result, scale, maxq
 
 
+@register_dtype("int_sym_xh")
+def quant_tensor_sym_xh(
+    tensor,
+    bits=4,
+    group_size=-1,
+    v=0,
+    min_scale=1.0,
+    max_scale=1.0,
+    scale_dtype=torch.float16,
+    tensor_min=None,
+    tensor_max=None,
+    q_scale_thresh=1e-5,
+    **kwargs
+):
+    """Quantize on the positive-scale signed-integer grid used by XH hardware.
+
+    AutoRound still learns ``min_scale``, ``max_scale`` and the per-weight
+    rounding perturbation ``v``.  The only difference from ``int_sym`` is the
+    scale construction: it explicitly covers the asymmetric signed code range
+    ``[-2**(bits-1), 2**(bits-1)-1]`` with a positive scale.  For INT4 this is
+    ``scale = max(abs(adjusted_min) / 8, adjusted_max / 7)``.
+
+    The returned zero point is the GPTQ midpoint (8 for INT4), so the packed
+    checkpoint remains standard GPTQ v2 and needs no XH-specific kernel.
+    """
+    if bits < 2:
+        raise ValueError(f"int_sym_xh requires bits >= 2, got {bits}")
+
+    tensor, orig_shape, pad_len = reshape_pad_tensor_by_group_size(tensor, group_size)
+    maxq = 2 ** (bits - 1)
+    if tensor_min is None or tensor_max is None:
+        wmin_tmp = torch.clamp(tensor.min(-1)[0], max=0)
+        wmax_tmp = torch.clamp(tensor.max(-1)[0], min=0)
+    else:
+        wmin_tmp = tensor_min
+        wmax_tmp = tensor_max
+
+    negative_extent = -(wmin_tmp * min_scale)  # pylint: disable=E1130
+    positive_extent = wmax_tmp * max_scale
+    scale = torch.maximum(negative_extent / maxq, positive_extent / (maxq - 1)).to(scale_dtype)
+    scale = torch.clamp(scale, min=q_scale_thresh).unsqueeze(dim=-1)
+
+    int_w = round_ste(tensor / scale + v)
+    q = torch.clamp(int_w, -maxq, maxq - 1)
+    qdq_result = (scale * q).to(tensor.dtype)
+    qdq_result = revert_tensor_by_pad(qdq_result, orig_shape=orig_shape, pad_len=pad_len)
+    zp = torch.full_like(scale, maxq)
+    return qdq_result, scale, zp
+
+
 @register_dtype("int_asym")
 def quant_tensor_asym(
     tensor,

@@ -102,8 +102,8 @@ def test_autoround_dense_mode1_matches_wrapper_defaults(tmp_path: Path):
     assert _flag_value(command, "--llm_bits") == "4"
     assert _flag_value(command, "--llm_group_size") == "64"
     assert _flag_value(command, "--data_type") == "int_sym_gptq"
-    assert _flag_value(command, "--iters") == "200"
-    assert _flag_value(command, "--nsamples") == "128"
+    assert _flag_value(command, "--iters") == "400"
+    assert _flag_value(command, "--nsamples") == "256"
     assert _flag_value(command, "--seqlen") == "2048"
     assert _flag_value(command, "--batch_size") == "8"
     assert _flag_value(command, "--dataset") == "NeelNanda/pile-10k"
@@ -183,6 +183,20 @@ def test_autoround_data_type_can_restore_signed_full_range(tmp_path: Path):
     assert result.provenance["data_type"] == "int"
 
 
+def test_autoround_int_sym_xh_is_forwarded_and_recorded(tmp_path: Path):
+    result = quantize_qwen35_autoround(
+        model_dir="weights/Qwen3.6-35B-A3B",
+        output_dir=str(tmp_path / "moe-ar-int-sym-xh"),
+        topology="moe",
+        data_type="int_sym_xh",
+        dry_run=True,
+    )
+
+    assert _flag_value(_cmd(result), "--data_type") == "int_sym_xh"
+    assert result.provenance["data_type"] == "int_sym_xh"
+    _assert_backend_accepts_command(_cmd(result))
+
+
 def test_autoround_asymmetric_mode_requires_compatible_data_type(tmp_path: Path):
     with pytest.raises(ValueError, match="requires sym=True"):
         quantize_qwen35_autoround(
@@ -205,6 +219,18 @@ def test_autoround_asymmetric_mode_requires_compatible_data_type(tmp_path: Path)
     assert "--asym" in command
     assert "--sym" not in command
     _assert_backend_accepts_command(command)
+
+
+def test_autoround_int_sym_xh_rejects_asymmetric_mode(tmp_path: Path):
+    with pytest.raises(ValueError, match="int_sym_xh.*requires sym=True"):
+        quantize_qwen35_autoround(
+            model_dir="weights/Qwen3.5-9B",
+            output_dir=str(tmp_path / "dense-ar-xh-asym"),
+            topology="dense",
+            sym=False,
+            data_type="int_sym_xh",
+            dry_run=True,
+        )
 
 
 def test_autoround_default_commands_are_backend_supported(tmp_path: Path):
@@ -266,7 +292,79 @@ def test_int_sym_gptq_scale_is_always_positive():
     assert (zero_point == 8).all()
 
 
-def test_int_sym_gptq_skips_layers_that_cannot_be_packed():
+def test_int_sym_xh_uses_positive_hardware_grid_and_gptq_midpoint():
+    torch = pytest.importorskip("torch")
+    from auto_round.data_type import get_quant_func
+    from auto_round.data_type.int import quant_tensor_sym_xh
+
+    weight = torch.tensor(
+        [
+            [-1.0, 2.0, 0.5, -0.25],
+            [-2.0, 1.0, -0.5, 0.25],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    qdq, scale, zero_point = quant_tensor_sym_xh(
+        weight,
+        bits=4,
+        group_size=4,
+        v=0,
+        min_scale=torch.tensor(1.0),
+        max_scale=torch.tensor(1.0),
+        scale_dtype=torch.float32,
+    )
+
+    expected_scale = torch.tensor([[2.0 / 7.0], [2.0 / 8.0], [1.0e-5]])
+    assert torch.allclose(scale, expected_scale)
+    assert (scale > 0).all()
+    assert (zero_point == 8).all()
+
+    signed_codes = torch.round(qdq / scale)
+    packed_codes = signed_codes + zero_point
+    assert signed_codes.min() >= -8
+    assert signed_codes.max() <= 7
+    assert packed_codes.min() >= 0
+    assert packed_codes.max() <= 15
+    assert torch.equal(scale * (packed_codes - zero_point), qdq)
+
+    quant_func, registered_name = get_quant_func("int_sym_xh", bits=4, sym=True, disable_opt_rtn=True)
+    assert quant_func is quant_tensor_sym_xh
+    assert registered_name == "int_sym_xh"
+    with pytest.raises(ValueError, match="requires symmetric quantization"):
+        get_quant_func("int_sym_xh", bits=4, sym=False, disable_opt_rtn=True)
+
+
+def test_int_sym_xh_preserves_autoround_minmax_and_rounding_gradients():
+    torch = pytest.importorskip("torch")
+    from auto_round.data_type.int import quant_tensor_sym_xh
+
+    weight = torch.tensor(
+        [[-1.0, 2.0, 0.5, -0.25], [-2.0, 1.0, -0.5, 0.25]],
+        dtype=torch.float32,
+    )
+    min_scale = torch.tensor(1.0, requires_grad=True)
+    max_scale = torch.tensor(1.0, requires_grad=True)
+    rounding = torch.zeros_like(weight, requires_grad=True)
+
+    qdq, _, _ = quant_tensor_sym_xh(
+        weight,
+        bits=4,
+        group_size=4,
+        v=rounding,
+        min_scale=min_scale,
+        max_scale=max_scale,
+        scale_dtype=torch.float32,
+    )
+    qdq.square().sum().backward()
+
+    assert min_scale.grad is not None and torch.isfinite(min_scale.grad)
+    assert max_scale.grad is not None and torch.isfinite(max_scale.grad)
+    assert rounding.grad is not None and torch.isfinite(rounding.grad).all()
+
+
+@pytest.mark.parametrize("data_type", ["int_sym_gptq", "int_sym_xh"])
+def test_symmetric_gptq_dtypes_skip_layers_that_cannot_be_packed(data_type):
     torch = pytest.importorskip("torch")
     from auto_round.formats import _check_divisible_by_32
     from auto_round.schemes import QuantizationScheme
@@ -276,7 +374,7 @@ def test_int_sym_gptq_skips_layers_that_cannot_be_packed():
             bits=4,
             group_size=64,
             sym=True,
-            data_type="int_sym_gptq",
+            data_type=data_type,
             act_bits=16,
         ),
         model=torch.nn.Sequential(torch.nn.Linear(64, 1, bias=False)),

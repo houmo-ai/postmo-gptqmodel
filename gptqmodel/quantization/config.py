@@ -711,6 +711,9 @@ class QuantizeConfig():
 
     # AutoRound-specific options
     auto_round_enabled: Optional[bool] = field(default=None)
+    # AutoRound producer-side weight grid. It does not alter the GPTQ packing
+    # contract, but must survive checkpoint load/save for reproducibility.
+    data_type: Optional[str] = field(default=None)
     iters: int = field(default=200)
     lr: Optional[float] = field(default=None)
     minmax_lr: Optional[float] = field(default=None)
@@ -982,6 +985,13 @@ class QuantizeConfig():
 
         if self.disable_opt_rtn is not None and not isinstance(self.disable_opt_rtn, bool):
             raise ValueError("QuantizeConfig: `disable_opt_rtn` must be a bool or None.")
+
+        if self.data_type is not None:
+            if not isinstance(self.data_type, str) or not self.data_type.strip():
+                raise ValueError("QuantizeConfig: `data_type` must be a non-empty string or None.")
+            self.data_type = self.data_type.strip()
+            if self.data_type in {"int_sym_gptq", "int_sym_xh"} and not self.sym:
+                raise ValueError(f"QuantizeConfig: `data_type={self.data_type}` requires `sym=True`.")
 
         if self.auto_round_version is not None:
             if isinstance(self.auto_round_version, str):
@@ -1527,6 +1537,7 @@ class QuantizeConfig():
             "bits": self.bits,
             "dynamic": self.dynamic,
             "group_size": self.group_size,
+            "data_type": self.data_type,
             "desc_act": self.desc_act,
             "lm_head": self.lm_head,
             QUANT_METHOD_FIELD: serialized_quant_method,
