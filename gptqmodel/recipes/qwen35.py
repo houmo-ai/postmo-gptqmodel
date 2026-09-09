@@ -82,6 +82,7 @@ def quantize_qwen35(
     dry_run: bool = False,
     extra_args: list[str] | None = None,
     env: Mapping[str, str] | None = None,
+    head: Mapping[str, Any] | None = None,
 ) -> Qwen35QuantRecipeResult:
     """Quantize Qwen3.5/Qwen3.6 via the maintained example scripts.
 
@@ -94,6 +95,13 @@ def quantize_qwen35(
     command in provenance.  This is useful for lightweight integration tests and
     Gerrit command-shape checks.
     """
+
+    if head is not None:
+        options = locals().copy()
+        from ..quantization.lm_head import HeadQuantizationConfig
+        if HeadQuantizationConfig(**head).bits < 8:
+            from .qwen35_head import quantize_with_head
+            return quantize_with_head(quantize_qwen35, options, backbone_algorithm="gptq")
 
     method = str(method or "gptq").lower()
     preset = str(preset or "full_vlm").lower()

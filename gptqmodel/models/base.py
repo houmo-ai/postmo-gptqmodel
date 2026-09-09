@@ -883,12 +883,19 @@ class BaseQModel(nn.Module):
         # minimum length of calibration data, default is 10
         calibration_data_min_length: int = 10,
         calibration_concat_separator: Optional[str] = None,
+        lm_head_only: bool = False,
     ) -> Dict[str, List[Dict[str, str]]]:
         if self.quantize_config is None or not isinstance(self.quantize_config, QuantizeConfig):
             raise AttributeError("`quantize_config` must be not None")
 
-        if self.quantized:
+        if self.quantized and not lm_head_only:
             raise EnvironmentError("quantize() is called a model that is already quantized")
+
+        if lm_head_only:
+            if not getattr(self, "_head_calibration_active", False):
+                raise ValueError("Use requantize(head=...) for head-only calibration")
+            from ..quantization.lm_head import validate_head_quantization
+            validate_head_quantization(self)
 
         timer = getattr(self, "quant_region_timer", None)
         if timer is not None:
@@ -951,7 +958,7 @@ class BaseQModel(nn.Module):
             backend=preferred_backend,
             format=self.quantize_config.format,
             quant_method=self.quantize_config.quant_method,
-            device=DEVICE(self.quantize_config.device),
+            device=DEVICE(getattr(self.quantize_config.device, "type", self.quantize_config.device)),
             pack=True,
             pack_dtype=self.quantize_config.pack_dtype,
 
@@ -1126,6 +1133,9 @@ class BaseQModel(nn.Module):
             ]
         elif self.quantize_config.quant_method == METHOD.AUTO_ROUND:
             from ..looper.auto_round_processor import AutoRoundProcessor
+            if lm_head_only:
+                from ..looper.lm_head_auto_round_processor import LMHeadAutoRoundProcessor
+                AutoRoundProcessor = LMHeadAutoRoundProcessor
 
             quantize_processor = [
                 TensorParallelWeightProcessor(**args),
@@ -1184,7 +1194,7 @@ class BaseQModel(nn.Module):
             )
 
         # prepare processor worker (looper)
-        module_looper = ModuleLooper(self, processors=processors)
+        module_looper = ModuleLooper(self, processors=processors, lm_head_only=lm_head_only)
 
         # When gc_mode=ON_STAGE_END, disable auto-gc for the whole quantization process
         # to prevent interference with manual cleanups performed at stage ends
@@ -1204,6 +1214,53 @@ class BaseQModel(nn.Module):
         if timer is not None:
             timer.flush()
 
+        return result
+
+    def requantize(self, calibration=None, *, head=None, **kwargs):
+        """Calibrate a floating-point lm_head, or reuse a compatible packed head.
+
+        Configure the head through ``head`` (bits, algorithm and tuning options).
+        Decoder blocks only replay calibration activations.
+        Saving preserves source checkpoint tensors outside the head, following
+        the endpoint-only lifecycle in upstream GPTQModel (646d0f5a).
+        This local API currently supports the output head only.
+        """
+        if not self.quantized:
+            raise EnvironmentError("requantize() requires an already quantized model")
+        if "lm_head_only" in kwargs:
+            raise ValueError("requantize() always selects lm_head_only")
+        from ..quantization.lm_head import head_skip_info, prepare_head_quantization, merge_head_config
+        skipped = head_skip_info(self, head)
+        if skipped is not None:
+            self._lm_head_last_operation = skipped
+            # A head calibrated earlier on this instance still needs the normal
+            # replacement writer; its source on disk may contain a float head.
+            if not getattr(self, "_lm_head_replacement_source", None):
+                self._lm_head_skip_source = str(self.model_local_path)
+            return {self.lm_head: [skipped]}
+        if calibration is None:
+            raise ValueError("Head calibration requires calibration data; only a compatible packed head can be skipped")
+        original_config = self.quantize_config
+        config, provenance = prepare_head_quantization(self, head)
+        merged_dynamic = merge_head_config(original_config.dynamic, self.lm_head, provenance)
+        self.quantize_config = config
+        self._head_calibration_active = True
+        try:
+            result = self.quantize(calibration, lm_head_only=True, **kwargs)
+        finally:
+            self._head_calibration_active = False
+            self.quantize_config = original_config
+        self.quantize_config.dynamic = merged_dynamic
+        self.quantize_config.lm_head = True
+        # pack_module emits the requested disk format; newly constructed Torch
+        # kernels otherwise retain their default v1 marker even for v2 buffers.
+        self.model.get_submodule(self.lm_head).qzero_format(
+            format=2 if config.format == FORMAT.GPTQ_V2 else 1
+        )
+        self._lm_head_quantization = provenance
+        self._lm_head_replacement_source = str(self.model_local_path)
+        self._lm_head_skip_source = None
+        self._lm_head_last_operation = {"action": "calibrated", **provenance}
         return result
 
     def _eora_generate(

@@ -77,6 +77,7 @@ class BaseQuantLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.group_size = group_size if group_size != -1 else in_features
+        self.logical_bits = int(bits)
         if bits == 5:
             self.bits = 8
         else:

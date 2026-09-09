@@ -101,9 +101,10 @@ class ModuleLooper():
     instance so tasks such as module reloading, forward passes, and finalisation
     reuse the same worker threads.
     """
-    def __init__(self, model: BaseQModel, processors: List[LoopProcessor]):
+    def __init__(self, model: BaseQModel, processors: List[LoopProcessor], *, lm_head_only: bool = False):
         self.processors = processors
         self.gptq_model = model
+        self.lm_head_only = lm_head_only
 
         # Initialize pause/resume controller first
         self.pause_controller = PauseResumeController()
@@ -191,6 +192,10 @@ class ModuleLooper():
         else:
             self.moe_routing_override = None
         self.moe_routing_bypass = self.gptq_model.quantize_config.moe_routing_bypass()
+        if self.lm_head_only:
+            # Head inputs must follow the checkpoint's normal expert routing.
+            self.moe_routing_override = None
+            self.moe_routing_bypass = False
 
         for processor in self.processors:
             self._processor_mask_tls(processor)
@@ -615,7 +620,7 @@ class ModuleLooper():
         - Module contains an MoE block
         """
         # Check if feature is enabled
-        flag_enabled = self.gptq_model.quantize_config.moe_routing_bypass()
+        flag_enabled = self.gptq_model.quantize_config.moe_routing_bypass() and not self.lm_head_only
         if not flag_enabled:
             return False
 

@@ -144,6 +144,12 @@ def ModelWriter(cls):
             eora_path: Optional[str] = None,
     ):
         """save quantized model and configs to local disk"""
+        if getattr(self, "_lm_head_replacement_source", None) is not None:
+            from ..quantization.lm_head import save_head_checkpoint
+            return save_head_checkpoint(self, save_dir, safetensors_metadata=safetensors_metadata)
+        if getattr(self, "_lm_head_skip_source", None) is not None:
+            from ..quantization.lm_head import save_skipped_head_checkpoint
+            return save_skipped_head_checkpoint(self._lm_head_skip_source, save_dir, self._lm_head_last_operation)
         os.makedirs(save_dir, exist_ok=True)
 
         if self.quant_log:

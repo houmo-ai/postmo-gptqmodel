@@ -134,7 +134,7 @@ class GPTQProcessor(LoopProcessor):
         def tmp(module, inp: Tuple[torch.Tensor, ...], out: torch.Tensor):
             g = self.tasks[name]  # noqa: F821
             batch_idx = self.current_batch_index()
-            g.add_batch(inp[0].data, out.data, batch_index=batch_idx)  # noqa: F821
+            g.add_batch(inp[0].data, None if out is None else out.data, batch_index=batch_idx)  # noqa: F821
             del inp, out
         return tmp
 

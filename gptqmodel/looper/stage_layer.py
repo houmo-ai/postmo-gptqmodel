@@ -77,6 +77,7 @@ def run_layer_stage(
         if looper._check_loop_stop():
             break
         is_lm_head_module = layer_index >= layer_count
+        replay_only = getattr(looper, "lm_head_only", False) and not is_lm_head_module
 
         if is_lm_head_module:
             layer_title = "Quantizing lm_head"
@@ -97,15 +98,16 @@ def run_layer_stage(
             layer_descriptor = looper.gptq_model.lm_head
         else:
             model_type = looper.gptq_model.model.config.model_type
-            if model_type in MODULE_CONVERTER_MAP:
+            if not replay_only and model_type in MODULE_CONVERTER_MAP:
                 converter = MODULE_CONVERTER_MAP[model_type]
                 module = converter(module, looper.gptq_model.model.config.text_config)
 
-            replace_module_with_hooked_legacy(
-                module,
-                quant_lm_head=looper.gptq_model.quantize_config.lm_head,
-                skip_module_paths=hook_skip_modules,
-            )
+            if not replay_only:
+                replace_module_with_hooked_legacy(
+                    module,
+                    quant_lm_head=looper.gptq_model.quantize_config.lm_head,
+                    skip_module_paths=hook_skip_modules,
+                )
 
             layers[layer_index] = module
 
@@ -126,6 +128,8 @@ def run_layer_stage(
             processor.collect_memory_info(layer_index)
 
             modules = [[looper.gptq_model.lm_head]] if is_lm_head_module else layer_modules
+            if replay_only:
+                modules = []
 
             # for NativeProcessor we process one time forward on all grouped module subsets
             if processor.fwd_all_modules_in_single_pass:
@@ -235,7 +239,7 @@ def run_layer_stage(
             preserve_devices = bool(forward_device_map)
 
             # second forward after process()
-            if not is_last_module and processor.fwd_after_process and subset_context is not None:
+            if not is_last_module and processor.fwd_after_process and (subset_context is not None or replay_only):
                 layer_inputs = looper.gptq_model.prepare_layer_inputs_for_quantize(
                     layer_inputs,
                     processor.inputs_cache,
@@ -592,6 +596,9 @@ def run_layer_stage(
                         looper.register_dangling_thread(finalizer_thread)
                         finalizer_thread.start()
                 else:
+                    # Head-only replay has no body finalizers. Close the empty
+                    # bar so it cannot keep redrawing over later layer progress.
+                    finalize_pb.close()
                     looper._emit_layer_complete(
                         layer_idx=layer_index,
                         submodule_finalized=True,

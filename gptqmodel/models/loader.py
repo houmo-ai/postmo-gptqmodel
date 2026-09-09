@@ -255,8 +255,9 @@ def ModelLoader(cls):
         # enforce some values despite user specified
         # non-quantized models are always loaded into cpu
         model_init_kwargs["device_map"] = cpu_device_map
-        model_init_kwargs["torch_dtype"] = model_init_kwargs.get("torch_dtype", dtype)
-        model_init_kwargs["dtype"] = dtype
+        # AutoRound's Transformers compatibility wrapper rejects both aliases
+        # being supplied together when a later float model is loaded in-process.
+        model_init_kwargs["dtype"] = model_init_kwargs.pop("torch_dtype", dtype)
         model_init_kwargs["_fast_init"] = cls.require_fast_init
         #model_init_kwargs["low_cpu_mem_usage"] = True
 

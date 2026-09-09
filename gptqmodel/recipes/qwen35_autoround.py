@@ -57,7 +57,14 @@ def quantize_qwen35_autoround(
     extra_args: Sequence[str] | None = None,
     dry_run: bool = False,
     env: Mapping[str, str] | None = None,
+    head: Mapping[str, Any] | None = None,
 ) -> Qwen35AutoRoundRecipeResult:
+    if head is not None:
+        options = locals().copy()
+        from ..quantization.lm_head import HeadQuantizationConfig
+        if HeadQuantizationConfig(**head).bits < 8:
+            from .qwen35_head import quantize_with_head
+            return quantize_with_head(quantize_qwen35_autoround, options, backbone_algorithm="autoround")
     topology = _normalize_topology(topology)
     mode = str(mode or "llm-only").replace("_", "-")
     if mode != "llm-only":

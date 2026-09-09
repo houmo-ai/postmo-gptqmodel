@@ -112,6 +112,20 @@ def _run_single_subset_pass(
         # Determine if this module is part of MoE block (needs pre-hook to avoid StopForward)
         is_moe_module = moe_block_name and name.startswith(moe_block_name + ".")
 
+        if is_lm_head_module and getattr(looper, "lm_head_only", False) and isinstance(processor, GPTQProcessor):
+            # Head solvers need inputs only. Avoid allocating [tokens, vocab]
+            # logits, particularly for Qwen's 248K output vocabulary.
+            from ..nn_modules.hooked_linear import STOP_FORWARD_EXCEPTION
+            capture = looper._masked_pre_hook_wrapper(
+                processor, processor.pre_process_fwd_hook(name), hook_source)
+
+            def capture_head(module, inputs, capture=capture):
+                capture(module, inputs, None)
+                raise STOP_FORWARD_EXCEPTION.with_traceback(None)
+
+            handle.append(m.module.register_forward_pre_hook(capture_head))
+            continue
+
         if hasattr(subset[name], 'forward_hook'):
             original_hook = processor.pre_process_fwd_hook(name)
             # Use pre-hook for MoE modules to fire before StopForward

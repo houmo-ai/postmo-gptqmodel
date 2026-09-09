@@ -153,6 +153,13 @@ class BaseQwen3VLGPTQ(BaseQModel):
         return AutoProcessor.from_pretrained(self.model_local_path)
 
     def prepare_dataset(self, calibration_dataset, batch_size: int = 1, **kwargs):
+        if calibration_dataset and all(
+            isinstance(sample, dict) and "input_ids" in sample
+            and set(sample) <= {"input_ids", "attention_mask", "labels"}
+            for sample in calibration_dataset
+        ):
+            # Qwen3.5 also reuses this method without inheriting BaseQwen3VLGPTQ.
+            return BaseQModel.prepare_dataset(self, calibration_dataset, batch_size=batch_size, **kwargs)
         processor = self.load_processor()
         calib_data = []
         for batch in batched(calibration_dataset, batch_size, process_func=self.preprocess_dataset):
