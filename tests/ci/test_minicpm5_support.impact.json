@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/models/definitions/minicpm5.py",
+    "gptqmodel/models/moe_lifecycle.py"
+  ]
+}

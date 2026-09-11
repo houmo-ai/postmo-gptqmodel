@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "lane": "quant",
+  "patterns": [
+    "tests/ci/prepare_block.py",
+    "gptqmodel/quantization/calibration/dense_ivsg/gen_data/Qwen3.5-27B.jsonl",
+    "gptqmodel/recipes/qwen35.py",
+    "gptqmodel/models/definitions/qwen3_5*.py",
+    "gptqmodel/models/definitions/base_qwen3_5_vl.py",
+    "examples/quantization/examples/example_qwen35dense.py",
+    "examples/quantization/examples/example_qwen35moe.py",
+    "examples/quantization/examples/qwen35_common.py",
+    "gptqmodel/recipes/qwen35_autoround.py",
+    "third_party/auto-round/scripts/quantize.py",
+    "third_party/auto-round/scripts_qwen35moe/**",
+    "examples/quantization/examples/example_qwen35dense_autoround.py",
+    "gptqmodel/utils/calibration.py",
+    "gptqmodel/utils/data.py",
+    "tests/ci/_fixture_download.py"
+  ]
+}

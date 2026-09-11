@@ -1,0 +1,538 @@
+{
+  "version": 1,
+  "release": "gptqmodel-blocks-v1",
+  "created_date": "2026-09-11",
+  "kind": "floating-pretrained-blocks",
+  "repository": "model_zoo2",
+  "path": "ci/gptqmodel-blocks-v1",
+  "blocks": [
+    {
+      "id": "qwen35-dense-min2",
+      "model": "Qwen3.5-0.8B",
+      "text_layers": 2,
+      "source_layers": [
+        0,
+        3
+      ],
+      "archive": "qwen35-dense-min2-fp-v1.tar.gz",
+      "url": "http://10.10.1.53:8081/artifactory/model_zoo2/ci/gptqmodel-blocks-v1/qwen35-dense-min2-fp-v1.tar.gz",
+      "sha256": "1027dc6b33d4f665b16db4ce57b6fd862a9f9490a49464cd23d88d4d73ea6d71",
+      "bytes": 642047614,
+      "directory": "qwen35-dense-min2",
+      "weights_sha256": "a2ad60a724c23f13d79961a7ca702582e2cc573487eeb6810bd328afd43b2f6f",
+      "weights_bytes": 789583744,
+      "files": {
+        "LICENSE": {
+          "bytes": 11343,
+          "sha256": "50cbab8a892c5f2993b8c7351a99182507472def3b1374558308605d99b86b32"
+        },
+        "README.md": {
+          "bytes": 61705,
+          "sha256": "87a163af54f32fa608a0f8d3ac67945c53dd2b4a7c96740b3d7fdc28e8458864"
+        },
+        "chat_template.jinja": {
+          "bytes": 7755,
+          "sha256": "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
+        },
+        "ci_block_provenance.json": {
+          "bytes": 720,
+          "sha256": "96aeb5e42d8a89966f74115800e46fb2fb3667d2b5eab8dd014fd5e98fe54440"
+        },
+        "config.json": {
+          "bytes": 2318,
+          "sha256": "a07c0194a2c3a3e60c29629784745a7e52eee20f65e801d3254f265fbac07f9d"
+        },
+        "configuration.json": {
+          "bytes": 51,
+          "sha256": "2d4464e2ead06bc9bc718c781309ad1e7baded626d66e8dcdc8b469ba185faf0"
+        },
+        "merges.txt": {
+          "bytes": 3353259,
+          "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+        },
+        "model.safetensors": {
+          "bytes": 789583744,
+          "sha256": "a2ad60a724c23f13d79961a7ca702582e2cc573487eeb6810bd328afd43b2f6f"
+        },
+        "preprocessor_config.json": {
+          "bytes": 390,
+          "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+        },
+        "tokenizer.json": {
+          "bytes": 12807982,
+          "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+        },
+        "tokenizer_config.json": {
+          "bytes": 16709,
+          "sha256": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
+        },
+        "video_preprocessor_config.json": {
+          "bytes": 385,
+          "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+        },
+        "vocab.json": {
+          "bytes": 6722759,
+          "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+        }
+      },
+      "provenance": {
+        "version": 1,
+        "source": "/data01/home/yujy/work/gptqmodel/work_dirs/ci-block-fixtures/qwen35-dense-fp/transformer55-ci-Qwen3.5-0.8B-layers4",
+        "source_config_sha256": "f8bbe4b3fadbb3e375477905207d0d69f3d3d1367f2a8b090fdf6ac2aff54491",
+        "source_shards": [
+          {
+            "name": "model.safetensors-00001-of-00001.safetensors",
+            "size": 916716608
+          }
+        ],
+        "source_layers": [
+          0,
+          3
+        ],
+        "layer_types": [
+          "linear_attention",
+          "full_attention"
+        ],
+        "num_kv_shared_layers": 0,
+        "scope": "text backbone; original widths/experts and auxiliary weights retained; MTP excluded",
+        "weights_sha256": "a2ad60a724c23f13d79961a7ca702582e2cc573487eeb6810bd328afd43b2f6f",
+        "weights_bytes": 789583744
+      },
+      "validation": {
+        "hf_shapes": "passed",
+        "bf16_text_forward": "passed",
+        "quantization": "GPTQ and AutoRound W4/W8 G64 smoke passed on this block"
+      }
+    },
+    {
+      "id": "qwen35-moe-min2",
+      "model": "Qwen3.5-35B-A3B",
+      "text_layers": 2,
+      "source_layers": [
+        0,
+        3
+      ],
+      "archive": "qwen35-moe-min2-fp-v1.tar.gz",
+      "url": "http://10.10.1.53:8081/artifactory/model_zoo2/ci/gptqmodel-blocks-v1/qwen35-moe-min2-fp-v1.tar.gz",
+      "sha256": "54f224b30c69cb2339b5126b2bf65c4108f9d2dd9439914ff10bbaffa9ada73a",
+      "bytes": 4720420517,
+      "directory": "qwen35-moe-min2",
+      "weights_sha256": "fb8a8b38eb5139de4051490e668d6ac0a3693e36808d393dc07702ab90133ee9",
+      "weights_bytes": 6285320832,
+      "files": {
+        "LICENSE": {
+          "bytes": 11544,
+          "sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+        },
+        "README.md": {
+          "bytes": 93150,
+          "sha256": "eee814e5e0182e559d11bdbb67226cc0ffb97da90c8b4447585401112d14af5f"
+        },
+        "chat_template.jinja": {
+          "bytes": 7756,
+          "sha256": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+        },
+        "ci_block_provenance.json": {
+          "bytes": 1940,
+          "sha256": "f97c8eea1f9f85630eaa285b91a53d33ed4b24db17905ce8b0cffd2638c6f266"
+        },
+        "config.json": {
+          "bytes": 2044,
+          "sha256": "8fca2d1b2a5ac3cbbc94725d6e773154e685fdb14314e299cbd47a419d5dc059"
+        },
+        "configuration.json": {
+          "bytes": 51,
+          "sha256": "2d4464e2ead06bc9bc718c781309ad1e7baded626d66e8dcdc8b469ba185faf0"
+        },
+        "generation_config.json": {
+          "bytes": 244,
+          "sha256": "4f25002776b741773666203dcea8f54619f177ace3ae483d311102092a4658e0"
+        },
+        "merges.txt": {
+          "bytes": 3353259,
+          "sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d"
+        },
+        "model.safetensors": {
+          "bytes": 6285320832,
+          "sha256": "fb8a8b38eb5139de4051490e668d6ac0a3693e36808d393dc07702ab90133ee9"
+        },
+        "preprocessor_config.json": {
+          "bytes": 390,
+          "sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516"
+        },
+        "tokenizer.json": {
+          "bytes": 12807982,
+          "sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+        },
+        "tokenizer_config.json": {
+          "bytes": 16710,
+          "sha256": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8"
+        },
+        "video_preprocessor_config.json": {
+          "bytes": 385,
+          "sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+        },
+        "vocab.json": {
+          "bytes": 6722759,
+          "sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+        }
+      },
+      "provenance": {
+        "version": 1,
+        "source": "/data01/datasets/Qwen3.5-35B-A3B",
+        "source_config_sha256": "5e4d7f74fec2f360eb9cfbfcd6ec0c4c76e684d3a11caaed259d9fd9bfbc7944",
+        "source_shards": [
+          {
+            "name": "model.safetensors-00001-of-00014.safetensors",
+            "size": 5368709816
+          },
+          {
+            "name": "model.safetensors-00002-of-00014.safetensors",
+            "size": 5368709808
+          },
+          {
+            "name": "model.safetensors-00003-of-00014.safetensors",
+            "size": 5368709808
+          },
+          {
+            "name": "model.safetensors-00004-of-00014.safetensors",
+            "size": 5368709816
+          },
+          {
+            "name": "model.safetensors-00005-of-00014.safetensors",
+            "size": 5368709816
+          },
+          {
+            "name": "model.safetensors-00006-of-00014.safetensors",
+            "size": 5368709816
+          },
+          {
+            "name": "model.safetensors-00007-of-00014.safetensors",
+            "size": 5368709808
+          },
+          {
+            "name": "model.safetensors-00008-of-00014.safetensors",
+            "size": 5368709808
+          },
+          {
+            "name": "model.safetensors-00009-of-00014.safetensors",
+            "size": 5255463936
+          },
+          {
+            "name": "model.safetensors-00010-of-00014.safetensors",
+            "size": 5368710456
+          },
+          {
+            "name": "model.safetensors-00011-of-00014.safetensors",
+            "size": 5368710464
+          },
+          {
+            "name": "model.safetensors-00012-of-00014.safetensors",
+            "size": 5368710456
+          },
+          {
+            "name": "model.safetensors-00013-of-00014.safetensors",
+            "size": 5367839544
+          },
+          {
+            "name": "model.safetensors-00014-of-00014.safetensors",
+            "size": 2224764664
+          }
+        ],
+        "source_layers": [
+          0,
+          3
+        ],
+        "layer_types": [
+          "linear_attention",
+          "full_attention"
+        ],
+        "num_kv_shared_layers": 0,
+        "scope": "text backbone; original widths/experts and auxiliary weights retained; MTP excluded",
+        "weights_sha256": "fb8a8b38eb5139de4051490e668d6ac0a3693e36808d393dc07702ab90133ee9",
+        "weights_bytes": 6285320832
+      },
+      "validation": {
+        "hf_shapes": "passed",
+        "bf16_text_forward": "passed",
+        "quantization": "not run on these original-size weights"
+      }
+    },
+    {
+      "id": "gemma4-dense-shared-min4",
+      "model": "Gemma4-E2B",
+      "text_layers": 4,
+      "source_layers": [
+        13,
+        14,
+        15,
+        19
+      ],
+      "archive": "gemma4-dense-shared-min4-fp-v1.tar.gz",
+      "url": "http://10.10.1.53:8081/artifactory/model_zoo2/ci/gptqmodel-blocks-v1/gemma4-dense-shared-min4-fp-v1.tar.gz",
+      "sha256": "a9fca3728bf4cc4c5a21f437b038690a68812c2ef7391a3a0826e736e9c5e693",
+      "bytes": 1829850800,
+      "directory": "gemma4-dense-shared-min4",
+      "weights_sha256": "77d221ecdafb8b870e7ea6efdd12543185c7b1cf223b661e4f4f4bd781c8db96",
+      "weights_bytes": 2723290016,
+      "files": {
+        "README.md": {
+          "bytes": 26708,
+          "sha256": "12bb9ae9ceecb0d8dc3712187e4347202d3ac05328ccdd3c797310fdafee646a"
+        },
+        "chat_template.jinja": {
+          "bytes": 16804,
+          "sha256": "33204f1acb5bd0002713e16a593847f24ceeafe711ed88bda2a352dc996a3373"
+        },
+        "ci_block_provenance.json": {
+          "bytes": 754,
+          "sha256": "833614e602d7982f6f10e663090202202586005631d48893ca48abd129d48755"
+        },
+        "config.json": {
+          "bytes": 4130,
+          "sha256": "3adb1073cad58095cd2754c6f1058ea27cda0e45a18d87e7329ed511789571e5"
+        },
+        "configuration.json": {
+          "bytes": 68,
+          "sha256": "a2d35662b8f8fbef70347eb85d67514f383ca3594db139cb078a55b115e7891a"
+        },
+        "generation_config.json": {
+          "bytes": 208,
+          "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de"
+        },
+        "model.safetensors": {
+          "bytes": 2723290016,
+          "sha256": "77d221ecdafb8b870e7ea6efdd12543185c7b1cf223b661e4f4f4bd781c8db96"
+        },
+        "processor_config.json": {
+          "bytes": 1689,
+          "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c"
+        },
+        "tokenizer.json": {
+          "bytes": 32169626,
+          "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+        },
+        "tokenizer_config.json": {
+          "bytes": 2095,
+          "sha256": "90c3a3ba5bf53818383a58e1a776cbcacd2a038d4812eaa373e1522f2d06f3df"
+        }
+      },
+      "provenance": {
+        "version": 1,
+        "source": "/data01/datasets/gemma-4-E2B-it",
+        "source_config_sha256": "1b28f3d2c3100f6c594754b81107428bd7b822a7f48272ca681dae9d2ec38330",
+        "source_shards": [
+          {
+            "name": "model.safetensors",
+            "size": 10246621918
+          }
+        ],
+        "source_layers": [
+          13,
+          14,
+          15,
+          19
+        ],
+        "layer_types": [
+          "sliding_attention",
+          "full_attention",
+          "sliding_attention",
+          "full_attention"
+        ],
+        "num_kv_shared_layers": 2,
+        "omitted": [
+          "MTP",
+          "unused Gemma shared-layer K/V tensors"
+        ],
+        "scope": "text backbone; original widths/experts and auxiliary weights retained; MTP excluded",
+        "weights_sha256": "77d221ecdafb8b870e7ea6efdd12543185c7b1cf223b661e4f4f4bd781c8db96",
+        "weights_bytes": 2723290016
+      },
+      "validation": {
+        "hf_shapes": "passed",
+        "bf16_text_forward": "passed",
+        "quantization": "not run on these original-size weights"
+      }
+    },
+    {
+      "id": "gemma4-moe-min2",
+      "model": "Gemma4-26B-A4B",
+      "text_layers": 2,
+      "source_layers": [
+        0,
+        5
+      ],
+      "archive": "gemma4-moe-min2-fp-v1.tar.gz",
+      "url": "http://10.10.1.53:8081/artifactory/model_zoo2/ci/gptqmodel-blocks-v1/gemma4-moe-min2-fp-v1.tar.gz",
+      "sha256": "0ae7ecc4b82b68dce0fc3c9ce7eeedfe3232a393e8696c8cec625d1e7dc17cfc",
+      "bytes": 4752880971,
+      "directory": "gemma4-moe-min2",
+      "weights_sha256": "5ccf3795b790f2ad908f9c52dacca43aceb2af2dfac861abfa1e15d94a128c5f",
+      "weights_bytes": 5907262148,
+      "files": {
+        "README.md": {
+          "bytes": 26695,
+          "sha256": "ed7f6224fe9b46a588b655062418f5320c3c87061924e7d134adc1b20ba2f23d"
+        },
+        "chat_template.jinja": {
+          "bytes": 12045,
+          "sha256": "2dfbfc7d538912f4ea11d29d85b4e25d7bc26386e53f57529f1d707c28b5828c"
+        },
+        "ci_block_provenance.json": {
+          "bytes": 721,
+          "sha256": "04a73980774b4b2f43e43c9ae874ccbb0982f1ba625d401e57b9444add7941dc"
+        },
+        "config.json": {
+          "bytes": 3070,
+          "sha256": "9bc92f86d19141495460ee7644c1fbb4cc1e77e559981cdf0af3765f1f6a872a"
+        },
+        "configuration.json": {
+          "bytes": 76,
+          "sha256": "7f5e4dab8f262b1731914cb110764c86dbfc0459a136de7cc3ae4ae375edc828"
+        },
+        "generation_config.json": {
+          "bytes": 208,
+          "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de"
+        },
+        "model.safetensors": {
+          "bytes": 5907262148,
+          "sha256": "5ccf3795b790f2ad908f9c52dacca43aceb2af2dfac861abfa1e15d94a128c5f"
+        },
+        "processor_config.json": {
+          "bytes": 1689,
+          "sha256": "32bdf45d2ad4cc29a0822ddd157a182de76644f0419a6228d151495256e9813c"
+        },
+        "tokenizer.json": {
+          "bytes": 32169626,
+          "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"
+        },
+        "tokenizer_config.json": {
+          "bytes": 2068,
+          "sha256": "97af7f9a43d9c26b4ae9558b39c2d6ffed60b9869f2cf2b9a5282b05c6dac67c"
+        }
+      },
+      "provenance": {
+        "version": 1,
+        "source": "/data01/datasets/gemma-4-26B-A4B-it",
+        "source_config_sha256": "ed0c1eb3633de771906e9ba004a44cc5635bcc06ee2062077c3d2e88a50707d3",
+        "source_shards": [
+          {
+            "name": "model-00001-of-00002.safetensors",
+            "size": 49907246508
+          },
+          {
+            "name": "model-00002-of-00002.safetensors",
+            "size": 1704763408
+          }
+        ],
+        "source_layers": [
+          0,
+          5
+        ],
+        "layer_types": [
+          "sliding_attention",
+          "full_attention"
+        ],
+        "num_kv_shared_layers": 0,
+        "scope": "text backbone; original widths/experts and auxiliary weights retained; MTP excluded",
+        "weights_sha256": "5ccf3795b790f2ad908f9c52dacca43aceb2af2dfac861abfa1e15d94a128c5f",
+        "weights_bytes": 5907262148
+      },
+      "validation": {
+        "hf_shapes": "passed",
+        "bf16_text_forward": "passed",
+        "quantization": "not run on these original-size weights"
+      }
+    },
+    {
+      "id": "ling3-flash-min3",
+      "model": "Ling-3.0-flash",
+      "text_layers": 3,
+      "source_layers": [
+        0,
+        2,
+        5
+      ],
+      "archive": "ling3-flash-min3-fp-v1.tar.gz",
+      "url": "http://10.10.1.53:8081/artifactory/model_zoo2/ci/gptqmodel-blocks-v1/ling3-flash-min3-fp-v1.tar.gz",
+      "sha256": "5b5a1893003e92e2dbf9e8d18b9ddd1a6ac3e741b2ab63d522d8af131c16550e",
+      "bytes": 11338737387,
+      "directory": "ling3-flash-min3",
+      "weights_sha256": "69cdc0a56cbd64d64f25ba79b4afb1087e3307595fc6fb26db41b8d64833fa3f",
+      "weights_bytes": 14128943896,
+      "files": {
+        "README.md": {
+          "bytes": 10253,
+          "sha256": "69f013911dbd7308e8ccb2c2130ce9388f920aa2589c2d7f7b1c1eea8d1cf526"
+        },
+        "chat_template.jinja": {
+          "bytes": 6073,
+          "sha256": "b4ab3a1c8f748e6f874d9aea102333efe7ab82528e8ab81c2eb155851e8705c6"
+        },
+        "ci_block_provenance.json": {
+          "bytes": 726,
+          "sha256": "e0d34c20ce2f79770fbb988a6335c0e773368a6ead3f4f47b6aa0e0f163773ad"
+        },
+        "config.json": {
+          "bytes": 2350,
+          "sha256": "b95830d31348c35c34f8a2da89005319e5e4ca1aedd56525758911964015c0fb"
+        },
+        "configuration.json": {
+          "bytes": 26,
+          "sha256": "563571360b3c5a4cf9b14b09732f686a8ed9da2d0dfcd1728d72140b4aeb1467"
+        },
+        "configuration_bailing_moe_v3.py": {
+          "bytes": 4725,
+          "sha256": "f2c048966aec8a2f042cfeb1351f74d51a28589b409c55baae7d24e841c1f6c4"
+        },
+        "model.safetensors": {
+          "bytes": 14128943896,
+          "sha256": "69cdc0a56cbd64d64f25ba79b4afb1087e3307595fc6fb26db41b8d64833fa3f"
+        },
+        "modeling_bailing_moe_v3.py": {
+          "bytes": 73194,
+          "sha256": "c2509bf7ac580c262e2581d34d6403aa21682d2e10beb9ad85ad8820a7e33a40"
+        },
+        "special_tokens_map.json": {
+          "bytes": 580,
+          "sha256": "69b63b9f81044ead642d16a5fdc01bcc737dc1183746485c8397ab14d3126614"
+        },
+        "tokenizer.json": {
+          "bytes": 12205732,
+          "sha256": "40fb9d7d7795b8bd305aeff39ce9963f3f450915b9553f2938e009be9a1fed60"
+        },
+        "tokenizer_config.json": {
+          "bytes": 49671,
+          "sha256": "2456b0372956cd3e82f17e33372148b115a94970bfd4878ba5e7e60cd3204f74"
+        }
+      },
+      "provenance": {
+        "version": 1,
+        "source": "/data01/datasets/Ling-3.0-flash",
+        "source_config_sha256": "6c1bd3c25e8b2db7ed954bd08291fa706ab2596a16b2cbab397ca75d44979c3b",
+        "source_code_sha256": {
+          "configuration_bailing_moe_v3.py": "f2c048966aec8a2f042cfeb1351f74d51a28589b409c55baae7d24e841c1f6c4",
+          "modeling_bailing_moe_v3.py": "c2509bf7ac580c262e2581d34d6403aa21682d2e10beb9ad85ad8820a7e33a40"
+        },
+        "source_layers": [
+          0,
+          2,
+          5
+        ],
+        "structures": [
+          "KDA+dense",
+          "KDA+MoE",
+          "MLA+MoE"
+        ],
+        "weights_sha256": "69cdc0a56cbd64d64f25ba79b4afb1087e3307595fc6fb26db41b8d64833fa3f",
+        "weights_bytes": 14128943896,
+        "scope": "original dimensions, experts and router; representative text layer mechanisms"
+      },
+      "validation": {
+        "hf_shapes": "passed",
+        "bf16_text_forward": "passed",
+        "quantization": "not run on these original-size weights"
+      }
+    }
+  ]
+}

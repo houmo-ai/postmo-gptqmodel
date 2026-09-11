@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": ["tests/ci/prepare_block.py", "tests/ci/test_quantization_guard.py"]
+}

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "lane": "modelzoo",
+  "patterns": [
+    "gptqmodel/models/definitions/ling3_flash_mla.py",
+    "gptqmodel/models/definitions/ling_3_flash.py",
+    "gptqmodel/recipes/ling3_flash*.py",
+    "gptqmodel/nn_modules/qlinear/__init__.py",
+    "gptqmodel/nn_modules/qlinear/torch.py",
+    "gptqmodel/utils/model.py"
+  ]
+}

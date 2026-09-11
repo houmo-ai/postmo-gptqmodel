@@ -223,7 +223,7 @@ def test_real_absorbed_quantize_load_resave(tmp_path, method, monkeypatch):
         + "\n"
     )
     script = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[2]
         / "examples/quantization/examples/example_ling3_flash.py"
     )
     command = [

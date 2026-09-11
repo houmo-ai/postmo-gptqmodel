@@ -116,6 +116,23 @@ def patch_ling_3_flash_remote_code() -> None:
             if isinstance(config_cls, type):
                 _patch_config_class(config_cls)
         elif "modeling_bailing_moe_v3" in module_name:
+            # HF caches config classes by source content. Two checkpoints
+            # named "out" can therefore share a config class even when one
+            # carries newly absorbed model code. AutoModel may reuse the
+            # earlier registered model class instead of importing that code.
+            # Keep every loaded Ling class aware of the config-gated ABI;
+            # ordinary/MTP layers retain their original construction.
+            from .ling3_flash_mla import (
+                install_ling_mla_class,
+                install_ling_mla_model_class,
+            )
+
+            attention_cls = getattr(module, "BailingMoeV3MultiLatentAttention", None)
+            if isinstance(attention_cls, type):
+                install_ling_mla_class(attention_cls)
+            causal_cls = getattr(module, "BailingMoeV3ForCausalLM", None)
+            if isinstance(causal_cls, type):
+                install_ling_mla_model_class(causal_cls)
             for model_cls in vars(module).values():
                 if (
                     isinstance(model_cls, type)

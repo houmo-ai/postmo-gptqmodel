@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "lane": "quant",
+  "patterns": [
+    "gptqmodel/recipes/qwen3_next*.py",
+    "gptqmodel/models/definitions/qwen3_next.py",
+    "gptqmodel/utils/missing_tensors.py",
+    "examples/quantization/examples/example_qwen3_next*.py"
+  ],
+  "nodes": [
+    "test_real_autoround_quantize_save_load"
+  ]
+}

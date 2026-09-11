@@ -40,11 +40,19 @@ def getFiles(
     ignored_set = set(_strip_py_suffix(x) for x in ignored_list)
 
     # all tests under tests/**/test_*.py (includes tests/models/**)
-    all_tests = {
-        str(p.relative_to(tests_root).with_suffix(""))
-        for p in tests_root.rglob("test_*.py")
-        if p.stem not in ignored_set
-    }
+    all_tests = set()
+    for path in tests_root.rglob("test_*.py"):
+        relative = str(path.relative_to(tests_root).with_suffix(""))
+        # Project lanes own tests/ci. Do not allocate one upstream GPU job per
+        # policy or opt-in quantization test added there in the future.
+        if path.relative_to(tests_root).parts[0] == "ci":
+            continue
+        # Accept both historical basename entries (``test_foo.py``) and
+        # directory-qualified entries (``models/test_foo.py``). The previous
+        # stem-only comparison silently ignored every qualified exclusion.
+        if path.stem in ignored_set or relative in ignored_set:
+            continue
+        all_tests.add(relative)
 
     # torch tests
     torch_test_files = {

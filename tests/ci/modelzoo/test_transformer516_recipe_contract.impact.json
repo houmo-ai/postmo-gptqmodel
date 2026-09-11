@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "lane": "modelzoo",
+  "patterns": [
+    "gptqmodel/recipes/qwen35.py",
+    "gptqmodel/models/definitions/qwen3_5*.py",
+    "gptqmodel/models/definitions/base_qwen3_5_vl.py",
+    "examples/quantization/examples/example_qwen35dense.py",
+    "examples/quantization/examples/example_qwen35moe.py",
+    "examples/quantization/examples/qwen35_common.py",
+    "gptqmodel/recipes/qwen35_autoround.py",
+    "third_party/auto-round/scripts/quantize.py",
+    "third_party/auto-round/scripts_qwen35moe/**",
+    "examples/quantization/examples/example_qwen35dense_autoround.py",
+    "gptqmodel/recipes/gemma4.py",
+    "gptqmodel/models/definitions/gemma4.py",
+    "examples/quantization/examples/example_gemma4.py",
+    "third_party/auto-round/scripts_gemma4*/**",
+    "gptqmodel/looper/input_cache.py",
+    "gptqmodel/utils/looper_helpers.py"
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "lane": "modelzoo",
+  "patterns": [
+    "gptqmodel/recipes/qwen35_head.py",
+    "gptqmodel/quantization/lm_head.py",
+    "gptqmodel/recipes/qwen35.py",
+    "gptqmodel/recipes/qwen35_autoround.py",
+    "gptqmodel/models/definitions/qwen3_5*.py",
+    "gptqmodel/models/definitions/base_qwen3_5_vl.py"
+  ]
+}

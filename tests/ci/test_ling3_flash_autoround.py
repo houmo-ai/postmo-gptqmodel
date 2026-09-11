@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import sys
@@ -134,11 +133,9 @@ def _save_real_tiny_ling(path, mtp_layers, **overrides):
         patch_ling_3_flash_remote_code,
     )
 
-    remote = Path(
-        os.environ.get("LING3_FLASH_MODEL_DIR", "/data01/datasets/Ling-3.0-flash")
-    )
-    if not (remote / "modeling_bailing_moe_v3.py").is_file():
-        pytest.skip("Set LING3_FLASH_MODEL_DIR to Ling's checkpoint-side model code")
+    from _ling_fixture import ling_code_dir
+
+    remote = ling_code_dir()
     # Only the remote config/code is loaded, never the full checkpoint weights.
     config = load_ling_3_flash_config(str(remote))
     values = dict(
@@ -226,7 +223,7 @@ def test_real_ling_autoround_quantize_save_load(tmp_path, mtp_layers, monkeypatc
     # Keep source-model construction separate from the quantizer's global HF
     # and kernel state, as in a real CLI run against an existing checkpoint.
     script = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[2]
         / "examples/quantization/examples/example_ling3_flash.py"
     )
     process = subprocess.run(

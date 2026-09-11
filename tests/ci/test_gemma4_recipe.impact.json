@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/recipes/gemma4.py",
+    "gptqmodel/models/definitions/gemma4.py",
+    "examples/quantization/examples/example_gemma4.py",
+    "third_party/auto-round/scripts_gemma4*/**",
+    "gptqmodel/looper/input_cache.py",
+    "gptqmodel/utils/looper_helpers.py"
+  ]
+}

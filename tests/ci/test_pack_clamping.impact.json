@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/nn_modules/qlinear/__init__.py",
+    "gptqmodel/nn_modules/qlinear/torch.py",
+    "gptqmodel/utils/model.py"
+  ]
+}

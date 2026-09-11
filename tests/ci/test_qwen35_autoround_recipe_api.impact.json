@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/recipes/qwen35_autoround.py",
+    "third_party/auto-round/scripts/quantize.py",
+    "third_party/auto-round/scripts_qwen35moe/**",
+    "examples/quantization/examples/example_qwen35dense_autoround.py"
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/quantization/calibration/generation/moe_ebss_provider.py",
+    "gptqmodel/quantization/calibration/generation/base.py"
+  ]
+}

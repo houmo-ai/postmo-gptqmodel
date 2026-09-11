@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/recipes/laguna_autoround.py",
+    "third_party/auto-round/scripts_laguna/**"
+  ]
+}

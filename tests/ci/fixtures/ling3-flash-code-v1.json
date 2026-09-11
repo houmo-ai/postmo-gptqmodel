@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "kind": "checkpoint-code-only",
+  "directory": "ling3-flash-code-v1",
+  "url": "http://10.10.1.53:8081/artifactory/model_zoo2/ci/ling3-flash-code-v1/ling3-flash-code-v1.tar.gz",
+  "sha256": "2398fa8a77e1c18847a30b2450a58b3cff979b46606f0089999b267b1b1855bd",
+  "bytes": 21570,
+  "files": {
+    "config.json": {
+      "bytes": 2350,
+      "sha256": "b95830d31348c35c34f8a2da89005319e5e4ca1aedd56525758911964015c0fb"
+    },
+    "configuration_bailing_moe_v3.py": {
+      "bytes": 4725,
+      "sha256": "f2c048966aec8a2f042cfeb1351f74d51a28589b409c55baae7d24e841c1f6c4"
+    },
+    "modeling_bailing_moe_v3.py": {
+      "bytes": 73194,
+      "sha256": "c2509bf7ac580c262e2581d34d6403aa21682d2e10beb9ad85ad8820a7e33a40"
+    },
+    "README.md": {
+      "bytes": 10253,
+      "sha256": "69f013911dbd7308e8ccb2c2130ce9388f920aa2589c2d7f7b1c1eea8d1cf526"
+    }
+  },
+  "source": {
+    "block_url": "http://10.10.1.53:8081/artifactory/model_zoo2/ci/gptqmodel-blocks-v1/ling3-flash-min3-fp-v1.tar.gz",
+    "block_sha256": "5b5a1893003e92e2dbf9e8d18b9ddd1a6ac3e741b2ab63d522d8af131c16550e",
+    "upstream_revision": "e0dfe7cd0f6e3b572bbbc0a8a84947469e428cc3"
+  },
+  "scope": "Original checkpoint config and Python source only; no pretrained weights or tokenizer. CPU/quant tests generate deterministic tiny weights and tokenizer."
+}

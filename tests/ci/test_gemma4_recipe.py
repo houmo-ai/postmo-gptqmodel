@@ -221,7 +221,7 @@ def test_autoround_registers_gemma4_unified_text_only_contract():
     ],
 )
 def test_gemma4_autoround_defaults_and_forwards_positive_scale_data_type(script_path):
-    path = Path(__file__).resolve().parents[1] / "third_party" / "auto-round" / script_path
+    path = Path(__file__).resolve().parents[2] / "third_party" / "auto-round" / script_path
     tree = ast.parse(path.read_text(encoding="utf-8"))
 
     parser_flags = set()
@@ -268,7 +268,7 @@ def test_gemma4_autoround_defaults_and_forwards_positive_scale_data_type(script_
 )
 def test_autoround_patch_supplies_shared_kv_dictionary(script_path, patch_kwargs):
     script_path = (
-        Path(__file__).resolve().parents[1]
+        Path(__file__).resolve().parents[2]
         / "third_party"
         / "auto-round"
         / script_path

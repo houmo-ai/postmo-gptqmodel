@@ -184,7 +184,7 @@ example.py
 /gptqmodel_offload/
 /gptqmodel_ext/machete/generated/
 AGENT.md
-AGENTS.md
+# Repository agent instructions are reviewed and versioned.
 agent
 output/
 data/datasets
@@ -201,3 +201,5 @@ gptqmodel_offload_*
 /work_dirs
 *weights
 .codegraph/codegraph.db
+
+/artifacts/ci/

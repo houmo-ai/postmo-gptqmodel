@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "always_tests": [
+    "tests/ci/test_ci_policy.py",
+    "tests/ci/test_ci_test_selection.py"
+  ],
+  "guarded_patterns": [
+    "gptqmodel/**",
+    "examples/quantization/**",
+    "third_party/auto-round/auto_round/**"
+  ],
+  "global_patterns": [
+    "tests/ci/select_tests.py",
+    "tests/ci/run.py",
+    "tests/ci/run.sh",
+    "tests/ci/pytest.ini",
+    "tests/ci/impact_policy.json",
+    "pyproject.toml",
+    "setup.py",
+    "requirements*.txt",
+    "gptqmodel/__init__.py",
+    "gptqmodel/models/auto.py",
+    "gptqmodel/models/base.py",
+    "gptqmodel/models/loader.py",
+    "gptqmodel/models/writer.py",
+    "gptqmodel/recipes/__init__.py",
+    "gptqmodel/quantization/__init__.py",
+    "gptqmodel/quantization/config.py",
+    "gptqmodel/quantization/gptq.py",
+    "gptqmodel/quantization/quantizer.py",
+    "gptqmodel/quantization/auto_round.py",
+    "gptqmodel/utils/model.py",
+    "gptqmodel/nn_modules/qlinear/__init__.py",
+    "gptqmodel/nn_modules/qlinear/torch.py",
+    "gptqmodel/looper/__init__.py",
+    "gptqmodel/looper/module_looper.py",
+    "gptqmodel/looper/loop_processor.py",
+    "gptqmodel/looper/gptq_processor.py",
+    "gptqmodel/looper/auto_round_processor.py",
+    "gptqmodel/looper/stage_subset.py",
+    "gptqmodel/looper/stage_layer.py",
+    "gptqmodel/looper/stage_inputs_capture.py",
+    "gptqmodel/looper/input_cache.py",
+    "third_party/auto-round/auto_round/__init__.py",
+    "third_party/auto-round/auto_round/autoround.py",
+    "third_party/auto-round/auto_round/wrapper.py",
+    "third_party/auto-round/auto_round/calib_dataset.py",
+    "third_party/auto-round/auto_round/special_model_handler.py",
+    "third_party/auto-round/auto_round/schemes.py",
+    "third_party/auto-round/auto_round/formats.py"
+  ]
+}

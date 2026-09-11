@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "tests/ci/_ling_fixture.py",
+    "tests/ci/_fixture_download.py",
+    "tests/ci/fixtures/ling3-flash-code-v1.json"
+  ]
+}

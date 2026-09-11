@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/models/definitions/ling_3_flash.py",
+    "gptqmodel/models/definitions/ling3_flash_mla.py",
+    "tests/ci/test_ling3_flash_autoround.py",
+    "tests/ci/_ling_fixture.py",
+    "tests/ci/_fixture_download.py",
+    "tests/ci/fixtures/ling3-flash-code-v1.json"
+  ]
+}

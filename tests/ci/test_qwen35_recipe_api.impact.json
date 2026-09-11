@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/recipes/qwen35.py",
+    "gptqmodel/models/definitions/qwen3_5*.py",
+    "gptqmodel/models/definitions/base_qwen3_5_vl.py",
+    "examples/quantization/examples/example_qwen35dense.py",
+    "examples/quantization/examples/example_qwen35moe.py",
+    "examples/quantization/examples/qwen35_common.py"
+  ]
+}
