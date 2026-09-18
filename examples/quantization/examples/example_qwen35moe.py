@@ -105,6 +105,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Qwen3.5-MoE/VL GPTQ quantization with unified LLM+vision+MTP rotation"
     )
+    parser.add_argument("--auto-mixed-precision", type=json.loads, default=None)
     parser.add_argument("--model", type=str, default="/data01/datasets/Qwen3.5-35B-A3B", help="fp model path")
     parser.add_argument("--out", type=str, default=None)
     parser.add_argument("--bits", type=int, default=4, choices=[2, 3, 4, 5, 8])
@@ -178,6 +179,12 @@ def parse_args():
 def main():
     args = parse_args()
     force_moe_grouped_mm_fallback_if_needed()
+    from gptqmodel.quantization.auto_mixed_precision import (
+        recipe_search_options, run_search, dynamic_overrides, save_search_report,
+    )
+    search_options = recipe_search_options(
+        args.auto_mixed_precision, topology="moe", rotation=args.rotation,
+        incompatible=args.max_quant_layers is not None or args.offload_to_disk or args.skip_quantize)
     args.out = args.out or build_default_output_dir(args)
 
     if not is_moe_model(args.model, args.trust_remote_code):
@@ -191,6 +198,8 @@ def main():
             "Qwen3.5 rotated quantization must run with --no-offload-to-disk; "
             "offload_to_disk is known to produce corrupted rotated checkpoints."
         )
+    if search_options is not None and is_gptq_quantized_dir(args.out):
+        raise ValueError("auto_mixed_precision output already exists; choose a new output directory")
     if not args.skip_quantize and is_gptq_quantized_dir(args.out):
         existing_offload = _existing_quant_offload_to_disk(args.out)
         if args.rotation and existing_offload:
@@ -239,7 +248,7 @@ def main():
 
         print("[2/5] Loading fp model ...")
         load_kwargs = dict(trust_remote_code=args.trust_remote_code)
-        if args.device_map:
+        if args.device_map and search_options is None:
             load_kwargs["device_map"] = args.device_map
         model = GPTQModel.load(args.model, quantize_config, **load_kwargs)
 
@@ -301,9 +310,17 @@ def main():
                 print("[rotation] Stop requested after rotation; skipping quantization.")
                 return
 
+        search_report = run_search(
+            model.model, tokenizer=tokenizer, value=search_options,
+            dataset=args.calibration_jsonl, output_dir=args.out,
+            group_size=args.group_size, device=args.device or "cuda:0")
+        if search_report is not None:
+            model.quantize_config.dynamic = dynamic_overrides(search_report, model.quantize_config.dynamic)
+
         print("[3/5] Running GPTQ quantization ...")
         model.quantize(calibration_dataset, batch_size=args.batch_size)
         model.save(args.out)
+        save_search_report(args.out, search_report)
         print(f"Quantized model saved to: {args.out}")
         rotate_mtp_after_save(args.model, args.out, model, is_moe=True, rotation=args.rotation)
         ensure_visual_tensors_present(args.model, args.out)

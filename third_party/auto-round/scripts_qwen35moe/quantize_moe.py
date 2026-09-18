@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+import json
 import math
 import importlib.util
 import os
@@ -77,6 +78,8 @@ def parse_args():
         help='AutoRound calibration device map, e.g. "0", "0,1", "auto", or "balanced"',
     )
 
+    parser.add_argument("--auto-mixed-precision", type=json.loads, default=None,
+                        help="Optional Qwen block W4/W5/W8 search configuration (JSON)")
     # LLM quantization params
     parser.add_argument("--llm_bits", type=int, default=4)
     parser.add_argument("--llm_group_size", type=int, default=64)
@@ -762,6 +765,16 @@ def _merge_two_stages(stage1_dir, stage2_dir, output_dir):
 def main():
     args = parse_args()
     validate_export_requirements(args.format)
+    search_options = None
+    if args.auto_mixed_precision is not None and args.auto_mixed_precision is not False:
+        from gptqmodel.quantization.auto_mixed_precision import (
+            recipe_search_options, run_search, save_search_report,
+        )
+        search_options = recipe_search_options(
+            args.auto_mixed_precision, topology="moe", rotation=args.mode != "llm-only",
+            incompatible=not args.sym or args.two_stage or bool(args.save_rotated)
+            or args.data_type not in {"int_sym_xh", "int_sym_gptq"}
+            or args.format != "auto_round:gptqmodel")
     total_start = time.time()
 
     need_rotation = args.mode in ("rotate-merger", "rotate-full", "rotate-quant-all")
@@ -900,6 +913,16 @@ def main():
         expert_up_gate_bits=args.expert_up_gate_bits,
         expert_down_bits=args.expert_down_bits,
     )
+    search_report = None
+    if search_options is not None:
+        search_report = run_search(
+            model, tokenizer=tokenizer, value=search_options, dataset=args.dataset,
+            output_dir=args.output_dir, group_size=args.llm_group_size, device=args.device)
+    if search_report is not None:
+        llm_layer_config.update({
+            name: _override_cfg(bits, args.llm_group_size)
+            for name, bits in search_report["module_bits"].items()
+        })
     _print_llm_override_summary(llm_layer_config)
 
     layer_config = llm_layer_config or None
@@ -960,6 +983,8 @@ def main():
         print(f"\nSaving to: {args.output_dir} (format={args.format})")
         ar.save_quantized(args.output_dir, format=args.format)
         fix_checkpoint_after_save(args.output_dir)
+        if search_report is not None:
+            save_search_report(args.output_dir, search_report)
 
     total_time = time.time() - total_start
     print(f"\n{'='*60}")

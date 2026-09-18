@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/quantization/auto_mixed_precision.py",
+    "tests/ci/_qwen35_mixed_fixture.py"
+  ]
+}

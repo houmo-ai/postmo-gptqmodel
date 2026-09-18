@@ -83,6 +83,8 @@ def quantize_qwen35(
     extra_args: list[str] | None = None,
     env: Mapping[str, str] | None = None,
     head: Mapping[str, Any] | None = None,
+    auto_mixed_precision: bool | Mapping[str, Any] | None = None,
+    mtp: Mapping[str, Any] | None = None,
 ) -> Qwen35QuantRecipeResult:
     """Quantize Qwen3.5/Qwen3.6 via the maintained example scripts.
 
@@ -96,6 +98,10 @@ def quantize_qwen35(
     Gerrit command-shape checks.
     """
 
+    if mtp is not None:
+        options = locals().copy()
+        from .qwen35_mtp import quantize_with_mtp
+        return quantize_with_mtp(quantize_qwen35, options, backbone_algorithm="gptq")
     if head is not None:
         options = locals().copy()
         from ..quantization.lm_head import HeadQuantizationConfig
@@ -133,6 +139,18 @@ def quantize_qwen35(
     if preset in {"full_vlm_rotate", "rotated_fp_only"} and not rotation:
         raise ValueError(f"preset={preset!r} requires a non-null rotation")
 
+    search_options = None
+    if auto_mixed_precision is not None and auto_mixed_precision is not False:
+        from gptqmodel.quantization.auto_mixed_precision import recipe_search_options, validate_search_paths
+        search_options = recipe_search_options(
+            auto_mixed_precision, topology=topology, rotation=rotation,
+            incompatible=bool(max_quant_layers is not None or offload_to_disk))
+
+        if search_options is not None:
+            validate_search_paths(model_dir, output_dir)
+            if search_options["device"] is None:
+                search_options["device"] = device or "cuda:0"
+
     command = _build_command(
         model_dir=model_dir,
         output_dir=output_dir,
@@ -167,6 +185,9 @@ def quantize_qwen35(
         extra_args=extra_args,
     )
 
+    if search_options is not None:
+        command.extend(["--auto-mixed-precision", json.dumps(search_options)])
+
     provenance = {
         "recipe": "gptqmodel.recipes.qwen35.quantize_qwen35",
         "backend": "examples/quantization/examples/example_qwen35dense.py"
@@ -190,6 +211,9 @@ def quantize_qwen35(
         if env:
             run_env.update({str(key): str(value) for key, value in env.items()})
         subprocess.run(command, cwd=str(_repo_root()), env=run_env, check=True)
+        if search_options is not None:
+            from gptqmodel.quantization.auto_mixed_precision import read_precision_plan
+            provenance["auto_mixed_precision"] = read_precision_plan(output_dir)
         _write_recipe_provenance(output_dir, provenance)
 
     return Qwen35QuantRecipeResult(

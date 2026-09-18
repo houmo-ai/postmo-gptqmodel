@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/quantization/auto_mixed_precision.py",
+    "gptqmodel/recipes/qwen35.py",
+    "gptqmodel/recipes/qwen35_autoround.py",
+    "gptqmodel/recipes/qwen35_head.py",
+    "third_party/auto-round/scripts_qwen35moe/quantize_moe.py",
+    "examples/quantization/examples/example_qwen35moe.py",
+    "tests/ci/_qwen35_mixed_fixture.py"
+  ]
+}

@@ -15,6 +15,8 @@
 | W4/W5 head 的 GPTQ/AutoRound 补量化 | `tests/ci/test_lm_head_requantization.py`；W5 使用 W8 存储槽位，检查逻辑位宽、tied head、主体保留、packed 复用和错误参数 | 前轮 CPU 通过；不代表所有 expert 的 W5 |
 | W4 打包饱和 | `tests/ci/test_pack_clamping.py`；检查越界值 clamp 后再 pack，避免回绕 | 前轮 CPU 通过；不代表所有硬件 kernel |
 | 产物消费 | ModelZoo 的 head / XH dtype / Ling MLA 用例 | 前轮通过；不能替代生产端完整量化 |
+| Qwen3.5/3.6 MoE MTP 专家 W4，继承 AutoRound/GPTQ | `test_qwen35_mtp.py`、`test_qwen35_mtp_quant.py`；AutoRound 联合重建 / GPTQ true-sequential，已量化主干和主 head 保留，独立 GPTQ V2 保存重载 | CPU 16 项；两算法各覆盖原生 HF、整模后 MTP、已量化主体补 MTP，GPU 共 6 项通过；完整模型和 HMONNX 接收率单独验证 |
+| Qwen MoE block W4/W5/W8 自动混合精度 | `test_auto_mixed_precision.py`、`test_auto_mixed_precision_images.py`、`test_auto_mixed_precision_quant.py`；图文筛选、两种校准算法、保存重载和逻辑位宽 | CPU 70 项及 4 组真实小模型量化重载通过；完整 Qwen3.6 校准、HMONNX 权重及 demo 单独验证，搜索阈值不代表最终任务精度 |
 
 “前轮”指 README 中的验证基线。5 种复用/自切浮点 block 的来源与结构见
 [fixture 说明](fixtures/README.md)；它们通过浮点前向不等于对应算法量化已通过。

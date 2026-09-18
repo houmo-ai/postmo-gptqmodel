@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "lane": "modelzoo",
+  "patterns": [
+    "gptqmodel/quantization/qwen35_mtp.py",
+    "gptqmodel/quantization/lm_head.py",
+    "gptqmodel/recipes/qwen35_mtp.py"
+  ]
+}

@@ -126,6 +126,10 @@ def quantize_qwen35_head(*, model_dir, head, output_dir=None, calibration_jsonl=
         provenance["action"] = model._lm_head_last_operation["action"]
         provenance["operation"] = model._lm_head_last_operation
         model.save(str(target))
+        from ..quantization.auto_mixed_precision import REPORT_NAME, save_search_report
+        search_report_path = Path(model_dir) / REPORT_NAME
+        if search_report_path.is_file():
+            save_search_report(target, json.loads(search_report_path.read_text()))
         (target / "qwen35_head_recipe_provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
     return Qwen35HeadRecipeResult(str(target), method, "gptqmodel_hf", provenance)
 
@@ -182,7 +186,14 @@ def quantize_with_head(recipe, options, *, backbone_algorithm):
         with tempfile.TemporaryDirectory(prefix=Path(original_output).name + ".backbone-",
                                          dir=Path(original_output).parent) as temporary:
             body_options["output_dir"] = str(Path(temporary) / "model")
-            result = recipe(**body_options)
+            try:
+                result = recipe(**body_options)
+            finally:
+                search_report = Path(body_options["output_dir"] + ".auto_mixed_precision_search.json")
+                if search_report.is_file():
+                    saved_report = Path(original_output + ".auto_mixed_precision_search.json")
+                    shutil.copy2(search_report, saved_report)
+                    print(f"[auto_mixed_precision] Search report: {saved_report}", flush=True)
             head_options["model_dir"] = result.output_dir
             head_result = quantize_qwen35_head(**head_options)
             log_file = result.provenance.get("log_file")
