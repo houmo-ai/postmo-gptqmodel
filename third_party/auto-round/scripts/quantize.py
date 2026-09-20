@@ -24,6 +24,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -52,7 +53,10 @@ def parse_args():
     parser.add_argument("--llm_bits", type=int, default=4)
     parser.add_argument("--llm_group_size", type=int, default=64)
     parser.add_argument("--data_type", type=str, default="int_sym_gptq",
-                        help="AutoRound weight data type (default: positive-scale GPTQ symmetric int)")
+                        help="AutoRound weight data type; int_sym_xh_hessian enables Hessian initialization and log-scale tuning")
+    parser.add_argument("--optimization_mode", choices=["standard", "xh_hessian"], default="standard")
+    parser.add_argument("--xh_hessian_config", type=json.loads, default=None,
+                        help="JSON options for G64 Hessian search and positive log-scale tuning")
     # Vision quantization params (mode 4 only)
     parser.add_argument("--vision_bits", type=int, default=8)
     parser.add_argument("--vision_group_size", type=int, default=64)
@@ -88,11 +92,26 @@ def parse_args():
                         help="(Mode 4) Two-stage calibration: LLM with pile-10k, vision with llava_conv_58k")
 
     args = parser.parse_args()
-    if args.data_type in {"int_sym_gptq", "int_sym_xh"} and not args.sym:
+    if args.data_type == "int_sym_xh_hessian":
+        from auto_round.xh_hessian import resolve_xh_data_type
+        args.optimization_mode = resolve_xh_data_type(args.data_type, args.optimization_mode)[1]
+    if args.data_type in {"int_sym_gptq", "int_sym_xh", "int_sym_xh_hessian"} and not args.sym:
         parser.error(
             f"--data_type {args.data_type} requires symmetric quantization; "
             "remove --asym or use --data_type int"
         )
+    if args.optimization_mode == "xh_hessian":
+        if args.mode != "llm-only" or args.data_type not in {"int_sym_xh", "int_sym_xh_hessian"} or args.llm_bits != 4 or args.llm_group_size != 64 or args.iters <= 0:
+            parser.error("xh_hessian requires llm-only, int_sym_xh, W4/G64 and iters > 0")
+        from auto_round.xh_hessian import XHHessianConfig
+        try:
+            config = XHHessianConfig(**(args.xh_hessian_config or {}))
+            if args.nsamples - config.validation_samples < args.batch_size * args.gradient_accumulate_steps:
+                raise ValueError("training split must contain a full optimization batch")
+        except (TypeError, ValueError) as error:
+            parser.error(str(error))
+    elif args.xh_hessian_config is not None:
+        parser.error("--xh_hessian_config requires --optimization_mode xh_hessian")
     return args
 
 
@@ -857,7 +876,7 @@ def main():
 
     from auto_round import AutoRound
 
-    ar_kwargs = {}
+    ar_kwargs = {"optimization_mode": args.optimization_mode, "xh_hessian_config": args.xh_hessian_config}
     if args.deterministic:
         ar_kwargs["enable_deterministic_algorithms"] = True
 
@@ -899,6 +918,11 @@ def main():
 
         print(f"\nSaving to: {args.output_dir} (format={args.format})")
         ar.save_quantized(args.output_dir, format=args.format)
+        if args.optimization_mode == "xh_hessian":
+            from dataclasses import asdict
+            with open(os.path.join(args.output_dir, "xh_hessian_report.json"), "w") as handle:
+                json.dump({"optimization_mode": args.optimization_mode, "config": asdict(ar.xh_hessian_config),
+                           "records": ar.xh_hessian_report}, handle, indent=2)
 
     total_time = time.time() - total_start
     print(f"\n{'='*60}")

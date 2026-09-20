@@ -1,4 +1,5 @@
 # Copyright (c) 2023 Intel Corporation
+# Modifications Copyright (c) 2026 HOUMO AI: optional XH Hessian optimization mode.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -201,6 +202,8 @@ class BaseCompressor(object):
         disable_opt_rtn: bool | None = None,
         seed: int = 42,
         low_cpu_mem_usage: bool = True,
+        optimization_mode: str = "standard",
+        xh_hessian_config: dict | None = None,
         **kwargs,
     ):
         """Initialize AutoRound with quantization and tuning configuration.
@@ -237,6 +240,10 @@ class BaseCompressor(object):
             device_map (str | dict, optional): Device placement map. Defaults to None.
             disable_opt_rtn (bool, optional): Disable RTN-mode optimization (iters=0). Defaults to None.
             enable_alg_ext (bool, optional): Enable algorithm extension (primarily for INT2). Defaults to False.
+            optimization_mode (str): "standard" or dense W4/G64 "xh_hessian".
+                data_type="int_sym_xh_hessian" selects xh_hessian with backend defaults.
+            xh_hessian_config (dict, optional): Group-Hessian search, positive log-scale bounds,
+                and fixed held-out validation options. Only valid with xh_hessian.
             **kwargs: Backward compatible options:
                 - enable_alg_ext, quant_lm_head, lr, lr_scheduler, not_use_best_mse, dynamic_max_gap,
                   super_group_size, super_bits, scale_dtype ("fp16" etc.),
@@ -266,6 +273,14 @@ class BaseCompressor(object):
         # 1. Pre-extract user-specified overrides from kwargs
         # This ensures we know exactly what the user wants to "force"
         self.user_scheme_overrides = {}
+        # Resolve the solver preset before dtype/scheme validation. Wrappers
+        # and exporters continue to consume the existing int_sym_xh grid.
+        self.requested_data_type = kwargs.get("data_type")
+        if self.requested_data_type == "int_sym_xh_hessian":
+            from auto_round.xh_hessian import resolve_xh_data_type
+            kwargs["data_type"], optimization_mode = resolve_xh_data_type(
+                self.requested_data_type, optimization_mode
+            )
         for k in scheme_fields:
             if k in kwargs:
                 value = kwargs.pop(k)
@@ -553,6 +568,15 @@ class BaseCompressor(object):
                 logger.error("algorithm extension import error, fallback to default mode")
 
         self.transform_config = kwargs.pop("transform_config", {})
+        self.optimization_mode = optimization_mode
+        self.xh_hessian_config = None
+        if optimization_mode not in {"standard", "xh_hessian"}:
+            raise ValueError(f"Unknown optimization_mode: {optimization_mode!r}")
+        if optimization_mode == "xh_hessian":
+            from auto_round.xh_hessian import configure
+            configure(self, xh_hessian_config)
+        elif xh_hessian_config is not None:
+            raise ValueError("xh_hessian_config requires optimization_mode='xh_hessian'")
 
     def _gen_auto_scheme(self) -> dict[str, dict]:
         if self.mllm:
@@ -2023,6 +2047,9 @@ class BaseCompressor(object):
             tmp_input_ids, tmp_input_others = self._sampling_inputs(
                 input_ids, input_others, indices, self.seqlen, self.batch_dim, share_cache_keys=self.shared_cache_keys
             )
+            if self.xh_hessian_config is not None:
+                from auto_round.xh_hessian import batch_mask
+                self._xh_hessian_mask = batch_mask(self, indices, nsamples, tmp_input_ids)
             tmp_output = self.block_forward(
                 block, tmp_input_ids, tmp_input_others, self.amp, self.amp_dtype, device
             ).to(cache_device)
@@ -3034,7 +3061,7 @@ class BaseCompressor(object):
         for n, m in block.named_modules():
             if hasattr(m, "orig_layer"):
                 for key in m.params.keys():
-                    if "min" in key or "max" in key:
+                    if "min" in key or "max" in key or key == "log_scale":
                         minmax_params.append(m.params[key])
                     else:
                         round_params.append(m.params[key])
@@ -3099,7 +3126,12 @@ class BaseCompressor(object):
             whole_indices = torch.arange(global_batch_size)
             num_elm = self._get_current_num_elm(input_ids, whole_indices)
         setup_ddp_if_needed_(self, block, self.device_list)
-        index_sampler = IndexSampler(nsamples, global_batch_size)
+        training_samples = nsamples
+        if self.xh_hessian_config is not None:
+            training_samples -= self.xh_hessian_config.validation_samples
+            if training_samples < global_batch_size:
+                raise ValueError("xh_hessian training split must contain a full optimization batch")
+        index_sampler = IndexSampler(training_samples, global_batch_size)
         batch_size = self.batch_size
         for i in range(self.iters):
             if self.enable_alg_ext and self.data_type.endswith("dq"):
@@ -3132,8 +3164,19 @@ class BaseCompressor(object):
             if i == 0:
                 init_loss = total_loss
 
-            if total_loss < best_loss:
-                best_loss = total_loss
+            selection_loss = total_loss
+            if self.xh_hessian_config is not None:
+                from auto_round.xh_hessian import validation_loss
+                selection_loss = float("inf")
+                if i % self.xh_hessian_config.validation_interval == 0 or i == self.iters - 1:
+                    selection_loss = validation_loss(
+                        self, block, input_ids, input_others, output, device, loss_device
+                    )
+                    logger.info("xh_hessian iteration %s validation MSE %.8g", i, selection_loss)
+                    if i == 0:
+                        initial_validation_loss = selection_loss
+            if selection_loss < best_loss:
+                best_loss = selection_loss
                 if not self.not_use_best_mse:
                     best_params = collect_best_params(block, self.cache_device)
                     # print(f"get better result at iter {i}, the loss is {total_loss}", flush=True)
@@ -3143,10 +3186,25 @@ class BaseCompressor(object):
                 best_params = collect_best_params(block, self.cache_device)
 
             if not self.not_use_best_mse:
-                if 0 < self.dynamic_max_gap <= i - last_best_iter:
+                if self.xh_hessian_config is None and 0 < self.dynamic_max_gap <= i - last_best_iter:
                     break
             self._step(scaler, optimizer, lr_schedule)
 
+        if self.xh_hessian_config is not None:
+            final_validation_loss = validation_loss(
+                self, block, input_ids, input_others, output, device, loss_device
+            )
+            if final_validation_loss < best_loss:
+                best_loss = final_validation_loss
+                best_params = collect_best_params(block, self.cache_device)
+                last_best_iter = self.iters
+            logger.info("xh_hessian selected iteration %s, validation MSE %.8g", last_best_iter, best_loss)
+            self.xh_hessian_report.append({
+                "block": getattr(block, "global_name", ""), "best_iteration": last_best_iter,
+                "validation_mse": best_loss, "training_samples": training_samples,
+                "initial_validation_mse": initial_validation_loss,
+                "validation_samples": self.xh_hessian_config.validation_samples,
+            })
         last_loss = total_loss
         best_iter = self.iters
         if not self.not_use_best_mse:
@@ -3161,6 +3219,11 @@ class BaseCompressor(object):
             dump_info = (
                 f"quantized {len(quantized_layer_names)}/{(len(quantized_layer_names) + len(unquantized_layer_names))} "
                 "layers in the block"
+            )
+        if self.xh_hessian_config is not None:
+            dump_info = (
+                f"quantized {len(quantized_layer_names)} layers; held-out MSE "
+                f"{initial_validation_loss:.8g} -> {best_loss:.8g} at iteration {last_best_iter}"
             )
 
         if self.low_gpu_mem_usage:
@@ -3362,6 +3425,11 @@ class BaseCompressor(object):
             serialization_dict = {}
             for key in SERIALIZATION_KEYS:
                 serialization_dict[key] = getattr(self, key)
+            if self.xh_hessian_config is not None:
+                serialization_dict["optimization_mode"] = self.optimization_mode
+                serialization_dict["xh_hessian_config"] = asdict(self.xh_hessian_config)
+                if self.requested_data_type == "int_sym_xh_hessian":
+                    serialization_dict["requested_data_type"] = self.requested_data_type
             from auto_round.version import __version__
 
             serialization_dict["autoround_version"] = __version__

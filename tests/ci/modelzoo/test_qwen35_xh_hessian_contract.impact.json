@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "lane": "modelzoo",
+  "patterns": [
+    "gptqmodel/recipes/qwen35_autoround.py",
+    "third_party/auto-round/scripts/quantize.py",
+    "third_party/auto-round/auto_round/compressors/base.py",
+    "third_party/auto-round/auto_round/xh_hessian.py"
+  ]
+}

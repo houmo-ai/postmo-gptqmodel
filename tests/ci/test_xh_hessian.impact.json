@@ -1,0 +1,1 @@
+{"version":1,"lane":"cpu","patterns":["third_party/auto-round/auto_round/xh_hessian.py","third_party/auto-round/auto_round/compressors/base.py","gptqmodel/recipes/qwen35_autoround.py","third_party/auto-round/scripts/quantize.py"]}

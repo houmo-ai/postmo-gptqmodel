@@ -60,7 +60,28 @@ def quantize_qwen35_autoround(
     head: Mapping[str, Any] | None = None,
     auto_mixed_precision: bool | Mapping[str, Any] | None = None,
     mtp: Mapping[str, Any] | None = None,
+    optimization_mode: str = "standard",
+    xh_hessian_config: Mapping[str, Any] | None = None,
 ) -> Qwen35AutoRoundRecipeResult:
+    if data_type == "int_sym_xh_hessian":
+        from auto_round.xh_hessian import resolve_xh_data_type
+        optimization_mode = resolve_xh_data_type(data_type, optimization_mode)[1]
+    if optimization_mode not in {"standard", "xh_hessian"}:
+        raise ValueError(f"Unknown optimization_mode: {optimization_mode!r}")
+    if optimization_mode == "xh_hessian":
+        topology = _normalize_topology(topology)
+        mode = str(mode or "llm-only").replace("_", "-")
+        if topology != "dense" or mode != "llm-only" or data_type not in {"int_sym_xh", "int_sym_xh_hessian"} or bits != 4 or group_size != 64 or not sym or iters <= 0:
+            raise ValueError("xh_hessian requires dense llm-only int_sym_xh W4/G64 and iters > 0")
+        if mtp is not None or head is not None or auto_mixed_precision not in (None, False):
+            raise ValueError("xh_hessian v1 excludes MTP, head and mixed-precision extensions")
+        from auto_round.xh_hessian import XHHessianConfig
+        from dataclasses import asdict
+        xh_hessian_config = asdict(XHHessianConfig(**dict(xh_hessian_config or {})))
+        if nsamples - xh_hessian_config["validation_samples"] < (batch_size or 8) * (gradient_accumulate_steps or 1):
+            raise ValueError("xh_hessian training split must contain a full optimization batch")
+    elif xh_hessian_config is not None:
+        raise ValueError("xh_hessian_config requires optimization_mode='xh_hessian'")
     if mtp is not None:
         options = locals().copy()
         from .qwen35_mtp import quantize_with_mtp
@@ -146,6 +167,8 @@ def quantize_qwen35_autoround(
         save_rotated=save_rotated,
         extra_args=extra_args,
     )
+    if optimization_mode == "xh_hessian":
+        command.extend(["--optimization_mode", optimization_mode, "--xh_hessian_config", json.dumps(xh_hessian_config)])
     if search_options is not None:
         command.extend(["--auto-mixed-precision", json.dumps(search_options)])
 
@@ -159,6 +182,9 @@ def quantize_qwen35_autoround(
         "log_file": _normalize_path(_default_log_file(output_dir)),
         "dry_run": bool(dry_run),
     }
+    if optimization_mode == "xh_hessian":
+        provenance.update(optimization_mode=optimization_mode, xh_hessian_config=xh_hessian_config)
+        provenance["storage_data_type"] = "int_sym_xh"
     if not dry_run:
         run_env = os.environ.copy()
         if env:

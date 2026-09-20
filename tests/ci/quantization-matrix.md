@@ -8,6 +8,7 @@
 
 | 能力 | 已登记用例与边界 | 状态 |
 | --- | --- | --- |
+| `int_sym_xh_hessian`：Hessian 初始化 + 正 log-scale/rounding 联合优化 | `test_xh_hessian.py`、`test_xh_hessian_quant.py`；单名称预设及兼容显式模式，dense Qwen3.5 小模型，linear/full attention，W4A16/G64，AutoGPTQ v1；逐层独立解包参考及整模 logits 一致性 | CPU 数学/梯度/参数恢复及 GPU 真实量化、保存重载；27B 任务精度与 Marlin/HMONNX 另行验证 |
 | GPTQ 基本 W4/G64，GPTQ v1/v2 保存重载 | `tests/ci/test_lm_head_requantization.py` 的最小 Qwen2 主体真实量化；sym=True、desc_act=False | 前轮 CPU 通过；不代表所有 group_size/desc_act |
 | GPTQ / AutoRound dense W4/W8 G64 | `test_quantization_guard.py`，Qwen3.5 文本路径，两种 attention 都实际量化；AutoRound 默认 `int_sym_gptq`，有限校准、packed/配置与重载前向检查 | 本轮 4 组 GPU 通过，连同 42 项 policy 共 46 项、约 228 秒；这是产物/重载 smoke，不是质量阈值 |
 | XH AutoRound 混合精度、hybrid attention、MoE、MTP | `tests/ci/test_qwen3_next_autoround.py::test_real_autoround_quantize_save_load`；`int_sym_xh`，组合 `(MTP,attention bits,expert bits)` = `(否,8,4)`、`(是,8,4)`、`(否,16,8)`；保存重载载荷与 logits 一致 | 前轮 3 组 GPU 通过；不代表 GPTQ MoE 或完整 VLM |
