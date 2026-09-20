@@ -1,4 +1,6 @@
 """Native vision/M-RoPE, answer masking and independent image search gates."""
+import base64
+import hashlib
 import json
 
 import pytest
@@ -7,7 +9,7 @@ import torch.nn.functional as F
 
 from _qwen35_mixed_fixture import native_qwen35_cpu, samples, save_image_dataset, save_source, tiny_model
 from gptqmodel.quantization.auto_mixed_precision import (
-    aggregate_metrics, discover_units, load_image_records, metrics_pass, output_metrics,
+    _load_search_image, aggregate_metrics, discover_units, load_image_records, metrics_pass, output_metrics,
     parse_auto_mixed_precision, search_precision, select_assignment, symmetric_qdq,
 )
 
@@ -36,9 +38,19 @@ def test_image_failure_is_not_hidden_by_text_average():
 
 
 @pytest.mark.usefixtures("native_qwen35_cpu")
-def test_real_vision_search_cache_matches_uncached_forward(tmp_path):
+@pytest.mark.parametrize("image_encoding", ["path", "base64"])
+def test_real_vision_search_cache_matches_uncached_forward(tmp_path, image_encoding):
     source = save_source(tmp_path / "source")
     dataset = save_image_dataset(tmp_path / "images")
+    if image_encoding == "base64":
+        rows = [json.loads(line) for line in dataset.read_text().splitlines()]
+        for row in rows:
+            image = dataset.parent / row.pop("image")
+            payload = image.read_bytes()
+            row["image_base64"] = base64.b64encode(payload).decode("ascii")
+            row["image_sha256"] = hashlib.sha256(payload).hexdigest()
+            image.unlink()  # The complete search must work with the JSONL alone.
+        dataset.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
     options = dict(image_dataset=str(dataset), image_nsamples=2, image_max_pixels=4096,
                    image_seqlen=128, nsamples=2, seqlen=32, positions_per_sample=8,
                    max_trials=2, max_kl=1, max_ppl_increase=1)
@@ -94,3 +106,46 @@ def test_real_vision_search_cache_matches_uncached_forward(tmp_path):
     dataset.write_text("\n".join(json.dumps(row) for row in rows))
     with pytest.raises(ValueError, match="nonempty"):
         load_image_records(source, config)
+
+
+def test_inline_image_matches_relative_and_absolute_paths(tmp_path):
+    dataset = save_image_dataset(tmp_path / "images")
+    row = json.loads(dataset.read_text().splitlines()[0])
+    image = dataset.parent / row["image"]
+    payload = image.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    relative = _load_search_image({**row, "image_sha256": digest}, dataset.parent)
+    absolute = _load_search_image({"image": str(image), "image_sha256": digest.upper()}, tmp_path)
+    inline = {"image_base64": base64.b64encode(payload).decode("ascii"), "image_sha256": digest}
+    image.unlink()
+    decoded = _load_search_image(inline, tmp_path)
+    assert relative.mode == absolute.mode == decoded.mode == "RGB"
+    assert relative.size == absolute.size == decoded.size
+    assert relative.tobytes() == absolute.tobytes() == decoded.tobytes()
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        _load_search_image({**inline, "image_sha256": "0" * 64}, tmp_path)
+
+
+@pytest.mark.parametrize("row,message", [
+    ({}, "exactly one"),
+    ({"image": "missing.png", "image_base64": "invalid"}, "exactly one"),
+    ({"image_base64": ""}, "nonempty"),
+    ({"image_base64": 123}, "nonempty"),
+    ({"image_base64": "%%%"}, "valid raw Base64"),
+    ({"image_base64": "中文"}, "valid raw Base64"),
+    ({"image_base64": "a"}, "valid raw Base64"),
+    ({"image_base64": "YWJj"}, "cannot be decoded"),
+    ({"image_base64": "YWJj", "image_sha256": "invalid"}, "hexadecimal"),
+])
+def test_invalid_inline_image_fails_explicitly(row, message, tmp_path):
+    with pytest.raises(ValueError, match=message):
+        _load_search_image(row, tmp_path)
+
+
+def test_path_image_hash_is_checked_and_missing_files_fail(tmp_path):
+    dataset = save_image_dataset(tmp_path / "images")
+    row = json.loads(dataset.read_text().splitlines()[0])
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        _load_search_image({**row, "image_sha256": "0" * 64}, dataset.parent)
+    with pytest.raises(FileNotFoundError):
+        _load_search_image({"image": "missing.png"}, tmp_path)

@@ -6,7 +6,10 @@ trials. Non-target weights and native routing are unchanged during screening.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import io
 import json
 import math
 import random
@@ -271,9 +274,42 @@ def _records(samples, config):
     raise ValueError(f"Search needs {config.nsamples} usable text samples, found {len(records)}")
 
 
+def _load_search_image(row, manifest_dir):
+    """Decode one local or inline image, checking its original encoded bytes."""
+    from PIL import Image, UnidentifiedImageError
+
+    sources = [key for key in ("image", "image_base64") if key in row]
+    if len(sources) != 1:
+        raise ValueError("Image JSONL requires exactly one of image or image_base64")
+    key = sources[0]
+    value = row[key]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Image JSONL requires a nonempty {key} string")
+    if key == "image_base64":
+        try:
+            payload = base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("image_base64 must contain valid raw Base64") from exc
+    else:
+        image_path = Path(value).expanduser()
+        if not image_path.is_absolute():
+            image_path = Path(manifest_dir) / image_path
+        payload = image_path.read_bytes()
+    if "image_sha256" in row:
+        expected = row["image_sha256"]
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected):
+            raise ValueError("image_sha256 must be a 64-character hexadecimal digest")
+        if hashlib.sha256(payload).hexdigest() != expected.lower():
+            raise ValueError("Image SHA256 mismatch")
+    try:
+        with Image.open(io.BytesIO(payload)) as source_image:
+            return source_image.convert("RGB")
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError("Image payload cannot be decoded") from exc
+
+
 def load_image_records(model_source, config):
-    """Local JSONL: image path, text prompt, reference answer; optional option labels."""
-    from PIL import Image
+    """Local JSONL: image path or Base64, prompt, answer; optional option labels."""
     from transformers import AutoProcessor
 
     path = Path(config.image_dataset).expanduser().resolve()
@@ -290,13 +326,9 @@ def load_image_records(model_source, config):
     records = []
     for row in rows[:config.image_nsamples]:
         if not isinstance(row, Mapping) or any(not isinstance(row.get(k), str) or not row[k].strip()
-                                               for k in ("image", "text", "answer")):
-            raise ValueError("Image JSONL requires nonempty image, text and answer strings")
-        image_path = Path(row["image"]).expanduser()
-        if not image_path.is_absolute():
-            image_path = path.parent / image_path
-        with Image.open(image_path) as source_image:
-            picture = source_image.convert("RGB")
+                                               for k in ("text", "answer")):
+            raise ValueError("Image JSONL requires nonempty text and answer strings")
+        picture = _load_search_image(row, path.parent)
         messages = [{"role": "user", "content": [
             {"type": "image", "image": picture}, {"type": "text", "text": row["text"]}]}]
         inputs = dict(processor.apply_chat_template(

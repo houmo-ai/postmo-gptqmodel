@@ -54,6 +54,19 @@ prompt and reference answer per record:
 ```
 
 Image paths are relative to the JSONL (absolute local paths are also accepted).
+For a self-contained JSONL, replace `image` with `image_base64` containing raw
+Base64 of the original image file bytes (no data-URI prefix):
+
+```json
+{"image_base64": "<base64 image bytes>", "text": "What is written on the sign?", "answer": "Library"}
+```
+
+Each record must provide exactly one of `image` and `image_base64`. Optional
+`image_sha256` is a 64-digit hexadecimal SHA256 of the original encoded file
+bytes, checked for either form before decoding. `image_name` may retain the
+original filename as metadata; it is not opened. Inline images are decoded in
+memory, require no sidecar files or download, and use the same preprocessing
+as path images. Invalid Base64, undecodable images and digest mismatches fail.
 The native processor builds the image patches and chat prompt with thinking
 disabled. Only reference-answer tokens are scored; image placeholders and the
 question are excluded. Long image sequences raise instead of silently truncating

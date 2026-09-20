@@ -1,4 +1,6 @@
 """Real native hybrid-MoE search -> solver -> packed reload, including head W4/W5."""
+import base64
+import hashlib
 import json
 from pathlib import Path
 
@@ -41,8 +43,20 @@ def test_search_quantize_and_reload(backend, initial, with_images, head_bits, tm
                       "nsamples": 2, "seqlen": 32, "positions_per_sample": 8,
                       "max_kl": 1, "max_ppl_increase": 1, "device": "cuda:0"})
     if with_images:
+        image_dataset = save_image_dataset(tmp_path / "images")
+        if head_bits == 5:
+            # Exercise both solvers with a standalone JSONL; W4-head cases
+            # retain the existing image-path coverage.
+            rows = [json.loads(line) for line in image_dataset.read_text().splitlines()]
+            for row in rows:
+                image = image_dataset.parent / row.pop("image")
+                payload = image.read_bytes()
+                row["image_base64"] = base64.b64encode(payload).decode("ascii")
+                row["image_sha256"] = hashlib.sha256(payload).hexdigest()
+                image.unlink()
+            image_dataset.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
         common["auto_mixed_precision"].update(
-            image_dataset=str(save_image_dataset(tmp_path / "images")),
+            image_dataset=str(image_dataset),
             image_nsamples=2, image_max_pixels=4096, image_seqlen=128)
     if backend == "autoround":
         result = quantize_qwen35_autoround(**common, dataset=str(calibration), iters=2,
