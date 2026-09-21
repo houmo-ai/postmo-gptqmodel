@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "lane": "modelzoo",
+  "patterns": [
+    "gptqmodel/models/definitions/glm5_next.py",
+    "gptqmodel/models/moe_lifecycle.py",
+    "gptqmodel/recipes/glm5_3_flash.py",
+    "gptqmodel/recipes/glm5_3_flash_autoround.py",
+    "gptqmodel/nn_modules/qlinear/torch.py",
+    "gptqmodel/utils/model.py"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "lane": "quant",
+  "patterns": [
+    "gptqmodel/recipes/glm5_3_flash_autoround.py",
+    "gptqmodel/recipes/glm5_3_flash.py",
+    "gptqmodel/models/definitions/glm5_next.py",
+    "tests/ci/_glm53_fixture.py",
+    "third_party/auto-round/auto_round/modeling/fused_moe/moe_experts_interface.py",
+    "third_party/auto-round/auto_round/compressors/base.py",
+    "third_party/auto-round/auto_round/wrapper.py",
+    "third_party/auto-round/auto_round/data_type/int.py"
+  ]
+}

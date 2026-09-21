@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "lane": "quant",
+  "patterns": [
+    "gptqmodel/models/definitions/glm5_next.py",
+    "gptqmodel/models/moe_lifecycle.py",
+    "gptqmodel/recipes/glm5_3_flash.py",
+    "tests/ci/_glm53_fixture.py"
+  ]
+}

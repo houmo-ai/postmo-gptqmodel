@@ -87,6 +87,7 @@ from .definitions.deepseek_v2 import DeepSeekV2QModel  # noqa: E402
 from .definitions.deepseek_v2_ocr import DeepSeekV2OCRQModel  # noqa: E402
 from .definitions.deepseek_v3 import DeepSeekV3QModel  # noqa: E402
 from .definitions.deepseek_v4 import DeepSeekV4QModel  # noqa: E402
+from .definitions.glm5_next import Glm5NextQModel  # noqa: E402
 from .definitions.dots1 import Dots1QModel  # noqa: E402
 from .definitions.dream import DreamQModel  # noqa: E402
 from .definitions.ernie4_5 import Ernie4_5QModel  # noqa: E402
@@ -193,6 +194,7 @@ random.seed(787)
 numpy.random.seed(787)
 
 MODEL_MAP = {
+    "glm5_next": Glm5NextQModel,
     "apertus": ApertusQModel,
     "dream": DreamQModel,
     "bloom": BloomQModel,

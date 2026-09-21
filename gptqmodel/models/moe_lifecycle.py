@@ -271,6 +271,13 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
                 f"Got: gate={self.gate_proj_name}, up={self.up_proj_name}, down={self.down_proj_name}"
             )
 
+    def expert_intermediate(self, moe_block, expert, gate_out, up_out):
+        """Activation entering down-proj; models may override their gate semantics."""
+        import torch.nn.functional as F
+
+        activation = getattr(expert, "act_fn", F.silu)
+        return activation(gate_out) * up_out
+
     def _extract_moe_block_prefix(self, subset: Dict[str, Any], moe_block: nn.Module) -> Optional[str]:
         """
         Extract moe_block_prefix from subset keys.
@@ -330,8 +337,6 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
         2. Forwards to all individual experts (only those with modules in subset)
         3. Returns normal routed forward output (not averaged)
         """
-        import torch.nn.functional as F
-
         if not processor or not original_forward:
             error_msg = "Missing processor or original_forward"
             log.error(error_msg)
@@ -465,10 +470,7 @@ class ExpertProjectionMoELifecycleHooks(MoELifecycleHooks):
                         up_out = up_module(expert_input)
 
                         # Compute intermediate using expert's activation function
-                        if hasattr(expert, 'act_fn'):
-                            intermediate = expert.act_fn(gate_out) * up_out
-                        else:
-                            intermediate = F.silu(gate_out) * up_out
+                        intermediate = self.expert_intermediate(moe_block, expert, gate_out, up_out)
                         del gate_out, up_out
 
                         # Call down_proj via wrapper (or replica module) with hooks enabled for activation collection

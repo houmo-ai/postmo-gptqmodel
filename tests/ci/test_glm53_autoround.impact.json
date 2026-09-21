@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/recipes/glm5_3_flash_autoround.py",
+    "gptqmodel/recipes/glm5_3_flash.py",
+    "examples/quantization/examples/example_glm5_3_flash_autoround.py",
+    "tests/ci/_glm53_fixture.py",
+    "third_party/auto-round/auto_round/modeling/fused_moe/moe_experts_interface.py",
+    "third_party/auto-round/auto_round/wrapper.py",
+    "third_party/auto-round/auto_round/data_type/int.py"
+  ]
+}
