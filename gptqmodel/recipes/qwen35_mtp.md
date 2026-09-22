@@ -64,3 +64,20 @@ HF 主模型仍忽略 MTP，`Qwen35MTP.from_pretrained` 负责加载 MTP。
 
 MTP 共用主模型 head；主 head 已打包时读取其真实量化载荷，不重复训练。
 不能仅因存在 embedding 就把它当作 untied head 的替代权重。
+
+## Dense MTP
+
+Qwen3.5/3.6/3.8 dense 的单层 MTP 使用 `mtp={"block_bits": 4}`；
+`block_bits` 可选 4、5、8。对 decoder block 的 attention 与 MLP Linear
+逐层使用所选 AutoRound/GPTQ 算法校准，融合 FC 保留浮点供导出 W8，
+norm 保留浮点，head 始终复用主模型。Dense 不使用 `expert_bits` 来划分专家；
+MoE 仍使用 `expert_bits=4`，两种拓扑配置不能混用。
+
+保存的 `mtp_quantization.scope=dense_block` 和 `block_bits` 描述真实精度，
+`mtp.layers.0.{self_attn,mlp}.*_proj` 保存 GPTQ V2 载荷；W5 仍使用本地
+8-bit 槽位。默认输出目录后缀为 `mtp_w<block_bits>`，已量化主干保持不变。
+重载时校验实际载荷、分组和模块覆盖，不依赖输出目录名称判断量化完成。
+验证指标中的 `draft_fp_to_wN_kl`/`wN_draft_main_top1_match` 随实际位宽变化。
+
+ModelZoo unified 的 LoRA＋MTP 使用已经完成这些校准的 `quant_checkpoint`。
+本 recipe 不加载或量化 LoRA 增量；多 LoRA 由导出层复用同一个量化基座。

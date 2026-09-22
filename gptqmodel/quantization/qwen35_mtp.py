@@ -30,6 +30,8 @@ from .lm_head import _checkpoint_weight_map, read_checkpoint_config
 class MTPQuantizationConfig:
     algorithm: str = "inherit"
     expert_bits: int = 4
+    block_bits: int | None = None
+    fusion_bits: int = 8
     group_size: int = 64
     data_type: str = "int_sym_xh"
     iters: int = 400
@@ -43,6 +45,8 @@ class MTPQuantizationConfig:
             raise ValueError("MTP algorithm must be inherit, autoround or gptq")
         if (self.expert_bits, self.group_size, self.data_type) != (4, 64, "int_sym_xh"):
             raise ValueError("MTP supports routed experts W4/G64/int_sym_xh only; other weights use export W8")
+        if self.block_bits not in (None, 4, 5, 8) or self.fusion_bits != 8:
+            raise ValueError("Dense MTP block_bits must be 4/5/8; fusion_bits must remain 8")
         for name in ("iters", "batch_tokens", "max_tokens_per_expert", "validation_nsamples"):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f"MTP {name} must be a positive integer")
@@ -89,8 +93,8 @@ class CheckpointTensors:
 
 def mtp_text_config(config):
     text = config.get("text_config", config)
-    if text.get("model_type") != "qwen3_5_moe_text" or text.get("mtp_num_hidden_layers", 1) != 1:
-        raise ValueError("MTP calibration requires Qwen3.5/3.6 MoE with exactly one MTP layer")
+    if text.get("model_type") not in ("qwen3_5_moe_text", "qwen3_5_text") or text.get("mtp_num_hidden_layers", 1) != 1:
+        raise ValueError("MTP calibration requires Qwen3.5 dense/MoE with exactly one MTP layer")
     if (config.get("quantization_config") or {}).get("rotation"):
         raise ValueError("MTP calibration does not support rotated checkpoints")
     return text
@@ -130,6 +134,11 @@ def load_packed_linear(reader, prefix, *, bits, group_size, in_features, out_fea
 def inspect_mtp_checkpoint(source, options):
     reader = CheckpointTensors(source)
     text = mtp_text_config(reader.config)
+    if text["model_type"] == "qwen3_5_text":
+        from .qwen35_mtp_dense import inspect_dense_checkpoint
+        return inspect_dense_checkpoint(reader, options)
+    if options.block_bits is not None:
+        raise ValueError("MoE MTP uses expert_bits, not block_bits")
     metadata = reader.config.get("mtp_quantization")
     prefix = "mtp.layers.0.mlp.experts."
     packed = any(k.startswith(prefix) and k.endswith(".qweight") for k in reader.mapping)
@@ -175,6 +184,13 @@ class Qwen35MTP(nn.Module):
         )
         values = copy.deepcopy(mtp_text_config(config))
         values.update(num_hidden_layers=1, layer_types=["full_attention"])
+        if values["model_type"] == "qwen3_5_text":
+            from transformers import Qwen3_5TextConfig as Qwen3_5MoeTextConfig
+            from transformers.models.qwen3_5.modeling_qwen3_5 import (
+                Qwen3_5DecoderLayer as Qwen3_5MoeDecoderLayer,
+                Qwen3_5RMSNorm as Qwen3_5MoeRMSNorm,
+                Qwen3_5TextRotaryEmbedding as Qwen3_5MoeTextRotaryEmbedding,
+            )
         cfg = Qwen3_5MoeTextConfig(**values)
         cfg._attn_implementation = "eager"
         self.config = cfg
@@ -202,6 +218,10 @@ class Qwen35MTP(nn.Module):
         reader = CheckpointTensors(source)
         with torch.device("meta"):
             model = cls(reader.config)
+        if mtp_text_config(reader.config)["model_type"] == "qwen3_5_text":
+            from .qwen35_mtp_dense import load_dense_state
+            load_dense_state(model, reader, dtype)
+            return model
         state = {k[4:]: reader.get(k).to(dtype) for k in reader.mapping
                  if k.startswith("mtp.") and ".mlp.experts." not in k}
         text = mtp_text_config(reader.config)
@@ -314,6 +334,9 @@ def tune_expert(weights, inputs, options, *, device):
 
 def calibrate_mtp_experts(model, expert_inputs, options, *, device):
     """Use actual MTP routing; explicitly record bypass data for unvisited experts."""
+    if model.config.model_type == "qwen3_5_text":
+        from .qwen35_mtp_dense import calibrate_dense
+        return calibrate_dense(model, expert_inputs, options, device=device)
     inputs = torch.cat(expert_inputs).reshape(-1, model.config.hidden_size).cpu()
     if not len(inputs) or not torch.isfinite(inputs).all():
         raise ValueError("MTP calibration has no finite, non-padding input tokens")
@@ -412,7 +435,7 @@ def tune_expert_gptq(weights, inputs, options, *, device):
                      "algorithm": "gptq", "true_sequential": True, "projections": projections}
 
 
-def validate_mtp_payload(model, payload, records, source, *, device):
+def validate_mtp_payload(model, payload, records, source, *, device, options=None):
     """Held-out teacher-forced draft comparison; not live speculative acceptance."""
     from ..nn_modules.qlinear.torch import TorchQuantLinear
     from .config import QuantizeConfig, FORMAT
@@ -433,24 +456,35 @@ def validate_mtp_payload(model, payload, records, source, *, device):
         if key not in reader.mapping and (reader.config.get("tie_word_embeddings") or text.get("tie_word_embeddings")):
             key = next(k for k in reader.mapping if k.endswith("embed_tokens.weight"))
         head_weight = reader.get(key).to(device=device, dtype=torch.float16)
-    expert_weights = model.layers[0].mlp.experts
-    for expert in range(model.config.num_experts):
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            prefix = f"mtp.layers.0.mlp.experts.{expert}.{proj}."
-            ins, outs = text["hidden_size"], text["moe_intermediate_size"]
-            if proj == "down_proj":
-                ins, outs = outs, ins
-            module = TorchQuantLinear(bits=4, group_size=64, sym=True, desc_act=False,
-                                     in_features=ins, out_features=outs)
+    if model.config.model_type == "qwen3_5_text":
+        from .qwen35_mtp_dense import dense_linears
+        for name, layer in dense_linears(model).items():
+            prefix = "mtp." + name + "."
+            module = TorchQuantLinear(bits=options.block_bits, group_size=64, sym=True, desc_act=False,
+                                      in_features=layer.in_features, out_features=layer.out_features)
             module.load_state_dict({k[len(prefix):]: v for k, v in payload.items() if k.startswith(prefix)})
             module.qzero_format(format=2)
-            weight = module.dequantize_weight().T
             with torch.no_grad():
+                layer.weight.copy_(module.dequantize_weight().T.to(layer.weight))
+    else:
+        expert_weights = model.layers[0].mlp.experts
+        for expert in range(model.config.num_experts):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                prefix = f"mtp.layers.0.mlp.experts.{expert}.{proj}."
+                ins, outs = text["hidden_size"], text["moe_intermediate_size"]
                 if proj == "down_proj":
-                    expert_weights.down_proj[expert].copy_(weight)
-                else:
-                    halves = expert_weights.gate_up_proj[expert].chunk(2, dim=0)
-                    halves[0 if proj == "gate_proj" else 1].copy_(weight)
+                    ins, outs = outs, ins
+                module = TorchQuantLinear(bits=4, group_size=64, sym=True, desc_act=False,
+                                         in_features=ins, out_features=outs)
+                module.load_state_dict({k[len(prefix):]: v for k, v in payload.items() if k.startswith(prefix)})
+                module.qzero_format(format=2)
+                weight = module.dequantize_weight().T
+                with torch.no_grad():
+                    if proj == "down_proj":
+                        expert_weights.down_proj[expert].copy_(weight)
+                    else:
+                        halves = expert_weights.gate_up_proj[expert].chunk(2, dim=0)
+                        halves[0 if proj == "gate_proj" else 1].copy_(weight)
     model.to(device).eval()
     tokens, kl_sum, same, fp_match, quant_match = 0, 0.0, 0, 0, 0
     with torch.inference_mode():
@@ -470,10 +504,13 @@ def validate_mtp_payload(model, payload, records, source, *, device):
                 quant_match += int((quant_ids == main_ids).sum())
                 tokens += len(ref)
     model.cpu()
+    bits = options.block_bits if model.config.model_type == "qwen3_5_text" else 4
     result = {"scope": "held_out_teacher_forcing", "samples": len(records), "tokens": tokens,
-              "draft_fp_to_w4_kl": kl_sum / tokens, "draft_top1_agreement": same / tokens,
-              "fp_draft_main_top1_match": fp_match / tokens, "w4_draft_main_top1_match": quant_match / tokens,
-              "note": "Floating non-expert MTP weights; not SEFP W8 runtime or live speculative acceptance."}
+              "logical_bits": bits, f"draft_fp_to_w{bits}_kl": kl_sum / tokens,
+              "draft_top1_agreement": same / tokens,
+              "fp_draft_main_top1_match": fp_match / tokens,
+              f"w{bits}_draft_main_top1_match": quant_match / tokens,
+              "note": "Uncalibrated MTP weights remain floating; not SEFP W8 runtime or live speculative acceptance."}
     if not all(math.isfinite(v) for v in result.values() if isinstance(v, float)):
         raise ValueError("MTP validation produced non-finite metrics")
     return result
@@ -487,7 +524,10 @@ def save_mtp_checkpoint(source, target, payload, options, provenance):
         raise ValueError("MTP output must be outside the source checkpoint")
     if target.exists() and any(target.iterdir()):
         raise FileExistsError(f"MTP output already exists: {target}")
-    old = {k for k in reader.mapping if k.startswith("mtp.layers.0.mlp.experts.")}
+    dense = mtp_text_config(reader.config)["model_type"] == "qwen3_5_text"
+    replaced = {key.rsplit(".", 1)[0] for key in payload}
+    old = ({key + ".weight" for key in replaced} if dense else
+           {k for k in reader.mapping if k.startswith("mtp.layers.0.mlp.experts.")})
     affected = {reader.mapping[k] for k in old}
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=target.name + ".tmp-", dir=target.parent) as tmp:
@@ -524,7 +564,7 @@ def save_mtp_checkpoint(source, target, payload, options, provenance):
         # does. read_checkpoint_config merges sidecars for reading only.
         config = json.loads((source / "config.json").read_text())
         config["mtp_quantization"] = {**asdict(options), "version": 1, "format": "gptq_v2",
-                                      "scope": "routed_experts", "other_weights": "float"}
+                                      "scope": "dense_block" if dense else "routed_experts", "other_weights": "float"}
         (stage / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         (stage / "qwen35_mtp_recipe_provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
         inspect_mtp_checkpoint(stage, options)

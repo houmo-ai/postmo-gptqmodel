@@ -1,6 +1,6 @@
 # Copyright 2026 HOUMO AI
 # SPDX-License-Identifier: Apache-2.0
-"""Complete Qwen3.5/3.6 MoE MTP experts on HF or already quantized checkpoints."""
+"""Calibrate Qwen dense/MoE MTP on HF or already quantized checkpoints."""
 from __future__ import annotations
 
 import argparse
@@ -61,7 +61,10 @@ def collect_mtp_inputs(source, model, calibration, *, device, validation_nsample
                 mtp_hidden = hidden[:, :-1].to(model.fc.weight.dtype)
                 reference = model(embeddings, mtp_hidden)
                 if index < len(calibration) - validation_nsamples:
-                    expert_inputs.extend(captured)
+                    if model.config.model_type == "qwen3_5_text":
+                        expert_inputs.append({"embedding": embeddings.cpu(), "hidden": mtp_hidden.cpu()})
+                    else:
+                        expert_inputs.extend(captured)
                 else:
                     validation.append({"embedding": embeddings.cpu(), "hidden": mtp_hidden.cpu(),
                                        "reference": reference.cpu(), "main_next_hidden": hidden[:, 1:].cpu()})
@@ -92,7 +95,7 @@ def quantize_qwen35_mtp(*, model_dir, mtp, output_dir=None, calibration_jsonl=No
     # that caller already resolves the algorithm exactly as the head stage does.
     if not dry_run or source.exists() or options.algorithm == "inherit":
         options = replace(options, algorithm=resolve_mtp_algorithm(source, options.algorithm))
-    target = Path(output_dir).expanduser().resolve() if output_dir else source.with_name(source.name + "_mtp_w4")
+    target = Path(output_dir).expanduser().resolve() if output_dir else source.with_name(source.name + f"_mtp_w{options.block_bits or options.expert_bits}")
     if not dry_run:
         metadata = inspect_mtp_checkpoint(source, options)
         if metadata:
@@ -113,7 +116,8 @@ def quantize_qwen35_mtp(*, model_dir, mtp, output_dir=None, calibration_jsonl=No
                   "calibration_dataset": calibration_dataset, "calibration_text_key": calibration_text_key,
                   "device": str(device), "seed": seed, "dry_run": dry_run,
                   "input_alignment": "main_post_norm_hidden[t], embedding(token[t+1])",
-                  "loss": "joint_expert_output_mse" if options.algorithm == "autoround" else "gptq_hessian",
+                  "loss": (("linear_output_mse" if options.block_bits else "joint_expert_output_mse")
+                           if options.algorithm == "autoround" else "gptq_hessian"),
                   "main_model_and_head": "unchanged"}
     if not dry_run:
         import torch
@@ -147,7 +151,7 @@ def quantize_qwen35_mtp(*, model_dir, mtp, output_dir=None, calibration_jsonl=No
         provenance["calibration_cache"] = str(cache) if cache else None
         payload, metrics = calibrate_mtp_experts(model, expert_inputs, options, device=device)
         provenance["experts"] = metrics
-        provenance["validation"] = validate_mtp_payload(model, payload, validation, source, device=device)
+        provenance["validation"] = validate_mtp_payload(model, payload, validation, source, device=device, options=options)
         save_mtp_checkpoint(source, target, payload, options, provenance)
     return Qwen35MTPRecipeResult(str(target), options.algorithm, "gptqmodel_hf", provenance)
 
@@ -165,13 +169,13 @@ def quantize_with_mtp(recipe, options, *, backbone_algorithm):
                                                       backbone_algorithm=backbone_algorithm))
     if _normalize_rotation(options.get("rotation")) or options.get("save_rotated"):
         raise ValueError("MTP calibration requires rotation=false")
-    if options.get("topology") not in (None, "moe"):
-        raise ValueError("MTP calibration supports MoE topology only")
+    if options.get("topology") not in (None, "moe", "dense"):
+        raise ValueError("MTP calibration supports Qwen dense/MoE topology")
     output = Path(options["output_dir"]).expanduser().resolve()
     body = dict(options, mtp=None, output_dir=str(output) + ".main")
     preview = recipe(**dict(body, dry_run=True))
-    if preview.topology != "moe":
-        raise ValueError("MTP calibration supports MoE topology only")
+    if (preview.topology == "dense") != (mtp.block_bits is not None):
+        raise ValueError("Dense MTP requires block_bits; MoE MTP requires expert_bits")
     source_options = (autoround_head_calibration_source(options["dataset"]) if backbone_algorithm == "autoround"
                       else {"calibration_jsonl": options.get("calibration_jsonl"),
                             "calibration_dataset": options.get("calibration_dataset")})

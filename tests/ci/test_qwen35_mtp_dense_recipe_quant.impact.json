@@ -1,0 +1,1 @@
+{"version":1,"lane":"quant","patterns":["gptqmodel/recipes/qwen35_mtp.py","gptqmodel/quantization/qwen35_mtp.py","gptqmodel/quantization/qwen35_mtp_dense.py","gptqmodel/recipes/qwen35.py","gptqmodel/recipes/qwen35_autoround.py","tests/ci/_qwen35_mixed_fixture.py"]}

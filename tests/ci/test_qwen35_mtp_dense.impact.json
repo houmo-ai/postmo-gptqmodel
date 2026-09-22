@@ -1,0 +1,1 @@
+{"version":1,"lane":"cpu","patterns":["gptqmodel/quantization/qwen35_mtp_dense.py","gptqmodel/quantization/qwen35_mtp.py","gptqmodel/recipes/qwen35_mtp.py"]}
