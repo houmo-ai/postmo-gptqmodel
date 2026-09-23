@@ -60,7 +60,6 @@ from ..utils.structure import alias_all_from_turtle_if_meta, restore_rotation_pr
 from ..utils.torch import torch_empty_cache
 from ..version import __version__
 from ._const import DEFAULT_MAX_SHARD_SIZE, DEVICE
-from .loader import preserve_initialization_state
 
 
 log = setup_logger()
@@ -541,7 +540,6 @@ def ModelWriter(cls):
 
     cls.save_quantized = save_quantized
 
-    @preserve_initialization_state
     def get_model_with_quantize(self, qcfg, model_id_or_path):
 
         config = AutoConfig.from_pretrained(
