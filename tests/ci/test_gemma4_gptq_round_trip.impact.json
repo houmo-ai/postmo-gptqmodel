@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/models/definitions/gemma4.py",
+    "gptqmodel/utils/model.py",
+    "gptqmodel/looper/module_looper.py",
+    "gptqmodel/models/loader.py",
+    "gptqmodel/models/writer.py"
+  ]
+}

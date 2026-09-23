@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "third_party/auto-round/scripts_gemma4/quantize.py",
+    "third_party/auto-round/auto_round/compressors/base.py",
+    "third_party/auto-round/auto_round/compressors/utils.py",
+    "gptqmodel/models/definitions/gemma4.py",
+    "gptqmodel/models/loader.py",
+    "gptqmodel/models/writer.py",
+    "third_party/auto-round/auto_round/export/export_to_autogptq/**",
+    "third_party/auto-round/auto_round/export/utils.py"
+  ]
+}

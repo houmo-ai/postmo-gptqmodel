@@ -1433,7 +1433,8 @@ class ModuleLooper():
             elif self.gptq_model.quantize_config.dynamic_get(self.gptq_model.lm_head, default=None) is None:
                 self.gptq_model.quantize_config.dynamic[self.gptq_model.lm_head] = lm_head_quant_config
 
-        forward_pass_use_cache = self.gptq_model.model.config.use_cache if hasattr(self.gptq_model.model.config, "use_cache") else False
+        forward_pass_had_use_cache = hasattr(self.gptq_model.model.config, "use_cache")
+        forward_pass_use_cache = self.gptq_model.model.config.use_cache if forward_pass_had_use_cache else False
         self.gptq_model.model.config.use_cache = False
         layers, layers_prefix = get_module_by_name_prefix(self.gptq_model.model, self.gptq_model.extract_layers_node())
         region_timer = getattr(self.gptq_model, "quant_region_timer", None)
@@ -1601,7 +1602,12 @@ class ModuleLooper():
         if region_timer is not None:
             region_timer.flush()
 
-        self.gptq_model.model.config.use_cache = forward_pass_use_cache
+        if forward_pass_had_use_cache:
+            self.gptq_model.model.config.use_cache = forward_pass_use_cache
+        else:
+            # Composite configs may own this flag only in text_config. Do not
+            # serialize the temporary calibration override into their root.
+            del self.gptq_model.model.config.use_cache
 
         return total_log
 

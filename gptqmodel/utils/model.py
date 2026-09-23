@@ -1132,7 +1132,20 @@ def pack_model(
     return quant_linear_cls
 
 def simple_dispatch_model(model, device_map):
-    from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+    from accelerate.hooks import AlignDevicesHook, CpuOffload, UserCpuOffloadHook, add_hook_to_module
+
+    skip_keys = getattr(model, "_skip_keys_device_placement", None)
+    preserved_keys = [skip_keys] if isinstance(skip_keys, str) else (skip_keys or [])
+
+    class CacheAwareCpuOffload(CpuOffload):
+        def pre_forward(self, module, *args, **kwargs):
+            # CpuOffload does not expose AlignDevicesHook's skip_keys option.
+            # Let it move the module and ordinary inputs, preserving the same
+            # model-owned cache containers as the resident-device branch.
+            preserved = {key: kwargs.pop(key) for key in preserved_keys if key in kwargs}
+            args, kwargs = super().pre_forward(module, *args, **kwargs)
+            kwargs.update(preserved)
+            return args, kwargs
 
     device_map = dict(device_map)
     single_root = "" in device_map and len(device_map) == 1
@@ -1161,7 +1174,12 @@ def simple_dispatch_model(model, device_map):
     prev_hook = None
     for idx, (n, d) in enumerate(cpu_offload_group):
         m = get_module_by_name_suffix(model, n)
-        _, prev_hook = accelerate.cpu_offload_with_hook(m, execution_device=main_device, prev_module_hook=prev_hook)
+        if preserved_keys:
+            hook = CacheAwareCpuOffload(execution_device=main_device, prev_module_hook=prev_hook)
+            add_hook_to_module(m, hook, append=True)
+            prev_hook = UserCpuOffloadHook(m, hook)
+        else:
+            _, prev_hook = accelerate.cpu_offload_with_hook(m, execution_device=main_device, prev_module_hook=prev_hook)
     # set first cpu offload module's prev_module_hook to the last cpu offload module's hook
     if len(cpu_offload_group) > 1:
         get_module_by_name_suffix(model, cpu_offload_group[0][0])._hf_hook.prev_module_hook = prev_hook
@@ -1172,7 +1190,13 @@ def simple_dispatch_model(model, device_map):
         m = get_module_by_name_suffix(model, n)
         if d != "cpu":
             d = torch.device(d)
-            hook = AlignDevicesHook(d, io_same_device=True, place_submodules=True)
+            # Preserve the model's mutable cache containers across layer hooks.
+            # Rebuilding Gemma4's shared_kv_states dictionary hides donor writes
+            # from later borrower layers, even when every tensor stays on CPU.
+            hook = AlignDevicesHook(
+                d, io_same_device=True, place_submodules=True,
+                skip_keys=skip_keys,
+            )
             add_hook_to_module(m, hook)
     accelerate.utils.modeling.retie_parameters(model, tied_params)
 

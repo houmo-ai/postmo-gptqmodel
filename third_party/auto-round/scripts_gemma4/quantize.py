@@ -562,6 +562,129 @@ def get_vision_layer_names(model):
 
 # ─── Position embeddings fix for AutoRound block-wise processing ──────────────
 
+class Gemma4ReplayState:
+    """Per-compressor calibration state; never share samples or FP/Q donor KV.
+
+    AutoRound computes FP targets first, then tunes and propagates quantized
+    inputs. Its generic cache omits dictionaries and only captures layer zero's
+    PLE. Keep these Gemma-specific inputs outside that cache, indexed by the
+    actual sampling indices (including shuffled and partial batches).
+    """
+
+    def __init__(self, language_model):
+        self.language_model = language_model
+        self.indices = None
+        self.phase = "quant"
+        self.kv = {"float": {}, "quant": {}}
+        self.per_layer_inputs = []
+        self._restores = []
+        self._first_outputs = False
+        self.quantized_input = True
+        if getattr(language_model, "hidden_size_per_layer_input", 0):
+            original = language_model.project_per_layer_inputs
+
+            def project(*args, **kwargs):
+                result = original(*args, **kwargs)
+                if self.indices is None:
+                    self.per_layer_inputs.extend(result.detach().cpu().split(1, dim=0))
+                return result
+
+            self._replace(language_model, "project_per_layer_inputs", project)
+
+    def _replace(self, obj, name, value):
+        had_local = name in vars(obj)
+        previous = vars(obj).get(name)
+        self._restores.append((obj, name, had_local, previous))
+        setattr(obj, name, value)
+
+    def attach(self, compressor):
+        if compressor.nblocks != 1:
+            raise ValueError("Gemma4 replay requires nblocks=1")
+        self.quantized_input = getattr(compressor, "enable_quanted_input", True)
+        # This is already a bound classmethod. Passing compressor/cls again
+        # would shift every argument and fail on the very first block.
+        sample = compressor._sampling_inputs
+        get_outputs = compressor._get_block_outputs
+        quantize_block = compressor._quantize_block
+
+        def sampling(input_ids, input_others, indices, *args, **kwargs):
+            sampled = sample(input_ids, input_others, indices, *args, **kwargs)
+            self.indices = [int(index) for index in indices]
+            return sampled
+
+        def outputs(*args, **kwargs):
+            previous = self.phase
+            self.phase = "float" if self._first_outputs else "quant"
+            self._first_outputs = False
+            try:
+                return get_outputs(*args, **kwargs)
+            finally:
+                self.phase = previous
+                self.indices = None
+
+        def quantize(*args, **kwargs):
+            self._first_outputs = True
+            self.phase = "quant"
+            try:
+                return quantize_block(*args, **kwargs)
+            finally:
+                self.indices = None
+
+        self._replace(compressor, "_sampling_inputs", sampling)
+        self._replace(compressor, "_get_block_outputs", outputs)
+        self._replace(compressor, "_quantize_block", quantize)
+
+    def inputs_for_layer(self, layer_index, hidden_states, per_layer_input, shared):
+        if self.indices is None:
+            return per_layer_input, shared if shared is not None else {}
+        if len(self.indices) != hidden_states.shape[0]:
+            raise ValueError("Gemma4 replay sample indices do not match batch size")
+        length = hidden_states.shape[1]
+        if self.per_layer_inputs:
+            per_layer_input = torch.cat([
+                self.per_layer_inputs[index][:, :length, layer_index, :]
+                for index in self.indices
+            ]).to(hidden_states.device)
+        attention = self.language_model.layers[layer_index].self_attn
+        shared = {}
+        if attention.is_kv_shared_layer:
+            phase = self.phase if self.quantized_input else "float"
+            bank = self.kv[phase].get(attention.layer_type, {})
+            missing = [index for index in self.indices if index not in bank]
+            if missing:
+                raise RuntimeError(
+                    f"Gemma4 {self.phase} KV donor missing for {attention.layer_type}, samples {missing}"
+                )
+            shared[attention.layer_type] = tuple(
+                torch.cat([bank[index][part][:, :, :length] for index in self.indices]).to(hidden_states.device)
+                for part in (0, 1)
+            )
+        return per_layer_input, shared
+
+    def save_donor(self, layer_index, shared):
+        if self.indices is None or torch.is_grad_enabled():
+            return
+        attention = self.language_model.layers[layer_index].self_attn
+        if not attention.store_full_length_kv:
+            return
+        key, value = shared[attention.layer_type]
+        bank = self.kv[self.phase].setdefault(attention.layer_type, {})
+        for offset, index in enumerate(self.indices):
+            bank[index] = (key[offset:offset + 1].detach().cpu().clone(),
+                           value[offset:offset + 1].detach().cpu().clone())
+
+    def close(self):
+        for obj, name, had_local, previous in reversed(self._restores):
+            if had_local:
+                setattr(obj, name, previous)
+            else:
+                delattr(obj, name)
+        self._restores.clear()
+        self.kv.clear()
+        self.per_layer_inputs.clear()
+        self.indices = None
+
+
 def patch_position_embeddings(model, seqlen, device):
     """Monkey-patch decoder layers to use correct position_embeddings per layer type.
 
@@ -587,6 +710,8 @@ def patch_position_embeddings(model, seqlen, device):
         print(f"  Pre-computed position_embeddings for '{layer_type}': "
               f"cos={cos.shape}, sin={sin.shape}")
 
+    replay = Gemma4ReplayState(lm)
+
     # Determine layer type for each layer
     layer_types = text_config.layer_types
 
@@ -596,16 +721,23 @@ def patch_position_embeddings(model, seqlen, device):
     supports_per_layer_input = "per_layer_input" in forward_parameters
     supports_shared_kv_states = "shared_kv_states" in forward_parameters
 
-    def make_patched_forward(layer_type_name, orig_fwd):
+    def make_patched_forward(layer_index, layer_type_name, orig_fwd):
         cached_pos = pos_emb_cache[layer_type_name]
 
         def patched_forward(self, hidden_states, per_layer_input=None,
                             position_embeddings=None, attention_mask=None,
                             position_ids=None, past_key_values=None, **kwargs):
             # Replace position_embeddings with the correct type for this layer
-            correct_pos = (cached_pos[0].to(hidden_states.device),
-                           cached_pos[1].to(hidden_states.device))
+            length = hidden_states.shape[1]
+            if position_ids is None:
+                correct_pos = tuple(part[:, :length].to(hidden_states.device) for part in cached_pos)
+            else:
+                positions = position_ids.to(device="cpu", dtype=torch.long)
+                correct_pos = tuple(part[0][positions].to(hidden_states.device) for part in cached_pos)
             shared_kv_states = kwargs.pop("shared_kv_states", None)
+            per_layer_input, shared_kv_states = replay.inputs_for_layer(
+                layer_index, hidden_states, per_layer_input, shared_kv_states
+            )
             call_kwargs = dict(
                 position_embeddings=correct_pos,
                 attention_mask=attention_mask,
@@ -624,14 +756,17 @@ def patch_position_embeddings(model, seqlen, device):
                 call_kwargs["shared_kv_states"] = (
                     shared_kv_states if shared_kv_states is not None else {}
                 )
-            return orig_fwd(self, hidden_states, **call_kwargs)
+            output = orig_fwd(self, hidden_states, **call_kwargs)
+            replay.save_donor(layer_index, shared_kv_states)
+            return output
         return patched_forward
 
     for i, layer in enumerate(lm.layers):
         lt = layer_types[i]
-        layer.forward = types.MethodType(make_patched_forward(lt, original_forward), layer)
+        replay._replace(layer, "forward", types.MethodType(make_patched_forward(i, lt, original_forward), layer))
 
     print(f"  Patched {len(lm.layers)} layers with correct position_embeddings")
+    return replay
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -658,11 +793,7 @@ def main():
     print("\nLoading model...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 
-    processor = None
-    try:
-        processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
-    except Exception:
-        pass
+    processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
 
     # Load to CPU; AutoRound handles GPU placement during optimization.
     model_kwargs = dict(
@@ -748,14 +879,16 @@ def main():
 
     # ── Patch position embeddings ──
     print("\nPatching position embeddings for block-wise processing...")
-    patch_position_embeddings(model, args.seqlen, args.device)
+    replay = patch_position_embeddings(model, args.seqlen, args.device)
 
     # ── Quantize ──
     print(f"\n{'='*60}")
     print("Starting AutoRound quantization...")
     print(f"{'='*60}")
 
-    from auto_round import AutoRound
+    # This script calibrates text only, including when the checkpoint has
+    # vision/audio components. Avoid the multimodal dataset/compressor route.
+    from auto_round.compressors import LLMCompressor as AutoRound
 
     ar_kwargs = {}
     layer_config = {}
@@ -773,7 +906,7 @@ def main():
     ar = AutoRound(
         model=model,
         tokenizer=tokenizer,
-        processor=processor,
+        device_map=args.device,
         bits=args.llm_bits,
         group_size=args.llm_group_size,
         sym=args.sym,
@@ -790,7 +923,11 @@ def main():
     )
 
     t1 = time.time()
-    ar.quantize()
+    replay.attach(ar)
+    try:
+        ar.quantize()
+    finally:
+        replay.close()
     quant_time = time.time() - t1
     print(f"Quantization completed in {quant_time:.1f}s ({quant_time/3600:.2f}h)")
 
@@ -799,6 +936,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     ar.save_quantized(args.output_dir, format=args.format)
     restore_source_config_fields(args.model, args.output_dir)
+    if processor is not None:
+        processor.save_pretrained(args.output_dir)
 
     total_time = time.time() - total_start
     print(f"\n{'='*60}")

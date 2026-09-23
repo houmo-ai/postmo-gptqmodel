@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from functools import wraps
 from importlib.metadata import PackageNotFoundError, version
 from itertools import chain
 from typing import Dict, List, Optional, Union
@@ -64,6 +65,31 @@ from ._const import DEVICE, normalize_device
 log = setup_logger()
 
 ATTN_IMPLEMENTATION = "attn_implementation"
+
+
+def preserve_initialization_state(func):
+    """Keep no-init model construction from changing later model loads."""
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        init = torch.nn.init
+        initializers = {
+            name: getattr(init, name)
+            for name in ("kaiming_uniform_", "uniform_", "normal_")
+        }
+        hf_utils = transformers.modeling_utils
+        had_hf_init_weights = hasattr(hf_utils, "_init_weights")
+        hf_init_weights = getattr(hf_utils, "_init_weights", None)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            for name, initializer in initializers.items():
+                setattr(init, name, initializer)
+            if had_hf_init_weights:
+                hf_utils._init_weights = hf_init_weights
+            elif hasattr(hf_utils, "_init_weights"):
+                del hf_utils._init_weights
+
+    return wrapped
 
 
 def parse_version_string(version_str: str):
@@ -128,6 +154,7 @@ def get_model_local_path(pretrained_model_id_or_path, **kwargs):
 
 def ModelLoader(cls):
     @classmethod
+    @preserve_initialization_state
     def from_pretrained(
             cls,
             pretrained_model_id_or_path: str,
@@ -336,6 +363,7 @@ def ModelLoader(cls):
     cls.from_pretrained = from_pretrained
 
     @classmethod
+    @preserve_initialization_state
     def from_quantized(
             cls,
             model_id_or_path: Optional[str],
