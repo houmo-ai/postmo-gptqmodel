@@ -6,6 +6,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from _qwen35_mtp_fixture import save_mtp_source
+from _qwen35_mixed_fixture import native_qwen35_cpu
 from gptqmodel.quantization.qwen35_mtp import (
     CheckpointTensors, MTPQuantizationConfig, Qwen35MTP, calibrate_mtp_experts,
     inspect_mtp_checkpoint, save_mtp_checkpoint,
@@ -100,7 +101,7 @@ def test_full_recipe_has_final_mtp_stage(algorithm, tmp_path):
     data = tmp_path / "data.jsonl"
     data.write_text('{"text": "t3 t4 t5"}\n')
     options = dict(model_dir=str(source), output_dir=str(tmp_path / "out"), topology="moe",
-                   head={"bits": 4}, mtp={"iters": 3}, dry_run=True)
+                   head={"bits": 4}, mtp={"iters": 3}, mtp_replay_device="cpu", dry_run=True)
     if algorithm == "autoround":
         result = quantize_qwen35_autoround(**options, dataset=str(data))
     else:
@@ -108,8 +109,32 @@ def test_full_recipe_has_final_mtp_stage(algorithm, tmp_path):
     assert result.provenance["head_stage"]["head"]["bits"] == 4
     assert result.provenance["mtp_stage"]["mtp"]["iters"] == 3
     assert result.provenance["mtp_stage"]["mtp"]["algorithm"] == algorithm
+    assert result.provenance["mtp_stage"]["replay_device"] == "cpu"
     assert result.output_dir == str(tmp_path / "out")
     assert not (tmp_path / "out").exists()
+
+
+def test_mtp_input_replay_uses_explicit_device(tmp_path, native_qwen35_cpu, monkeypatch):
+    from gptqmodel.recipes.qwen35_mtp import collect_mtp_inputs
+    from _qwen35_mixed_fixture import tiny_model
+    from transformers import AutoModelForImageTextToText
+
+    source = save_mtp_source(tmp_path / "source")
+    model = Qwen35MTP.from_pretrained(source)
+    calibration = [{"input_ids": torch.tensor([[3, 4, 5, 6, 7, 8]])} for _ in range(2)]
+    # Keep the tiny model's native Torch attention when the saved model is
+    # loaded: FLA's optional Triton kernel cannot execute on a CPU tensor.
+    monkeypatch.setattr(AutoModelForImageTextToText, "from_pretrained", lambda *a, **k: tiny_model().half())
+    inputs, validation = collect_mtp_inputs(
+        source, model, calibration, device="cpu", replay_device="cpu", validation_nsamples=1,
+    )
+    assert inputs and len(validation) == 1
+    assert validation[0]["hidden"].shape == (1, 5, 128)
+    assert validation[0]["embedding"].shape == (1, 5, 128)
+    owner = AutoModelForImageTextToText.from_pretrained(source, dtype=torch.float16)
+    with torch.inference_mode():
+        expected = owner.model.language_model(input_ids=calibration[0]["input_ids"], use_cache=False).last_hidden_state
+    torch.testing.assert_close(validation[0]["main_next_hidden"], expected[:, 1:], rtol=1e-3, atol=1e-3)
 
 
 def test_mtp_inherits_actual_producer_and_rejects_conflict(tmp_path):

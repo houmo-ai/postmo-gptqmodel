@@ -60,6 +60,7 @@ def quantize_qwen35_autoround(
     head: Mapping[str, Any] | None = None,
     auto_mixed_precision: bool | Mapping[str, Any] | None = None,
     mtp: Mapping[str, Any] | None = None,
+    mtp_replay_device: str | None = None,
     optimization_mode: str = "standard",
     xh_hessian_config: Mapping[str, Any] | None = None,
 ) -> Qwen35AutoRoundRecipeResult:

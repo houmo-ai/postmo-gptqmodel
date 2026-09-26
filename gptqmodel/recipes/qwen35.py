@@ -85,6 +85,7 @@ def quantize_qwen35(
     head: Mapping[str, Any] | None = None,
     auto_mixed_precision: bool | Mapping[str, Any] | None = None,
     mtp: Mapping[str, Any] | None = None,
+    mtp_replay_device: str | None = None,
 ) -> Qwen35QuantRecipeResult:
     """Quantize Qwen3.5/Qwen3.6 via the maintained example scripts.
 
