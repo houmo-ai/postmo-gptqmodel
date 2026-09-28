@@ -133,16 +133,18 @@ class BaseQuantLinear(nn.Module):
             in_features = self.in_features if not register_buffers_in_features else register_buffers_in_features
             out_features = self.out_features if not register_buffers_out_features else register_buffers_out_features
 
+            # Packed sizes count bits before converting to storage words.
+            # Dividing channels first drops valid partial 32-channel blocks.
             self.register_buffer(
                 "qweight",
-                t.zeros((in_features // self.pack_dtype_bits * self.bits, out_features), dtype=self.pack_dtype),
+                t.zeros((in_features * self.bits // self.pack_dtype_bits, out_features), dtype=self.pack_dtype),
             )
             self.register_buffer(
                 "qzeros",
                 t.zeros(
                     (
                         math.ceil(in_features / self.group_size),
-                        out_features // self.pack_dtype_bits * self.bits,
+                        out_features * self.bits // self.pack_dtype_bits,
                     ),
                     dtype=self.pack_dtype,
                 ),
@@ -645,12 +647,13 @@ class PackableQuantLinear(BaseQuantLinear):
         bits = int(self.bits)  # 2,3,4,8
         word_bits = int(self.pack_dtype_bits)  # expect 32
         assert word_bits == 32, "Only 32-bit packing words supported."
-        if (in_features % word_bits) != 0:
-            raise ValueError("in_features must be divisible by 32")
-        if (out_features % word_bits) != 0:
-            raise ValueError(
-                "pack_block extension requires out_features to be divisible by 32"
-            )
+        if (in_features % word_bits) != 0 or (out_features % word_bits) != 0:
+            # Native/block kernels process 32 channels at a time. The GPTQ
+            # format only needs pack_factor alignment for 2/4/8-bit values.
+            # Keep those valid tail channels through the scalar packer.
+            if bits in (2, 4, 8):
+                return self.pack_original(linear, scales.T, zeros.T, g_idx)
+            raise ValueError("pack_block requires 32-channel alignment for this bit width")
 
         disable_ext = env_flag("GPTQMODEL_DISABLE_PACK_EXT")
         force_ext = env_flag("GPTQMODEL_FORCE_PACK_EXT")
@@ -1098,7 +1101,12 @@ class PackableQuantLinear(BaseQuantLinear):
             int_weight = int_weight.T.contiguous()
             int_weight = int_weight.numpy().astype(self.pack_np_math_dtype)
 
-            qweight = np.zeros((int_weight.shape[0] // self.pack_dtype_bits * self.bits, int_weight.shape[1]),
+            alignment = self.pack_factor if self.bits in (2, 4, 8) else self.pack_dtype_bits
+            if int_weight.shape[0] % alignment or int_weight.shape[1] % alignment:
+                raise ValueError(f"pack_original requires input/output channels divisible by {alignment}")
+            # Multiply before dividing: e.g. 4304 W8 channels need 1076
+            # int32 words, not (4304 // 32) * 8 == 1072.
+            qweight = np.zeros((int_weight.shape[0] * self.bits // self.pack_dtype_bits, int_weight.shape[1]),
                                dtype=self.pack_np_math_dtype)
             if self.bits in [2, 4, 8]:
                 for row in range(qweight.shape[0]):
@@ -1131,7 +1139,7 @@ class PackableQuantLinear(BaseQuantLinear):
             self.register_buffer("qweight", t.from_numpy(qweight.astype(self.pack_np_dtype)))
 
             zeros = zeros.numpy().astype(self.pack_np_math_dtype)
-            qzeros = np.zeros((zeros.shape[0], zeros.shape[1] // self.pack_dtype_bits * self.bits), dtype=self.pack_np_math_dtype)
+            qzeros = np.zeros((zeros.shape[0], zeros.shape[1] * self.bits // self.pack_dtype_bits), dtype=self.pack_np_math_dtype)
             if self.bits in [2, 4, 8]:
                 for col in range(qzeros.shape[1]):
                     for j in range(self.pack_factor):
