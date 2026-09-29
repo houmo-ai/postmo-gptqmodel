@@ -158,6 +158,10 @@ from .definitions.qwen3_moe import Qwen3MoeQModel  # noqa: E402
 from .definitions.qwen3_next import Qwen3NextGPTQ  # noqa: E402
 from .definitions.qwen3_omni_moe import Qwen3OmniMoeGPTQ
 from .definitions.qwen3_vl import Qwen3_VLQModel
+try:
+    from .definitions.wemm_embedding import WeMMEmbeddingQModel
+except ImportError:
+    WeMMEmbeddingQModel = None
 from .definitions.rw import RwgQModel  # noqa: E402
 from .definitions.starcoder2 import Starcoder2QModel  # noqa: E402
 from .definitions.telechat2 import TeleChat2QModel
@@ -328,6 +332,9 @@ MODEL_MAP = {
 if Qwen3_5_VLQModel is not None:
     MODEL_MAP["qwen3_5"] = Qwen3_5_VLQModel
 
+if WeMMEmbeddingQModel is not None:
+    MODEL_MAP["wemm_embedding"] = WeMMEmbeddingQModel
+
 if Qwen3_5QModel is not None:
     MODEL_MAP["qwen3_5_text"] = Qwen3_5QModel
 
@@ -368,6 +375,10 @@ def _is_supported_quantization_config(config: AutoConfig) -> bool:
 
 def check_and_get_model_definition(model_dir, trust_remote_code=False):
     config = AutoConfig.from_pretrained(model_dir, trust_remote_code=trust_remote_code)
+    auto_map = getattr(config, "auto_map", None) or {}
+    if any("modeling_wemm_embedding" in str(value) for value in auto_map.values()):
+        if WeMMEmbeddingQModel is not None:
+            return WeMMEmbeddingQModel
     model_type = config.model_type.lower()
 
     # if model_type is not supported, use BaseQModel, will use auto_detect_module_tree to generate module tree

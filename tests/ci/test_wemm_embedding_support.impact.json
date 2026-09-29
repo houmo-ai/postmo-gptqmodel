@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/models/auto.py",
+    "gptqmodel/models/definitions/__init__.py",
+    "gptqmodel/models/definitions/wemm_embedding.py"
+  ]
+}

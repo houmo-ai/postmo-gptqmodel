@@ -131,6 +131,11 @@ except ImportError:
     Qwen3_5_VLQModel = None
 
 try:
+    from .wemm_embedding import WeMMEmbeddingQModel
+except ImportError:
+    WeMMEmbeddingQModel = None
+
+try:
     from .qwen3_5_moe import Qwen3_5_MoeQModel, Qwen3_5_MoeTextQModel, Qwen3_5MoeQModel, Qwen3_5MoeTextQModel
 except ImportError:
     Qwen3_5_MoeQModel = None
