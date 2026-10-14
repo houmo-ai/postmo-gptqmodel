@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "lane": "modelzoo",
+  "patterns": [
+    "gptqmodel/utils/deepseek_v4_dspark.py",
+    "gptqmodel/models/definitions/deepseek_v4.py",
+    "gptqmodel/recipes/deepseek_v4_flash.py"
+  ]
+}

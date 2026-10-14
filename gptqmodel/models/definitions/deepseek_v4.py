@@ -45,4 +45,10 @@ class DeepSeekV4QModel(DeepSeekV3QModel):
         },
     ]
 
+    def after_model_save(self, save_dir):
+        super().after_model_save(save_dir)
+        from ...utils.deepseek_v4_dspark import preserve_deepseek_v4_dspark
+
+        preserve_deepseek_v4_dspark(self.model_local_path, save_dir)
+
 __all__ = ["DeepSeekV4QModel"]

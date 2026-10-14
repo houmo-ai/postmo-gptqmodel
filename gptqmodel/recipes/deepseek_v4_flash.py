@@ -281,6 +281,10 @@ def prepare_deepseek_v4_flash_bf16(
         }
         copy_aux_files(source_path, staging_path, skip_files)
 
+        from gptqmodel.utils.deepseek_v4_dspark import preserve_deepseek_v4_dspark
+
+        preserve_deepseek_v4_dspark(source_path, staging_path)
+
         result = DeepSeekV4FlashPreparationResult(
             source_model_dir=str(source_path),
             output_dir=str(output_path),
@@ -599,6 +603,13 @@ def quantize_deepseek_v4_flash(
     )
     model.quantize(tokenized, batch_size=int(batch_size))
     model.save(str(output_path))
+    # Older prepared target checkpoints may have omitted the native draft.
+    # Repair from the recipe's original source without rerunning quantization.
+    from gptqmodel.utils.deepseek_v4_dspark import preserve_deepseek_v4_dspark
+
+    dspark = preserve_deepseek_v4_dspark(source_path, output_path)
+    result.provenance["dspark"] = dspark
+    result.provenance["mtp_included"] = dspark is not None
     audit_deepseek_v4_flash_quantized_artifact(output_path)
     _write_quant_provenance(output_path, result)
     return result
