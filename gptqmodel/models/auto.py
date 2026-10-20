@@ -87,6 +87,7 @@ from .definitions.deepseek_v2 import DeepSeekV2QModel  # noqa: E402
 from .definitions.deepseek_v2_ocr import DeepSeekV2OCRQModel  # noqa: E402
 from .definitions.deepseek_v3 import DeepSeekV3QModel  # noqa: E402
 from .definitions.deepseek_v4 import DeepSeekV4QModel  # noqa: E402
+from .definitions.xing4_0 import Xing4_0QModel  # noqa: E402
 from .definitions.glm5_next import Glm5NextQModel  # noqa: E402
 from .definitions.dots1 import Dots1QModel  # noqa: E402
 from .definitions.dream import DreamQModel  # noqa: E402
@@ -325,6 +326,7 @@ MODEL_MAP = {
     "lfm2_moe": LFM2MoeQModel,
     "deepseek_v2": DeepSeekV2QModel,
     "deepseek_v2_ocr": DeepSeekV2OCRQModel,
+    "xing4_0": Xing4_0QModel,
     "llada2_moe": LLaDA2MoeQModel,
     "mistral3": Mistral3GPTQ,
     "afmoe": AfMoeQModel,

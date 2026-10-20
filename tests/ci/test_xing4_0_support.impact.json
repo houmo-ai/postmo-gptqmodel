@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/models/definitions/xing4_0.py",
+    "gptqmodel/models/moe_lifecycle.py",
+    "gptqmodel/recipes/xing4_0.py"
+  ]
+}

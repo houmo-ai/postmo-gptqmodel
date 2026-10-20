@@ -1,6 +1,6 @@
 #!/bin/bash
 WORK_DIR=$(dirname $(readlink -f "$0"))
 unset PYTHONPATH
-export PYTHONPATH=$WORK_DIR:$PYTHONPATH
+export PYTHONPATH="${WORK_DIR}${PYTHONPATH:+:$PYTHONPATH}"
 eval "$(conda shell.bash hook)"
 conda activate xhquant
