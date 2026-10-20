@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "third_party/auto-round/auto_round/modeling/unfused_moe/qwen3_moe.py",
+    "third_party/auto-round/auto_round/modeling/fused_moe/qwen3_moe.py",
+    "third_party/auto-round/auto_round/modeling/unfused_moe/__init__.py"
+  ]
+}
