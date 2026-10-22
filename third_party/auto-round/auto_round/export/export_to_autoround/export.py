@@ -54,10 +54,10 @@ from auto_round.utils import (
 )
 
 
-def _set_gptqmodel_dynamic_override(dynamic: dict | None, regex: str, cfg: dict):
+def _set_gptqmodel_dynamic_override(dynamic: dict | None, regex: str, cfg: dict, *, default_bits: int):
     if dynamic is None:
         return
-    if cfg.get("bits", 16) > 8:
+    if cfg.get("bits", default_bits) > 8:
         dynamic[f"-:{regex}"] = {}
     else:
         dynamic[f"+:{regex}"] = cfg
@@ -356,7 +356,10 @@ def save_quantized_as_autoround(
                     if cfg.get(key) is not None:
                         extra_config[layer_name][key] = cfg[key]
                 if dynamic is not None:
-                    _set_gptqmodel_dynamic_override(dynamic, f"^{re.escape(layer_name)}$", extra_config[layer_name])
+                    _set_gptqmodel_dynamic_override(
+                        dynamic, f"^{re.escape(layer_name)}$", extra_config[layer_name],
+                        default_bits=quantization_config["bits"],
+                    )
 
     regex_config = quantization_config.pop("regex_config")
     if regex_config is not None:
@@ -369,7 +372,10 @@ def save_quantized_as_autoround(
                     if cfg.get(key) is not None:
                         extra_config[regex_name][key] = cfg[key]
                 if dynamic is not None:
-                    _set_gptqmodel_dynamic_override(dynamic, regex_name, extra_config[regex_name])
+                    _set_gptqmodel_dynamic_override(
+                        dynamic, regex_name, extra_config[regex_name],
+                        default_bits=quantization_config["bits"],
+                    )
 
     if len(extra_config) > 0:
         quantization_config["extra_config"] = extra_config

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/models/base.py",
+    "gptqmodel/models/definitions/base_qwen3_vl.py",
+    "gptqmodel/recipes/qwen3_vl.py"
+  ]
+}

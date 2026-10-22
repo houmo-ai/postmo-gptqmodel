@@ -70,7 +70,6 @@ from ._const import (
 from .loader import ModelLoader
 from .writer import ModelWriter
 
-from qwen_vl_utils import process_vision_info
 if TYPE_CHECKING:
     try:
         from datasets import Dataset as HFDatasetType
@@ -159,6 +158,16 @@ def apply_module_tree_override(module_tree, override):
 
 
 def demo(model, processor):
+    try:
+        from qwen_vl_utils import process_vision_info
+    except ModuleNotFoundError as exc:
+        if exc.name != "qwen_vl_utils":
+            raise
+        raise ImportError(
+            "The Qwen-VL demo requires qwen_vl_utils. "
+            "Install it with `pip install qwen-vl-utils`."
+        ) from exc
+
     from accelerate import dispatch_model, infer_auto_device_map
     from accelerate.utils import get_balanced_memory
     raw_device = next(model.parameters()).device

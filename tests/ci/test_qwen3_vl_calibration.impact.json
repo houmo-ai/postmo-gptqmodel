@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/models/definitions/qwen3_vl.py",
+    "gptqmodel/models/definitions/qwen3_vl_calibration.py",
+    "gptqmodel/models/definitions/base_qwen3_vl.py",
+    "gptqmodel/recipes/qwen3_vl.py"
+  ]
+}

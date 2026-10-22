@@ -327,3 +327,7 @@ CUDA_VISIBLE_DEVICES=7 python examples/quantization/examples/example_gemma4.py -
 ```
 
 该例子中使用qwen3-30b的校准集，用户亦可使用gemma4的自生成，可参考`gptqmodel/quantization/calibration/README.md`中校准集生成方法
+
+## Qwen3-VL 特征编码器
+
+GPTQ / AutoRound 的公开 recipe、原生多模态校准和 ModelZoo 消费方式见 [Qwen3-VL 特征量化](qwen3_vl_features.md)。

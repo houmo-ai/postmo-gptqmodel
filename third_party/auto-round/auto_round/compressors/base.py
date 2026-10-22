@@ -2543,6 +2543,16 @@ class BaseCompressor(object):
                 kwargs["hidden_states"] = hidden_states
 
             for key in kwargs.keys():
+                # Optional per-example arguments may alternate between tensors
+                # and None (e.g. Qwen3-VL text/visual position_ids). Keep their
+                # sample indices aligned with hidden_states in batch-one replay.
+                if self.batch_size <= 1 and (
+                    kwargs[key] is None or isinstance(kwargs[key], (torch.Tensor, list, tuple))
+                ):
+                    self.inputs[name].setdefault(key, []).append(
+                        to_device(kwargs[key], device=torch.device("cpu"))
+                    )
+                    continue
                 if (
                     isinstance(kwargs[key], torch.Tensor)
                     or isinstance(kwargs[key], list)
