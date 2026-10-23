@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "lane": "cpu",
+  "patterns": [
+    "gptqmodel/recipes/minicpm_v_4_7.py"
+  ]
+}
