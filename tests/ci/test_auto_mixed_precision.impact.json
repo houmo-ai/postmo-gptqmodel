@@ -3,6 +3,7 @@
   "lane": "cpu",
   "patterns": [
     "gptqmodel/quantization/auto_mixed_precision.py",
+    "gptqmodel/quantization/auto_mixed_precision_replay.py",
     "gptqmodel/recipes/qwen35.py",
     "gptqmodel/recipes/qwen35_autoround.py",
     "gptqmodel/recipes/qwen35_head.py",

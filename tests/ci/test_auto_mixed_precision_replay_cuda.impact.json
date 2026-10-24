@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "lane": "quant",
+  "patterns": [
+    "gptqmodel/quantization/auto_mixed_precision.py",
+    "gptqmodel/quantization/auto_mixed_precision_replay.py",
+    "tests/ci/_qwen35_mixed_fixture.py"
+  ]
+}

@@ -49,6 +49,7 @@ class AutoMixedPrecisionConfig:
     dataset: str | None = None
     text_key: str = "text"
     device: str | None = None
+    execution_mode: str = "layerwise"
     image_dataset: str | None = None
     image_nsamples: int = 32
     image_seqlen: int = 2048
@@ -66,6 +67,8 @@ def parse_auto_mixed_precision(value):
     if unknown:
         raise ValueError(f"Unknown auto_mixed_precision fields: {sorted(unknown)}")
     config = AutoMixedPrecisionConfig(**value)
+    if config.execution_mode not in ("layerwise", "resident"):
+        raise ValueError("auto_mixed_precision.execution_mode must be layerwise or resident")
     candidates = config.candidates
     if (not isinstance(candidates, (list, tuple)) or not candidates
             or any(type(b) is not int or b not in (4, 5, 8) for b in candidates)
@@ -407,7 +410,13 @@ def search_precision(model, samples, value, *, group_size=64, device="cuda:0", i
             digest.update(f"{key}:{tensor.dtype}:{tuple(tensor.shape)}".encode())
             digest.update(tensor.cpu().contiguous().view(torch.uint8).numpy().tobytes())
     try:
-        model.eval().to(device)
+        print(f"[auto_mixed_precision] execution_mode={config.execution_mode} device={device}", flush=True)
+        model.eval().to("cpu" if config.execution_mode == "layerwise" else device)
+        replay = None
+        if config.execution_mode == "layerwise":
+            from .auto_mixed_precision_replay import LayerwiseSearchReplay
+            replay = LayerwiseSearchReplay(model, device)
+            replay.prepare(records)
         # A bounded set of real Linear inputs ranks candidate reconstruction loss.
         def capture(name):
             def hook(module, args):
@@ -439,10 +448,14 @@ def search_precision(model, samples, value, *, group_size=64, device="cuda:0", i
             return F.log_softmax(out.logits[0].float(), dim=-1).cpu()
 
         reference = []
-        for i, record in enumerate(records):
-            reference.append(forward(record, capture_vision=True))
-            if (i + 1) % 8 == 0 or i + 1 == len(records):
-                print(f"[auto_mixed_precision] reference {i + 1}/{len(records)}", flush=True)
+        if replay is not None:
+            reference = replay.forward(records)
+            print(f"[auto_mixed_precision] layerwise reference {len(records)}/{len(records)}", flush=True)
+        else:
+            for i, record in enumerate(records):
+                reference.append(forward(record, capture_vision=True))
+                if (i + 1) % 8 == 0 or i + 1 == len(records):
+                    print(f"[auto_mixed_precision] reference {i + 1}/{len(records)}", flush=True)
         for hook in hooks:
             hook.remove()
         hooks.clear()
@@ -457,6 +470,7 @@ def search_precision(model, samples, value, *, group_size=64, device="cuda:0", i
                     y = F.linear(x, w.float())
                     error += ((F.linear(x, q.float()) - y).square().mean()
                               / y.square().mean().clamp_min(1e-12)).item()
+                    del w, q, x, y
                 errors[unit][bits] = error / len(group)
         input_cache.clear()
         counts = {u: sum(m.weight.numel() for m in group.values()) for u, group in units.items()}
@@ -468,10 +482,11 @@ def search_precision(model, samples, value, *, group_size=64, device="cuda:0", i
             by_modality = {}
             for modality in ("text", "image") if config.image_dataset else ("text",):
                 items, choices = [], []
-                for ref, record in zip(reference, records):
-                    if record["modality"] != modality:
-                        continue
-                    candidate = forward(record)
+                pairs = [(ref, record) for ref, record in zip(reference, records)
+                         if record["modality"] == modality]
+                predictions = (replay.forward([record for _, record in pairs]) if replay is not None
+                               else (forward(record) for _, record in pairs))
+                for (ref, record), candidate in zip(pairs, predictions):
                     items.append(output_metrics(ref, candidate, record["labels"]))
                     if record.get("options"):
                         options = record["options"]
