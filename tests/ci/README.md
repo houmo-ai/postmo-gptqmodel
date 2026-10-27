@@ -16,6 +16,16 @@ tests/ci/
 本仓 CI 用例与声明相邻放置，`lane` 决定执行资源；无需在目录外增加集中清单或代理测试。
 根目录及 `gptqmodel/recipes/` 的 AGENTS 保留各自作用域规则；生产代码仍位于 `gptqmodel/`。
 
+Xing MLA 的 `test_xing4_0_mla.py` 验证浮点吸收、两种 RoPE、Q-LoRA 及 HF 保存重载；
+`test_xing4_0_mla_quant.py` 实际运行 GPTQ/AutoRound，检查 W8 attention、W4 experts、
+整数载荷重载/再次保存及缓存 decode。两者默认使用随仓固定版本的
+[`fixtures/xing_native/`](fixtures/xing_native/README.md)，无需网络或额外环境变量。
+可设置 `XING4_0_MODEL_DIR` 指向其他原生 `config.json`、`configuration_xing4_0.py`、
+`modeling_xing4_0.py` 所在目录；显式路径缺文件时直接失败。测试只读取配置和代码，
+随机初始化缩小维度的两层 mHC/MLA/dense/MoE 模型，不加载 29B 权重。
+这不是原尺寸权重 block，也不代表整模质量。下游消费、整数保留与 HMONNX 导出回归由
+`modelzoo/test_xing_mla_quantization_boundary.impact.json` 关联指定 ModelZoo checkout。
+
 本仓当前远端是 Houmo Gerrit。项目 CI 与本地共用 `tests/ci/run.sh`。
 CI 同事负责平台任务、机器、环境、checkout 与调度；仓库提供测试入口和结果契约，不提供平台模板。
 外层生成整个 patchset 的变更路径列表，入口只消费该列表；runner/selector 不调用 Git，

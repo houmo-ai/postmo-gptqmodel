@@ -8,6 +8,7 @@
 
 | 能力 | 已登记用例与边界 | 状态 |
 | --- | --- | --- |
+| Xing MLA 原始浮点吸收后 GPTQ/AutoRound | `test_xing4_0_mla.py`、`test_xing4_0_mla_quant.py`；原生 remote code 的缩小维度两层 mHC/MLA/dense/MoE，W8 attention/dense/shared、W4 routed、G64；融合布局版本、整数保存重载/再次保存、prefill 与缓存 decode | 两算法实际量化通过；ModelZoo 消费、整数保留和 attention HMONNX 导出/CPU 回读通过。不代表 29B 整模质量或真机支持 |
 | `int_sym_xh_hessian`：Hessian 初始化 + 正 log-scale/rounding 联合优化 | `test_xh_hessian.py`、`test_xh_hessian_quant.py`；单名称预设及兼容显式模式，dense Qwen3.5 小模型，linear/full attention，W4A16/G64，AutoGPTQ v1；逐层独立解包参考及整模 logits 一致性 | CPU 数学/梯度/参数恢复及 GPU 真实量化、保存重载；27B 任务精度与 Marlin/HMONNX 另行验证 |
 | GPTQ 基本 W4/G64，GPTQ v1/v2 保存重载 | `tests/ci/test_lm_head_requantization.py` 的最小 Qwen2 主体真实量化；sym=True、desc_act=False | 前轮 CPU 通过；不代表所有 group_size/desc_act |
 | GPTQ / AutoRound dense W4/W8 G64 | `test_quantization_guard.py`，Qwen3.5 文本路径，两种 attention 都实际量化；AutoRound 默认 `int_sym_gptq`，有限校准、packed/配置与重载前向检查 | 本轮 4 组 GPU 通过，连同 42 项 policy 共 46 项、约 228 秒；这是产物/重载 smoke，不是质量阈值 |

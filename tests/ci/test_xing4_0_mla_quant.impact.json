@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "lane": "quant",
+  "patterns": [
+    "gptqmodel/models/definitions/xing4_0.py",
+    "gptqmodel/models/definitions/xing4_0_mla.py",
+    "gptqmodel/recipes/xing4_0.py",
+    "tests/ci/_xing_fixture.py",
+    "tests/ci/fixtures/xing_native/**"
+  ]
+}
