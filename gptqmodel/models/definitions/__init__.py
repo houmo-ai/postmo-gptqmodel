@@ -67,7 +67,6 @@ from .llama import LlamaQModel
 # from .xverse import XverseGPTQ
 # from .yi import YiGPTQ
 from .falcon_h1 import FalconH1QModel
-
 # from .pangu_alpha import PanguAlphaGPTQ
 from .baichuan import BaiChuanQModel
 from .bloom import BloomQModel
@@ -122,7 +121,6 @@ from .qwen2_5_vl import Qwen2_5_VLQModel
 from .qwen2_moe import Qwen2MoeQModel
 from .qwen2_vl import Qwen2VLQModel
 from .qwen3 import Qwen3QModel
-
 try:
     from .qwen3_5 import Qwen3_5QModel
 except ImportError:
@@ -134,12 +132,12 @@ except ImportError:
     Qwen3_5_VLQModel = None
 
 try:
-    from .qwen3_5_moe import (
-        Qwen3_5_MoeQModel,
-        Qwen3_5_MoeTextQModel,
-        Qwen3_5MoeQModel,
-        Qwen3_5MoeTextQModel,
-    )
+    from .wemm_embedding import WeMMEmbeddingQModel
+except ImportError:
+    WeMMEmbeddingQModel = None
+
+try:
+    from .qwen3_5_moe import Qwen3_5_MoeQModel, Qwen3_5_MoeTextQModel, Qwen3_5MoeQModel, Qwen3_5MoeTextQModel
 except ImportError:
     Qwen3_5_MoeQModel = None
     Qwen3_5_MoeTextQModel = None
