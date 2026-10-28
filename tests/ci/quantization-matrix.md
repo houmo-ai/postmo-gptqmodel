@@ -9,6 +9,7 @@
 | 能力 | 已登记用例与边界 | 状态 |
 | --- | --- | --- |
 | `int_sym_xh_hessian`：Hessian 初始化 + 正 log-scale/rounding 联合优化 | `test_xh_hessian.py`、`test_xh_hessian_quant.py`；单名称预设及兼容显式模式，dense Qwen3.5 小模型，linear/full attention，W4A16/G64，AutoGPTQ v1；逐层独立解包参考及整模 logits 一致性 | CPU 数学/梯度/参数恢复及 GPU 真实量化、保存重载；27B 任务精度与 Marlin/HMONNX 另行验证 |
+| Qwen3-VL 特征前缀 GPTQ / AutoRound W4/G64 | `test_qwen3_vl_calibration.py`、`test_qwen3_vl_recipe.py`；原生小模型 ViT、三次 DeepStack 注入，GPTQ 原生对称网格 / AutoRound `int_sym_xh`，保存及真实重载；ModelZoo 对应消费用例导出 W4A8 SSFP | 两算法的小模型生产/消费联调通过；不代表完整 H3 的生成质量、长视频校准或真机性能 |
 | GPTQ 基本 W4/G64，GPTQ v1/v2 保存重载 | `tests/ci/test_lm_head_requantization.py` 的最小 Qwen2 主体真实量化；sym=True、desc_act=False | 前轮 CPU 通过；不代表所有 group_size/desc_act |
 | GPTQ / AutoRound dense W4/W8 G64 | `test_quantization_guard.py`，Qwen3.5 文本路径，两种 attention 都实际量化；AutoRound 默认 `int_sym_gptq`，有限校准、packed/配置与重载前向检查 | 本轮 4 组 GPU 通过，连同 42 项 policy 共 46 项、约 228 秒；这是产物/重载 smoke，不是质量阈值 |
 | XH AutoRound 混合精度、hybrid attention、MoE、MTP | `tests/ci/test_qwen3_next_autoround.py::test_real_autoround_quantize_save_load`；`int_sym_xh`，组合 `(MTP,attention bits,expert bits)` = `(否,8,4)`、`(是,8,4)`、`(否,16,8)`；保存重载载荷与 logits 一致 | 前轮 3 组 GPU 通过；不代表 GPTQ MoE 或完整 VLM |
@@ -24,6 +25,11 @@
 “前轮”指 README 中的验证基线。5 种复用/自切浮点 block 的来源与结构见
 [fixture 说明](fixtures/README.md)；它们通过浮点前向不等于对应算法量化已通过。
 格式标签 `quant_method=gptq` 不足以判断生产算法；`int_sym_gptq` 与 `int_sym_xh` 要分别验证。
+
+Qwen3-MoE fused-expert 的生产端前向、梯度与重载由
+`test_qwen3_autoround_moe.py` 覆盖。当前 ModelZoo 消费集没有对应测试，已清理
+指向不存在 `test_qwen3moe_autoround_conversion.py` 的历史占位声明；这不构成
+Qwen3-MoE 跨仓消费验证，不能用 Qwen3.5 的消费结果替代。
 
 ## 应优先补齐的范围
 

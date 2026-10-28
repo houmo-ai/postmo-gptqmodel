@@ -4,7 +4,8 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 from .base_qwen3_vl import BaseQwen3VLGPTQ
+from .qwen3_vl_calibration import Qwen3VLCalibrationMixin
 
 
-class Qwen3_VLQModel(BaseQwen3VLGPTQ):
+class Qwen3_VLQModel(Qwen3VLCalibrationMixin, BaseQwen3VLGPTQ):
     pass
