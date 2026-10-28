@@ -7,6 +7,9 @@ from gptqmodel.models.definitions.wemm_embedding import WeMMEmbeddingQModel
 
 
 def test_wemm_embedding_definition_is_registered():
+    from gptqmodel.models.definitions import WeMMEmbeddingQModel as exported_definition
+
+    assert exported_definition is WeMMEmbeddingQModel
     assert MODEL_MAP["wemm_embedding"] is WeMMEmbeddingQModel
 
 
