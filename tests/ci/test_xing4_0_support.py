@@ -1,4 +1,7 @@
+import json
 from types import SimpleNamespace
+
+import pytest
 
 from torch import nn
 
@@ -39,6 +42,8 @@ def test_xing4_0_module_tree_covers_mla_dense_and_routed_mlp():
 
     assert "self_attn.q_a_proj" in flat_modules
     assert "self_attn.q_b_proj" in flat_modules
+    assert "self_attn.q_absorbed_proj" in flat_modules
+    assert "self_attn.q_rope_proj" in flat_modules
     assert "self_attn.kv_a_proj_with_mqa" in flat_modules
     assert "self_attn.kv_b_proj" in flat_modules
     assert "self_attn.o_proj" in flat_modules
@@ -75,12 +80,18 @@ def test_xing4_0_dynamic_marks_experts_w4_and_attention_w8():
         group_size=64,
         sym=True,
     )
-    assert dynamic[r"model\.layers\.\d+\.self_attn\.(q_a_proj|q_b_proj|kv_a_proj_with_mqa|kv_b_proj|o_proj)$"][
-        "bits"
-    ] == 8
-    assert dynamic[
-        r"model\.layers\.\d+\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$"
-    ]["bits"] == 4
+    assert (
+        dynamic[
+            r"model\.layers\.\d+\.self_attn\.(q_proj|q_a_proj|q_b_proj|q_absorbed_proj|q_rope_proj|kv_a_proj_with_mqa|kv_b_proj|o_proj)$"
+        ]["bits"]
+        == 8
+    )
+    assert (
+        dynamic[
+            r"model\.layers\.\d+\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$"
+        ]["bits"]
+        == 4
+    )
 
 
 def test_xing4_0_recipe_dry_run(tmp_path):
@@ -96,4 +107,62 @@ def test_xing4_0_recipe_dry_run(tmp_path):
     assert result.model_family == "xing4_0"
     assert result.precision["routed_experts"] == "W4"
     assert result.precision["self_attn"] == "W8"
+    assert result.precision["mla_weight_layout"] == "xh2_absorbed_v1"
+    assert result.provenance["offload_to_disk"] is False
     assert result.provenance["dry_run"] is True
+
+
+@pytest.mark.parametrize("head_alias", [False, True])
+@pytest.mark.parametrize("rope_type", ["default", "yarn"])
+def test_saved_xing_config_preserves_source_serialization(tmp_path, head_alias, rope_type):
+    from gptqmodel.models.definitions.xing4_0 import _preserve_source_config
+
+    source, output = tmp_path / "source", tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    scaling = {"type": "yarn", "factor": 64} if rope_type == "yarn" else None
+    config = {"qk_rope_head_dim": 64, "rope_theta": 10000, "rope_scaling": scaling}
+    if head_alias:
+        config["head_dim"] = 64
+    source_text = json.dumps(config)
+    (source / "config.json").write_text(source_text)
+    rope = {"rope_type": rope_type, "rope_theta": 10000}
+    if scaling:
+        rope.update(scaling)
+    saved = {
+        "qk_rope_head_dim": 64, "head_dim": 64, "rope_parameters": rope,
+        "quantization_config": {"bits": 4, "quant_method": "gptq"}, "mla_weight_layout": "xh2_absorbed_v1",
+    }
+    (output / "config.json").write_text(json.dumps(saved))
+    (output / "model.safetensors").write_bytes(b"unchanged-weight-payload")
+    _preserve_source_config(source, output)
+    result = json.loads((output / "config.json").read_text())
+    assert result == {
+        **config, "quantization_config": saved["quantization_config"], "mla_weight_layout": "xh2_absorbed_v1",
+    }
+    assert (source / "config.json").read_text() == source_text
+    assert (output / "model.safetensors").read_bytes() == b"unchanged-weight-payload"
+
+
+@pytest.mark.parametrize("changed", ["head_dim", "qk_rope_head_dim", "factor", "extra"])
+def test_preserving_xing_config_rejects_changed_behavior(tmp_path, changed):
+    from gptqmodel.models.definitions.xing4_0 import _preserve_source_config
+
+    source, output = tmp_path / "source", tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    (source / "config.json").write_text(json.dumps({
+        "qk_rope_head_dim": 64, "rope_theta": 10000, "rope_scaling": {"type": "yarn", "factor": 64},
+    }))
+    saved = {"qk_rope_head_dim": 64, "head_dim": 64, "rope_parameters": {
+        "rope_type": "yarn", "rope_theta": 10000, "factor": 64,
+    }}
+    if changed in {"head_dim", "qk_rope_head_dim"}:
+        saved[changed] = 128
+    else:
+        saved["rope_parameters"][changed] = 2
+    original = json.dumps(saved)
+    (output / "config.json").write_text(original)
+    with pytest.raises(ValueError):
+        _preserve_source_config(source, output)
+    assert (output / "config.json").read_text() == original

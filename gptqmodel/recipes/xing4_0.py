@@ -20,7 +20,7 @@ from typing import Any
 _SUPPORTED_METHODS = {"gptq", "auto_round"}
 _SELF_ATTN_PATTERN = (
     r"model\.layers\.\d+\.self_attn\."
-    r"(q_a_proj|q_b_proj|kv_a_proj_with_mqa|kv_b_proj|o_proj)$"
+    r"(q_proj|q_a_proj|q_b_proj|q_absorbed_proj|q_rope_proj|kv_a_proj_with_mqa|kv_b_proj|o_proj)$"
 )
 _DENSE_MLP_PATTERN = r"model\.layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)$"
 _EXPERT_PATTERN = (
@@ -48,6 +48,7 @@ def quantize_xing4_0(
     output_dir: str,
     method: str = "gptq",
     artifact_format: str = "gptqmodel_hf",
+    mla_weight_layout: str = "xh2_absorbed_v1",
     bits: int = 4,
     self_attn_bits: int = 8,
     dense_mlp_bits: int = 8,
@@ -68,7 +69,7 @@ def quantize_xing4_0(
     device: str = "cuda:0",
     dtype: str | None = None,
     trust_remote_code: bool = True,
-    offload_to_disk: bool = True,
+    offload_to_disk: bool = False,
     offload_to_disk_path: str | None = None,
     hessian_mse: bool = True,
     damp_percent: float = 0.01,
@@ -89,9 +90,21 @@ def quantize_xing4_0(
     ``calibration_data`` accepts plain text records; the recipe tokenizes them
     into the contiguous fixed-length WikiText blocks used by Xing4_0.
     Alternatively pass ``calibration_jsonl`` or ``calibration_dataset``.
+    The default layout absorbs original floating MLA weights before calibration;
+    ``hf_unabsorbed`` explicitly selects the legacy projection boundaries.
     """
 
     normalized_method = _normalize_method(method)
+    if trust_remote_code is not True:
+        raise ValueError(
+            "Xing4_0 requires trust_remote_code=True for checkpoint-side model code"
+        )
+    if mla_weight_layout not in {"hf_unabsorbed", "xh2_absorbed_v1"}:
+        raise ValueError(f"Unsupported Xing MLA weight layout: {mla_weight_layout!r}")
+    if mla_weight_layout == "xh2_absorbed_v1" and offload_to_disk:
+        raise ValueError(
+            "Absorbed Xing MLA requires materialized FP weights; set offload_to_disk=False"
+        )
     normalized_format = str(artifact_format).lower()
     _validate_recipe_args(
         method=normalized_method,
@@ -143,6 +156,7 @@ def quantize_xing4_0(
     )
 
     precision = {
+        "mla_weight_layout": mla_weight_layout,
         "self_attn": f"W{int(self_attn_bits)}",
         "dense_mlp": f"W{int(dense_mlp_bits)}",
         "shared_experts": f"W{int(shared_expert_bits)}",
@@ -205,7 +219,14 @@ def quantize_xing4_0(
         )
 
     import torch
-    from transformers import AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    from gptqmodel.models.definitions.xing4_0_mla import patch_loaded_xing_classes
+
+    get_class_from_dynamic_module(
+        "modeling_xing4_0.Xing4_0ForCausalLM", str(model_path)
+    )
+    patch_loaded_xing_classes()
 
     from gptqmodel import GPTQModel, QuantizeConfig
     from gptqmodel.quantization.config import (
@@ -254,6 +275,12 @@ def quantize_xing4_0(
             )
         )
     torch_dtype = _resolve_dtype(dtype, auto_round_enabled=auto_round_enabled)
+    load_dtype = torch_dtype
+    if mla_weight_layout == "xh2_absorbed_v1":
+        source_config = AutoConfig.from_pretrained(
+            str(model_path), trust_remote_code=True
+        )
+        load_dtype = getattr(source_config, "dtype", None) or torch.float32
     quantize_config = QuantizeConfig(
         bits=int(bits),
         dynamic=dynamic,
@@ -281,8 +308,26 @@ def quantize_xing4_0(
         str(model_path),
         quantize_config=quantize_config,
         trust_remote_code=bool(trust_remote_code),
-        dtype=torch_dtype,
+        dtype=load_dtype,
+        attn_implementation="eager",
     )
+    if mla_weight_layout == "xh2_absorbed_v1":
+        from gptqmodel.models.definitions.xing4_0_mla import (
+            absorb_xing_mla,
+            prepare_xing_quantization_dtype,
+        )
+
+        absorb_xing_mla(model.model)
+        prepare_xing_quantization_dtype(model.model, torch_dtype)
+    else:
+        from gptqmodel.models.definitions.xing4_0_mla import (
+            HF_MLA_LAYOUT,
+            validate_mla_config,
+        )
+
+        if validate_mla_config(model.model.config) != HF_MLA_LAYOUT:
+            raise ValueError("hf_unabsorbed cannot relabel an absorbed Xing checkpoint")
+        model.model.config.mla_weight_layout = HF_MLA_LAYOUT
     model.quantize(calibration, batch_size=int(batch_size))
     model.save(str(output_path), max_shard_size=str(max_shard_size))
     _write_provenance(output_path, result)

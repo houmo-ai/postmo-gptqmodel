@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "lane": "modelzoo",
+  "patterns": [
+    "gptqmodel/models/definitions/xing4_0.py",
+    "gptqmodel/models/definitions/xing4_0_mla.py",
+    "gptqmodel/recipes/xing4_0.py"
+  ]
+}

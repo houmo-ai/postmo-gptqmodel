@@ -8,6 +8,7 @@
 
 | 能力 | 已登记用例与边界 | 状态 |
 | --- | --- | --- |
+| Xing MLA 原始浮点吸收后 GPTQ/AutoRound | `test_xing4_0_mla.py`、`test_xing4_0_mla_quant.py`；原生 remote code 的缩小维度两层 mHC/MLA/dense/MoE，W8 attention/dense/shared、W4 routed、G64；融合布局版本、整数保存重载/再次保存、prefill 与缓存 decode | 两算法实际量化通过；ModelZoo 消费、整数保留和 attention HMONNX 导出/CPU 回读通过。不代表 29B 整模质量或真机支持 |
 | `int_sym_xh_hessian`：Hessian 初始化 + 正 log-scale/rounding 联合优化 | `test_xh_hessian.py`、`test_xh_hessian_quant.py`；单名称预设及兼容显式模式，dense Qwen3.5 小模型，linear/full attention，W4A16/G64，AutoGPTQ v1；逐层独立解包参考及整模 logits 一致性 | CPU 数学/梯度/参数恢复及 GPU 真实量化、保存重载；27B 任务精度与 Marlin/HMONNX 另行验证 |
 | Qwen3-VL 特征前缀 GPTQ / AutoRound W4/G64 | `test_qwen3_vl_calibration.py`、`test_qwen3_vl_recipe.py`；原生小模型 ViT、三次 DeepStack 注入，GPTQ 原生对称网格 / AutoRound `int_sym_xh`，保存及真实重载；ModelZoo 对应消费用例导出 W4A8 SSFP | 两算法的小模型生产/消费联调通过；不代表完整 H3 的生成质量、长视频校准或真机性能 |
 | GPTQ 基本 W4/G64，GPTQ v1/v2 保存重载 | `tests/ci/test_lm_head_requantization.py` 的最小 Qwen2 主体真实量化；sym=True、desc_act=False | 前轮 CPU 通过；不代表所有 group_size/desc_act |
