@@ -397,7 +397,12 @@ class BaseCompressor(object):
 
         if kwargs:
             logger.warning(f"unrecognized keys {list(kwargs.keys())} were passed. Please check them.")
-        if "CUBLAS_WORKSPACE_CONFIG" not in os.environ:
+        # PyTorch can already have cuBLAS workspaces from an earlier forward or
+        # mixed-precision search. Changing their configured size after CUDA has
+        # initialized can make cuBLAS write beyond the existing allocations.
+        # Keep a caller's active configuration; only supply the default before
+        # CUDA initialization.
+        if "CUBLAS_WORKSPACE_CONFIG" not in os.environ and not torch.cuda.is_initialized():
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
         # Deprecated, default not to use torch.use_deterministic_algorithms
         if not disable_deterministic_algorithms or enable_deterministic_algorithms:

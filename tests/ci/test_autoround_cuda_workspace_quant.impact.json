@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "lane": "quant",
+  "patterns": [
+    "third_party/auto-round/auto_round/compressors/base.py"
+  ]
+}
