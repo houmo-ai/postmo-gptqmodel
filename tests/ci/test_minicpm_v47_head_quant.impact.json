@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "lane": "quant",
+  "patterns": [
+    "gptqmodel/recipes/minicpm_v_4_7.py",
+    "gptqmodel/recipes/minicpm_v47_qdq_head.py",
+    "tests/ci/test_minicpm_v47_head.py",
+    "gptqmodel/models/definitions/qwen3_5_kernels.py",
+    "gptqmodel/models/definitions/qwen3_5.py",
+    "gptqmodel/models/definitions/qwen3_5_moe.py",
+    "gptqmodel/models/definitions/base_qwen3_5_vl.py"
+  ]
+}

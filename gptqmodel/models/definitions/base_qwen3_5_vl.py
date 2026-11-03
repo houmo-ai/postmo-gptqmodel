@@ -20,6 +20,11 @@ class BaseQwen3_5VLGPTQ(BaseQwen3VLGPTQ):
 
     ATTENTION_MASKS_REQUIRED_FOR_INPUT = True
 
+    def after_model_load(self, model, load_quantized_model):
+        from .qwen3_5_kernels import guard_qwen35_cpu_kernels
+
+        return guard_qwen35_cpu_kernels(super().after_model_load(model, load_quantized_model))
+
     module_tree = [
         "model",
         "language_model",

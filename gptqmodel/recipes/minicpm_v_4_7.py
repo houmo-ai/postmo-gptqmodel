@@ -95,10 +95,15 @@ def quantize_minicpm_v_4_7_gptq(
     device: str = "cuda:0",
     trust_remote_code: bool = True,
     dry_run: bool = False,
+    head: Mapping[str, Any] | None = None,
 ) -> MiniCPMV47QuantRecipeResult:
     """Extract Dense Qwen3.5 text, GPTQ-quantize, and emit float CausalLM weights."""
 
-    del device  # GPTQModel selects CUDA devices from the process environment.
+    if head is not None:
+        options = locals().copy()
+        from .minicpm_v47_qdq_head import quantize_with_minicpm_head
+
+        return quantize_with_minicpm_head(quantize_minicpm_v_4_7_gptq, options, algorithm="gptq")
     method = str(method).lower().replace("-", "_")
     artifact_format = str(artifact_format).lower()
     if method not in {"gptq", "gptqmodel"}:
@@ -167,6 +172,7 @@ def quantize_minicpm_v_4_7_gptq(
         group_size=int(group_size),
         desc_act=False,
         damp_percent=float(damp_percent),
+        device=device,
         offload_to_disk_path=str(output_path / "gptqmodel_offload"),
     )
 
@@ -218,9 +224,15 @@ def quantize_minicpm_v_4_7_autoround(
     expert_up_gate_bits: int | None = None,
     expert_down_bits: int | None = None,
     dry_run: bool = False,
+    head: Mapping[str, Any] | None = None,
 ) -> MiniCPMV47QuantRecipeResult:
     """AutoRound-quantize MiniCPM-V-4.7 MoE text and emit float CausalLM weights."""
 
+    if head is not None:
+        options = locals().copy()
+        from .minicpm_v47_qdq_head import quantize_with_minicpm_head
+
+        return quantize_with_minicpm_head(quantize_minicpm_v_4_7_autoround, options, algorithm="autoround")
     method = str(method).lower().replace("-", "_")
     artifact_format = str(artifact_format).lower()
     if method not in {"autoround", "auto_round"}:

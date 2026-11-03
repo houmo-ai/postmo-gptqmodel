@@ -28,6 +28,11 @@ class _BaseQwen3_5MoeQModel(BaseQModel):
 
     _BRIDGE_ATTRS = ("bos_token_id", "eos_token_id", "pad_token_id", "vocab_size")
 
+    def after_model_load(self, model, load_quantized_model):
+        from .qwen3_5_kernels import guard_qwen35_cpu_kernels
+
+        return guard_qwen35_cpu_kernels(super().after_model_load(model, load_quantized_model))
+
     def before_model_load(self, load_quantized_model=False):
         import transformers.models.qwen3_5_moe.configuration_qwen3_5_moe as qwen3_5_moe_config
 

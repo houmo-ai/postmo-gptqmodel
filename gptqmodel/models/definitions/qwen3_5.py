@@ -143,3 +143,8 @@ class Qwen3_5QModel(LlamaQModel):
                 setattr(cfg_cls, attr, _bridge_property(attr))
 
             qwen3_5_config._gptqmodel_qwen35_cfg_bridge = True
+
+    def after_model_load(self, model, load_quantized_model):
+        from .qwen3_5_kernels import guard_qwen35_cpu_kernels
+
+        return guard_qwen35_cpu_kernels(super().after_model_load(model, load_quantized_model))

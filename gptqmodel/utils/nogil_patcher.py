@@ -115,11 +115,11 @@ def patch_triton_autotuner() -> None:
 
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
-        cache_map = getattr(self, "cache", {})
+        cache_map = getattr(self, "cache", getattr(self, "_cache", {}))
         self._cache = dict(cache_map)
         self.cache = self._cache
         self._cache_lock = getattr(self, "_cache_lock", threading.RLock())
-        self._cache_futures = {}
+        self._cache_futures = getattr(self, "_cache_futures", {})
 
     def patched_check_disk_cache(self, tuning_key, configs, bench_fn):
         if not tuning_key or any(cfg.pre_hook for cfg in configs):
@@ -170,6 +170,14 @@ def patch_triton_autotuner() -> None:
         return False, bench_time, configs_timings, best_config
 
     def _get_config_for_key(self, key, args, kwargs):
+        cache = getattr(self, "_cache", None)
+        if cache is None:
+            cache = getattr(self, "cache", {})
+            self._cache = dict(cache)
+            self.cache = self._cache
+        self._cache_lock = getattr(self, "_cache_lock", threading.RLock())
+        self._cache_futures = getattr(self, "_cache_futures", {})
+        self._cache_futures.setdefault("__gptqmodel_initialized__", {})
         with self._cache_lock:
             cached = self._cache.get(key)
             if cached is not None:
