@@ -20,7 +20,7 @@ maturin>=1.9.4
 pyarrow>=21.0
 dill>=0.3.8
 torchao>=0.14.1,<0.15.0
-kernels>=0.12.2
+kernels==0.12.2
 defuser>=0.0.25
 py-cpuinfo
 tqdm
